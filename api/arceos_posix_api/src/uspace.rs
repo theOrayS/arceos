@@ -61,6 +61,7 @@ const USER_BRK_GROW_SIZE: usize = 64 * 1024 * 1024;
 const USER_PIE_LOAD_BASE: usize = USER_ASPACE_BASE;
 const MAX_SCRIPT_INTERPRETER_DEPTH: usize = 4;
 const TESTSUITE_STAGE_ROOT: &str = "/tmp/testsuite";
+const COMPAT_RUNTIME_WRITE_SHADOW_ROOT: &str = "/tmp/.arceos-runtime-writes";
 const AUX_CLOCK_TICKS: usize = 100;
 const SIGCHLD_NUM: isize = 17;
 const SIGCANCEL_NUM: i32 = 33;
@@ -190,6 +191,31 @@ struct UserProcess {
     exit_group_code: AtomicI32,
     exit_code: AtomicI32,
     exit_wait: WaitQueue,
+    vfork_completion: Mutex<Option<Arc<VforkCompletion>>>,
+}
+
+struct VforkCompletion {
+    done: AtomicBool,
+    wait: WaitQueue,
+}
+
+impl VforkCompletion {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            done: AtomicBool::new(false),
+            wait: WaitQueue::new(),
+        })
+    }
+
+    fn complete(&self) {
+        self.done.store(true, Ordering::Release);
+        self.wait.notify_all(false);
+    }
+
+    fn wait(&self) {
+        self.wait
+            .wait_until(|| self.done.load(Ordering::Acquire));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -391,7 +417,6 @@ impl UserSocket {
 
 struct ChildTask {
     pid: i32,
-    task: AxTaskRef,
     process: Arc<UserProcess>,
 }
 
@@ -408,7 +433,7 @@ enum RingBufferStatus {
     Normal,
 }
 
-const PIPE_BUF_SIZE: usize = 256;
+const PIPE_BUF_SIZE: usize = 4096;
 
 struct PipeRingBuffer {
     data: [u8; PIPE_BUF_SIZE],
@@ -421,6 +446,8 @@ struct PipeState {
     buffer: Mutex<PipeRingBuffer>,
     readers: AtomicUsize,
     writers: AtomicUsize,
+    read_wait: WaitQueue,
+    write_wait: WaitQueue,
 }
 
 struct PipeEndpoint {
@@ -784,6 +811,8 @@ impl PipeEndpoint {
             buffer: Mutex::new(PipeRingBuffer::new()),
             readers: AtomicUsize::new(1),
             writers: AtomicUsize::new(1),
+            read_wait: WaitQueue::new(),
+            write_wait: WaitQueue::new(),
         });
         let status_flags = flags & general::O_NONBLOCK;
         (
@@ -840,17 +869,26 @@ impl PipeEndpoint {
                 if current_unblocked_pending_signal().is_some() {
                     return Err(LinuxError::EINTR);
                 }
-                axtask::yield_now();
+                self.state
+                    .read_wait
+                    .wait_timeout_until(Duration::from_millis(10), || {
+                        let ring = self.state.buffer.lock();
+                        ring.available_read() > 0 || self.peer_closed()
+                    });
                 continue;
             }
             for _ in 0..available {
                 if read_len == dst.len() {
+                    drop(ring);
+                    self.state.write_wait.notify_all(false);
                     return Ok(read_len);
                 }
                 dst[read_len] = ring.read_byte();
                 read_len += 1;
             }
             if read_len > 0 {
+                drop(ring);
+                self.state.write_wait.notify_all(false);
                 return Ok(read_len);
             }
         }
@@ -900,16 +938,25 @@ impl PipeEndpoint {
                         Err(LinuxError::EINTR)
                     };
                 }
-                axtask::yield_now();
+                self.state
+                    .write_wait
+                    .wait_timeout_until(Duration::from_millis(10), || {
+                        let ring = self.state.buffer.lock();
+                        ring.available_write() > 0 || self.peer_closed()
+                    });
                 continue;
             }
             for _ in 0..available {
                 if written == src.len() {
+                    drop(ring);
+                    self.state.read_wait.notify_all(false);
                     return Ok(written);
                 }
                 ring.write_byte(src[written]);
                 written += 1;
             }
+            drop(ring);
+            self.state.read_wait.notify_all(false);
         }
         Ok(written)
     }
@@ -962,10 +1009,17 @@ impl Clone for PipeEndpoint {
 
 impl Drop for PipeEndpoint {
     fn drop(&mut self) {
-        if self.readable {
-            self.state.readers.fetch_sub(1, Ordering::AcqRel);
+        let last_peer = if self.readable {
+            self.state.readers.fetch_sub(1, Ordering::AcqRel) == 1
         } else {
-            self.state.writers.fetch_sub(1, Ordering::AcqRel);
+            self.state.writers.fetch_sub(1, Ordering::AcqRel) == 1
+        };
+        if last_peer {
+            if self.readable {
+                self.state.write_wait.notify_all(false);
+            } else {
+                self.state.read_wait.notify_all(false);
+            }
         }
     }
 }
@@ -1099,7 +1153,7 @@ fn user_thread_entry(process: Arc<UserProcess>, context: UspaceContext, child_ti
 fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
     let mut aspace = axmm::new_user_aspace(VirtAddr::from(USER_ASPACE_BASE), USER_ASPACE_SIZE)
         .map_err(|err| format!("failed to create user address space: {err}"))?;
-    let image = load_program_image(&mut aspace, cwd, argv)?;
+    let image = load_program_image(&mut aspace, cwd, argv, &[])?;
 
     let process = Arc::new(UserProcess {
         aspace: Mutex::new(aspace),
@@ -1118,6 +1172,7 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         exit_group_code: AtomicI32::new(NO_EXIT_GROUP_CODE),
         exit_code: AtomicI32::new(0),
         exit_wait: WaitQueue::new(),
+        vfork_completion: Mutex::new(None),
     });
 
     Ok(LoadedProgram {
@@ -1130,6 +1185,7 @@ fn load_program_image(
     aspace: &mut AddrSpace,
     cwd: &str,
     argv: &[&str],
+    envp: &[&str],
 ) -> Result<LoadedImage, String> {
     let prepared = prepare_program(cwd, argv, 0)?;
     let elf = ElfFile::new(&prepared.image).map_err(|err| format!("invalid ELF: {err}"))?;
@@ -1188,11 +1244,13 @@ fn load_program_image(
         .map_err(|err| format!("failed to map user stack: {err}"))?;
 
     let argv_refs = prepared.argv.iter().map(String::as_str).collect::<Vec<_>>();
+    let envp_refs = envp.iter().copied().collect::<Vec<_>>();
     let stack_ptr = build_initial_stack(
         aspace,
         stack_base,
         stack_top,
         &argv_refs,
+        &envp_refs,
         prepared.path.as_str(),
         main.entry,
         interp_base,
@@ -1230,7 +1288,7 @@ fn prepare_program(cwd: &str, argv: &[&str], depth: usize) -> Result<PreparedPro
         return Err("script interpreter recursion limit exceeded".into());
     }
 
-    let path = resolve_host_path(cwd.to_string(), argv[0])?;
+    let path = resolve_exec_program_path(cwd, argv[0])?;
     let image =
         axfs::api::read(path.as_str()).map_err(|err| format!("failed to read {path}: {err}"))?;
 
@@ -1472,6 +1530,7 @@ fn build_initial_stack(
     stack_base: usize,
     stack_top: usize,
     argv: &[&str],
+    envp: &[&str],
     execfn: &str,
     entry: usize,
     interp_base: usize,
@@ -1497,6 +1556,15 @@ fn build_initial_stack(
         arg_ptrs.push(ptr);
     }
     arg_ptrs.reverse();
+
+    let mut env_ptrs = Vec::with_capacity(envp.len());
+    for env in envp.iter().rev() {
+        let mut bytes = env.as_bytes().to_vec();
+        bytes.push(0);
+        let ptr = push_stack_bytes(aspace, stack_base, &mut sp, &bytes, 1)?;
+        env_ptrs.push(ptr);
+    }
+    env_ptrs.reverse();
 
     let aux = [
         AuxEntry {
@@ -1581,10 +1649,12 @@ fn build_initial_stack(
         },
     ];
 
-    let mut words = Vec::with_capacity(1 + arg_ptrs.len() + 1 + 1 + aux.len() * 2);
+    let mut words =
+        Vec::with_capacity(1 + arg_ptrs.len() + 1 + env_ptrs.len() + 1 + aux.len() * 2);
     words.push(argv.len());
     words.extend(arg_ptrs.iter().copied());
     words.push(0);
+    words.extend(env_ptrs.iter().copied());
     words.push(0);
     for item in aux {
         words.push(item.key);
@@ -1801,12 +1871,14 @@ fn exec_program(
     process: &UserProcess,
     cwd: &str,
     argv: &[String],
+    envp: &[String],
 ) -> Result<(usize, usize, usize), String> {
     detach_all_shared_mappings(process);
     let argv_refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
+    let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
     let image = {
         let mut aspace = process.aspace.lock();
-        load_program_image(&mut aspace, cwd, &argv_refs)?
+        load_program_image(&mut aspace, cwd, &argv_refs, &envp_refs)?
     };
     *process.brk.lock() = image.brk;
     process.set_exec_root(image.exec_root);
@@ -1863,9 +1935,21 @@ impl UserProcess {
         self.live_threads.fetch_add(1, Ordering::AcqRel);
     }
 
+    fn set_vfork_completion(&self, completion: Arc<VforkCompletion>) {
+        *self.vfork_completion.lock() = Some(completion);
+    }
+
+    fn complete_vfork(&self) {
+        let completion = self.vfork_completion.lock().take();
+        if let Some(completion) = completion {
+            completion.complete();
+        }
+    }
+
     fn note_thread_exit(&self, code: i32) {
         self.exit_code.store(code, Ordering::Release);
         if self.live_threads.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.complete_vfork();
             self.fds.lock().close_all();
             imp_time::clear_process_interval_timer(self.pid());
             crate::imp::fs::clear_process_umask(self.pid());
@@ -1957,12 +2041,13 @@ impl UserProcess {
             exit_group_code: AtomicI32::new(NO_EXIT_GROUP_CODE),
             exit_code: AtomicI32::new(0),
             exit_wait: WaitQueue::new(),
+            vfork_completion: Mutex::new(None),
         }))
     }
 
-    fn add_child(&self, task: AxTaskRef, process: Arc<UserProcess>) -> i32 {
-        let pid = task.id().as_u64() as i32;
-        self.children.lock().push(ChildTask { pid, task, process });
+    fn add_child(&self, _task: AxTaskRef, process: Arc<UserProcess>) -> i32 {
+        let pid = process.pid();
+        self.children.lock().push(ChildTask { pid, process });
         pid
     }
 
@@ -1971,11 +2056,7 @@ impl UserProcess {
             child.process.live_threads.load(Ordering::Acquire) == 0
         }
         fn reap_child(child: ChildTask) -> Result<(i32, i32), LinuxError> {
-            let status = if child.process.live_threads.load(Ordering::Acquire) == 0 {
-                child.process.exit_code.load(Ordering::Acquire)
-            } else {
-                child.task.join().ok_or(LinuxError::ECHILD)?
-            };
+            let status = child.process.exit_code.load(Ordering::Acquire);
             let child_pid = child.pid;
             child.process.teardown();
             drop(child);
@@ -2037,11 +2118,16 @@ impl UserProcess {
                 if let Some(code) = ext.process.pending_exit_group() {
                     terminate_current_thread(ext.process.as_ref(), code);
                 }
+                if current_unblocked_pending_signal().is_some() {
+                    return Err(LinuxError::EINTR);
+                }
+                ext.signal_wait.wait_timeout(Duration::from_millis(10));
+            } else {
+                if current_unblocked_pending_signal().is_some() {
+                    return Err(LinuxError::EINTR);
+                }
+                axtask::sleep(Duration::from_millis(10));
             }
-            if current_unblocked_pending_signal().is_some() {
-                return Err(LinuxError::EINTR);
-            }
-            axtask::sleep(core::time::Duration::from_millis(10));
         };
         reap_child(child).map(Some)
     }
@@ -4498,7 +4584,7 @@ fn sys_execve(
     _tf: &TrapFrame,
     pathname: usize,
     argv: usize,
-    _envp: usize,
+    envp: usize,
 ) -> isize {
     let path = match read_cstr(process, pathname) {
         Ok(path) => path,
@@ -4508,11 +4594,16 @@ fn sys_execve(
         Ok(argv) => argv,
         Err(err) => return neg_errno(err),
     };
+    let envp = match read_execve_envp(process, envp) {
+        Ok(envp) => envp,
+        Err(err) => return neg_errno(err),
+    };
     let cwd = process.cwd();
-    let (entry, stack_ptr, argc) = match exec_program(process, cwd.as_str(), &argv) {
+    let (entry, stack_ptr, argc) = match exec_program(process, cwd.as_str(), &argv, &envp) {
         Ok(image) => image,
         Err(_) => return neg_errno(LinuxError::ENOEXEC),
     };
+    process.complete_vfork();
     let context = make_uspace_context(entry, stack_ptr, argc);
     let kstack_top = axtask::current()
         .kernel_stack_top()
@@ -4548,6 +4639,7 @@ fn sys_clone(
         | general::CLONE_PARENT_SETTID as usize
         | general::CLONE_CHILD_SETTID as usize
         | general::CLONE_CHILD_CLEARTID as usize;
+    let is_vfork = clone_flags & vfork_flags == vfork_flags;
     let fork_like_flags = clone_flags & !process_allowed_flags == 0
         && (clone_flags & general::CLONE_VM as usize == 0
             || clone_flags & vfork_flags == vfork_flags);
@@ -4599,6 +4691,13 @@ fn sys_clone(
                 return ret;
             }
         }
+        let vfork_completion = if is_vfork {
+            let completion = VforkCompletion::new();
+            child_process.set_vfork_completion(completion.clone());
+            Some(completion)
+        } else {
+            None
+        };
         let child_clear_tid = if clone_flags & general::CLONE_CHILD_CLEARTID as usize != 0 {
             ctid
         } else {
@@ -4624,6 +4723,9 @@ fn sys_clone(
         let task = axtask::spawn_task(task);
         register_user_task(task.clone(), child_process.clone());
         process.add_child(task, child_process);
+        if let Some(completion) = vfork_completion {
+            completion.wait();
+        }
         return pid as isize;
     }
 
@@ -6608,12 +6710,116 @@ fn read_execve_argv(
     Ok(argv)
 }
 
+fn read_execve_envp(process: &UserProcess, envp_ptr: usize) -> Result<Vec<String>, LinuxError> {
+    const MAX_ENVC: usize = 256;
+
+    if envp_ptr == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut envp = Vec::new();
+    for idx in 0..MAX_ENVC {
+        let item_ptr = read_user_word(process, envp_ptr + idx * size_of::<usize>())?;
+        if item_ptr == 0 {
+            break;
+        }
+        envp.push(read_cstr(process, item_ptr)?);
+    }
+    Ok(envp)
+}
+
 fn current_cwd() -> String {
     axfs::api::current_dir().unwrap_or_else(|_| "/".into())
 }
 
 fn resolve_host_path(cwd: String, path: &str) -> Result<String, String> {
     normalize_path(cwd.as_str(), path).ok_or_else(|| format!("invalid path: {path}"))
+}
+
+fn resolve_exec_program_path(cwd: &str, path: &str) -> Result<String, String> {
+    let primary = resolve_host_path(cwd.to_string(), path)?;
+    if matches!(axfs::api::metadata(primary.as_str()), Ok(meta) if meta.is_file()) {
+        return Ok(primary);
+    }
+    for candidate in compat_runtime_binary_candidates(primary.as_str()) {
+        if matches!(axfs::api::metadata(candidate.as_str()), Ok(meta) if meta.is_file()) {
+            return Ok(candidate);
+        }
+    }
+    Ok(primary)
+}
+
+fn compat_runtime_binary_candidates(path: &str) -> Vec<String> {
+    let Some(normalized) = normalize_path("/", path) else {
+        return Vec::new();
+    };
+    let name = if let Some(name) = normalized.strip_prefix("/bin/") {
+        name
+    } else if let Some(name) = normalized.strip_prefix("/usr/bin/") {
+        name
+    } else {
+        return Vec::new();
+    };
+    if name.is_empty() || name.contains('/') {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for root in ["/musl", "/glibc"] {
+        push_runtime_candidate(
+            &mut candidates,
+            normalize_path(root, name).map(Some).unwrap_or(None),
+        );
+        push_runtime_candidate(
+            &mut candidates,
+            normalize_path(root, "busybox").map(Some).unwrap_or(None),
+        );
+    }
+    candidates
+}
+
+fn compat_runtime_write_shadow_path(path: &str) -> Option<String> {
+    let normalized = normalize_path("/", path)?;
+    if !(normalized == "/musl"
+        || normalized.starts_with("/musl/")
+        || normalized == "/glibc"
+        || normalized.starts_with("/glibc/"))
+    {
+        return None;
+    }
+    let rel = normalized.trim_start_matches('/');
+    if rel.is_empty() {
+        None
+    } else {
+        Some(format!("{COMPAT_RUNTIME_WRITE_SHADOW_ROOT}/{rel}"))
+    }
+}
+
+fn compat_ensure_shadow_parent(path: &str) -> Result<(), LinuxError> {
+    let Some((parent, _)) = path.rsplit_once('/') else {
+        return Ok(());
+    };
+    let mut current = String::new();
+    for part in parent.trim_start_matches('/').split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        current.push('/');
+        current.push_str(part);
+        if axfs::api::metadata(current.as_str()).is_ok() {
+            continue;
+        }
+        match axfs::api::create_dir(current.as_str()) {
+            Ok(()) => {}
+            Err(err) => {
+                let err = LinuxError::from(err);
+                if err != LinuxError::EEXIST {
+                    return Err(err);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn derive_exec_root_from_path(path: &str) -> String {
@@ -7257,10 +7463,21 @@ impl FdTable {
         if path.starts_with('/') || dirfd == general::AT_FDCWD {
             let cwd = process.cwd();
             let abs_path = resolve_host_path(cwd, path).map_err(|_| LinuxError::EINVAL)?;
-            return if remove_dir {
+            let result = if remove_dir {
                 directory_remove_dir(abs_path.as_str())
             } else {
                 directory_remove_file(abs_path.as_str())
+            };
+            return match result {
+                Ok(()) => Ok(()),
+                Err(err) if !remove_dir && (err == LinuxError::ENOENT || err == LinuxError::EROFS) => {
+                    if let Some(shadow) = compat_runtime_write_shadow_path(abs_path.as_str()) {
+                        directory_remove_file(shadow.as_str())
+                    } else {
+                        Err(err)
+                    }
+                }
+                Err(err) => Err(err),
             };
         }
         let FdEntry::Directory(dir) = self.entry(dirfd)? else {
@@ -7719,7 +7936,7 @@ fn open_fd_entry(
         if candidates.is_empty() {
             return Err(LinuxError::EINVAL);
         }
-        open_fd_candidates(&candidates, prefer_dir, &opts)
+        open_fd_candidates(&candidates, prefer_dir, &opts, !prefer_dir)
     } else {
         let FdEntry::Directory(dir) = table.entry(dirfd)? else {
             return Err(LinuxError::ENOTDIR);
@@ -7729,7 +7946,7 @@ fn open_fd_entry(
         for extra in runtime_library_name_candidates(exec_root.as_str(), path) {
             push_runtime_candidate(&mut candidates, Some(extra));
         }
-        open_fd_candidates(&candidates, prefer_dir, &opts)
+        open_fd_candidates(&candidates, prefer_dir, &opts, !prefer_dir)
     }
 }
 
@@ -7737,6 +7954,7 @@ fn open_fd_candidates(
     candidates: &[String],
     prefer_dir: bool,
     opts: &OpenOptions,
+    allow_shadow: bool,
 ) -> Result<FdEntry, LinuxError> {
     let mut last_err = LinuxError::ENOENT;
     for path in candidates {
@@ -7764,6 +7982,28 @@ fn open_fd_candidates(
                 let err = LinuxError::from(err);
                 if err == LinuxError::EISDIR {
                     return open_dir_entry(path.as_str());
+                }
+                if allow_shadow && (err == LinuxError::ENOENT || err == LinuxError::EROFS) {
+                    if let Some(shadow) = compat_runtime_write_shadow_path(path.as_str()) {
+                        if err == LinuxError::EROFS {
+                            compat_ensure_shadow_parent(shadow.as_str())?;
+                        }
+                        match File::open(shadow.as_str(), opts) {
+                            Ok(file) => {
+                                return Ok(FdEntry::File(FileEntry {
+                                    file,
+                                    path: shadow,
+                                    times: Arc::new(Mutex::new(None)),
+                                }));
+                            }
+                            Err(shadow_err) => {
+                                let shadow_err = LinuxError::from(shadow_err);
+                                if shadow_err != LinuxError::ENOENT {
+                                    return Err(shadow_err);
+                                }
+                            }
+                        }
+                    }
                 }
                 last_err = err;
                 if err != LinuxError::ENOENT {
