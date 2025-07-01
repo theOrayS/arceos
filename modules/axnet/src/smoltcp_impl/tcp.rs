@@ -24,7 +24,6 @@ const STATE_BUSY: u8 = 1;
 const STATE_CONNECTING: u8 = 2;
 const STATE_CONNECTED: u8 = 3;
 const STATE_LISTENING: u8 = 4;
-const DEFAULT_MSS: usize = 536;
 
 /// A TCP socket that provides POSIX-like APIs.
 ///
@@ -359,11 +358,6 @@ impl TcpSocket {
         } else {
             ax_err!(NotConnected, "socket is not connected")
         }
-    }
-
-    /// Gets the Maximum Segment Size (MSS) of the remote peer.
-    pub fn get_remote_mss(&self) -> usize {
-        DEFAULT_MSS
     }
 
     /// Returns the maximum capacity of the receive buffer in bytes.
