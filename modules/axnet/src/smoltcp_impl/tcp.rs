@@ -349,6 +349,7 @@ impl TcpSocket {
     }
 
     /// Enables or disables Nagle's algorithm for this TCP socket.
+    #[inline]
     pub fn set_nodelay(&self, enabled: bool) -> AxResult<()> {
         if let Some(h) = unsafe { self.handle.get().read() } {
             SOCKET_SET.with_socket_mut::<tcp::Socket, _, _>(h, |socket| {
@@ -361,6 +362,7 @@ impl TcpSocket {
     }
 
     /// Returns the maximum capacity of the receive buffer in bytes.
+    #[inline]
     pub fn recv_capacity(&self) -> AxResult<usize> {
         if let Some(h) = unsafe { self.handle.get().read() } {
             Ok(SOCKET_SET.with_socket::<tcp::Socket, _, _>(h, |socket| socket.recv_capacity()))
@@ -370,6 +372,7 @@ impl TcpSocket {
     }
 
     /// Returns the maximum capacity of the send buffer in bytes.
+    #[inline]
     pub fn send_capacity(&self) -> AxResult<usize> {
         if let Some(h) = unsafe { self.handle.get().read() } {
             Ok(SOCKET_SET.with_socket::<tcp::Socket, _, _>(h, |socket| socket.send_capacity()))
