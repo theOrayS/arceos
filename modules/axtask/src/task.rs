@@ -426,7 +426,7 @@ impl TaskInner {
     /// and it is set to `false` when the task has finished its scheduling process in `clear_prev_task_on_cpu()`.
     #[cfg(feature = "smp")]
     #[inline]
-    pub fn on_cpu(&self) -> bool {
+    pub(crate) fn on_cpu(&self) -> bool {
         self.on_cpu.load(Ordering::Acquire)
     }
 
