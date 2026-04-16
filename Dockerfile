@@ -1,10 +1,12 @@
 FROM rust:slim
 
-RUN echo 'deb http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm main' >> /etc/apt/sources.list
-RUN wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libclang-19-dev wget make python3 \
+    && apt-get install -y --no-install-recommends ca-certificates wget gpg \
+    && mkdir -p /etc/apt/keyrings \
+    && wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/apt.llvm.org.gpg \
+    && echo 'deb [signed-by=/etc/apt/keyrings/apt.llvm.org.gpg] http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm main' > /etc/apt/sources.list.d/llvm.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libclang-19-dev make python3 \
         xz-utils python3-venv ninja-build bzip2 meson \
         pkg-config libglib2.0-dev git libslirp-dev \
     && rm -rf /var/lib/apt/lists/*
