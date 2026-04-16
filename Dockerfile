@@ -1,6 +1,6 @@
 FROM rust:slim
 
-RUN echo /etc/apt/sources.list << deb http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm main
+RUN echo 'deb http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm main' >> /etc/apt/sources.list
 RUN wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
 
 RUN apt-get update \
