@@ -10,4 +10,9 @@ qemu.log
 rusty-tags.vi
 /.project*
 /.axconfig.*
-/crates
+/cratesbuild/
+*.log
+kernel-*
+.gdb_history
+vendor/
+build/

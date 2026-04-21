@@ -34,6 +34,29 @@ pub struct Directory {
     entry_idx: usize,
 }
 
+impl Clone for File {
+    fn clone(&self) -> Self {
+        let node = unsafe { self.node.access_unchecked() }.clone();
+        node.open().expect("failed to reopen cloned file node");
+        Self {
+            node: WithCap::new(node, self.node.cap()),
+            is_append: self.is_append,
+            offset: self.offset,
+        }
+    }
+}
+
+impl Clone for Directory {
+    fn clone(&self) -> Self {
+        let node = unsafe { self.node.access_unchecked() }.clone();
+        node.open().expect("failed to reopen cloned directory node");
+        Self {
+            node: WithCap::new(node, self.node.cap()),
+            entry_idx: self.entry_idx,
+        }
+    }
+}
+
 /// Options and flags which can be used to configure how a file is opened.
 #[derive(Clone)]
 pub struct OpenOptions {

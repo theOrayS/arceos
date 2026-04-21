@@ -17,6 +17,9 @@ fn path_to_str(path: &str) -> &str {
 
 mod cmd;
 
+#[cfg(feature = "uspace")]
+mod uspace;
+
 #[cfg(feature = "use-ramfs")]
 mod ramfs;
 
@@ -38,8 +41,7 @@ fn print_prompt() {
     std::io::stdout().flush().unwrap();
 }
 
-#[cfg_attr(feature = "axstd", unsafe(no_mangle))]
-fn main() {
+fn run_interactive_shell() {
     let mut stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
@@ -79,4 +81,12 @@ fn main() {
             }
         }
     }
+}
+
+#[cfg_attr(feature = "axstd", unsafe(no_mangle))]
+fn main() {
+    #[cfg(feature = "auto-run-tests")]
+    cmd::maybe_run_official_tests();
+
+    run_interactive_shell();
 }

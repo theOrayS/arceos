@@ -6,6 +6,8 @@
 //!
 //! - `fatfs`: Use [FAT] as the main filesystem and mount it on `/`. This feature
 //!   is **enabled** by default.
+//! - `ext4fs`: Use [ext4] as the main filesystem and mount it on `/`. This feature
+//!   is **enabled** by default for competition images and is read-only.
 //! - `devfs`: Mount [`axfs_devfs::DeviceFileSystem`] on `/dev`. This feature is
 //!   **enabled** by default.
 //! - `ramfs`: Mount [`axfs_ramfs::RamFileSystem`] on `/tmp`. This feature is
@@ -17,6 +19,7 @@
 //!   both are enabled.
 //!
 //! [FAT]: https://en.wikipedia.org/wiki/File_Allocation_Table
+//! [ext4]: https://en.wikipedia.org/wiki/Ext4
 //! [`MyFileSystemIf`]: fops::MyFileSystemIf
 
 #![cfg_attr(all(not(test), not(doc)), no_std)]

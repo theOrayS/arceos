@@ -13,7 +13,7 @@ ifeq ($(shell axconfig-gen --version 2>/dev/null),)
 endif
 
 # Cargo binutils
-ifeq ($(shell cargo install --list | grep cargo-binutils),)
+ifeq ($(shell rust-objcopy --version 2>/dev/null),)
   $(info Installing cargo-binutils...)
   $(shell cargo install cargo-binutils)
 endif

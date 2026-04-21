@@ -6,6 +6,10 @@ config_args := \
   -w 'platform="$(PLAT_NAME)"' \
   -o "$(OUT_CONFIG)"
 
+ifneq ($(strip $(AXCONFIG_WRITES)),)
+  config_args += $(AXCONFIG_WRITES)
+endif
+
 ifneq ($(SMP),)
   config_args += -w 'plat.max-cpu-num=$(SMP)'
 else
@@ -31,4 +35,3 @@ else
          $(error "ARCH" or "MYPLAT" has been changed, please run "make defconfig" again))
   endef
 endif
-

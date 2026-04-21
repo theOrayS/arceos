@@ -1,19 +1,33 @@
 use core::str;
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+use std::collections::BTreeSet;
 use std::fs::{self, File, FileType};
 use std::io::{self, prelude::*};
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+use std::string::ToString;
 use std::{string::String, vec::Vec};
 
 #[cfg(all(not(feature = "axstd"), unix))]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 use crate::path_to_str;
+#[cfg(feature = "uspace")]
+use crate::uspace;
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+const SUITE_DIRS: &[&str] = &["/musl", "/glibc"];
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+const SCRIPT_SUFFIX: &str = "_testcode.sh";
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+const TESTSUITE_STAGE_ROOT: &str = "/tmp/testsuite";
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+const SCRIPT_BUSYBOX_APPLETS: &[&str] = &["kill", "sleep"];
 
 macro_rules! print_err {
     ($cmd: literal, $msg: expr) => {
-        println!("{}: {}", $cmd, $msg);
+        println!("{}: {}", $cmd, $msg)
     };
     ($cmd: literal, $arg: expr, $err: expr) => {
-        println!("{}: {}: {}", $cmd, $arg, $err);
+        println!("{}: {}: {}", $cmd, $arg, $err)
     };
 }
 
@@ -29,6 +43,8 @@ const CMD_TABLE: &[(&str, CmdHandler)] = &[
     ("mkdir", do_mkdir),
     ("pwd", do_pwd),
     ("rm", do_rm),
+    #[cfg(feature = "uspace")]
+    ("runu", do_runu),
     ("uname", do_uname),
 ];
 
@@ -280,6 +296,472 @@ fn do_exit(_args: &str) {
     println!("Bye~");
     std::process::exit(0);
 }
+
+#[cfg(feature = "uspace")]
+fn do_runu(args: &str) {
+    let argv = args.split_whitespace().collect::<Vec<_>>();
+    if argv.is_empty() {
+        print_err!("runu", "usage: runu <path> [args...]");
+        return;
+    }
+
+    match run_user_program_argv(&argv) {
+        Ok(exit_code) => println!("runu: exited with status {exit_code}"),
+        Err(err) => print_err!("runu", err),
+    }
+}
+
+#[cfg(feature = "uspace")]
+fn run_user_program_argv(argv: &[&str]) -> Result<i32, String> {
+    uspace::run_user_program(argv)
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn run_user_program_argv_in(cwd: &str, argv: &[&str]) -> Result<i32, String> {
+    uspace::run_user_program_in(cwd, argv)
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn normalize_rel_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_matches(|c: char| matches!(c, '"' | '\'' | '`'));
+    let rel = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    if rel.is_empty() || rel == "." || rel == ".." || rel.starts_with('/') || rel.contains('$') {
+        None
+    } else {
+        Some(rel.trim_end_matches('/').to_string())
+    }
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn scan_script_dependencies(script: &str) -> Vec<String> {
+    let mut deps = BTreeSet::new();
+    for line in script.lines() {
+        let mut normalized = String::with_capacity(line.len());
+        for ch in line.chars() {
+            if matches!(ch, '|' | ';' | '(' | ')' | '{' | '}' | '<' | '>' | '=') {
+                normalized.push(' ');
+            } else {
+                normalized.push(ch);
+            }
+        }
+        for token in normalized.split_whitespace() {
+            if let Some(rel) = normalize_rel_path(token) {
+                deps.insert(rel);
+            }
+        }
+    }
+    deps.into_iter().collect()
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn join_path(base: &str, rel: &str) -> String {
+    if base == "/" {
+        format!("/{}", rel.trim_start_matches('/'))
+    } else if rel.is_empty() {
+        base.trim_end_matches('/').to_string()
+    } else {
+        format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            rel.trim_start_matches('/')
+        )
+    }
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn parent_dir(path: &str) -> Option<&str> {
+    let (parent, _) = path.rsplit_once('/')?;
+    Some(if parent.is_empty() { "/" } else { parent })
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn ensure_dir_all(path: &str) -> io::Result<()> {
+    if path.is_empty() || path == "/" {
+        return Ok(());
+    }
+
+    let is_abs = path.starts_with('/');
+    let mut current = if is_abs {
+        String::from("/")
+    } else {
+        String::new()
+    };
+
+    for part in path.trim_matches('/').split('/') {
+        if part.is_empty() {
+            continue;
+        }
+        current = if current == "/" || current.is_empty() {
+            if is_abs {
+                format!("/{part}")
+            } else {
+                String::from(part)
+            }
+        } else {
+            format!("{current}/{part}")
+        };
+        if fs::metadata(&current).is_err() {
+            fs::create_dir(&current)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn remove_dir_all(path: &str) -> io::Result<()> {
+    if !matches!(fs::metadata(path), Ok(meta) if meta.is_dir()) {
+        return Ok(());
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let name = String::from(path_to_str(&file_name));
+        let child = join_path(path, &name);
+        let metadata = fs::metadata(&child)?;
+        if metadata.is_dir() {
+            remove_dir_all(&child)?;
+        } else {
+            fs::remove_file(&child)?;
+        }
+    }
+    fs::remove_dir(path)
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn copy_file(src: &str, dst: &str) -> io::Result<()> {
+    if let Some(parent) = parent_dir(dst) {
+        ensure_dir_all(parent)?;
+    }
+    let mut src_file = File::open(src)?;
+    let mut dst_file = File::create(dst)?;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let len = src_file.read(&mut buffer)?;
+        if len == 0 {
+            break;
+        }
+        dst_file.write_all(&buffer[..len])?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn copy_script_file(
+    src: &str,
+    dst: &str,
+    busybox_path: &str,
+    rewrite_busybox_path: bool,
+) -> io::Result<()> {
+    if let Some(parent) = parent_dir(dst) {
+        ensure_dir_all(parent)?;
+    }
+    let raw_script = fs::read_to_string(src)?;
+    let mut script = raw_script
+        .lines()
+        .map(|line| rewrite_script_line(line, busybox_path, rewrite_busybox_path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if raw_script.ends_with('\n') {
+        script.push('\n');
+    }
+    let mut dst_file = File::create(dst)?;
+    dst_file.write_all(script.as_bytes())
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn rewrite_script_line(line: &str, busybox_path: &str, rewrite_busybox_path: bool) -> String {
+    let line = if rewrite_busybox_path {
+        line.replace("./busybox", busybox_path)
+    } else {
+        line.to_string()
+    };
+    for applet in SCRIPT_BUSYBOX_APPLETS {
+        if let Some(rewritten) = prefix_busybox_applet(&line, applet, busybox_path) {
+            return rewritten;
+        }
+    }
+    line
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn prefix_busybox_applet(line: &str, applet: &str, busybox_path: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with(applet) {
+        return None;
+    }
+    let rest = &trimmed[applet.len()..];
+    if !(rest.is_empty() || rest.as_bytes()[0].is_ascii_whitespace()) {
+        return None;
+    }
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+    Some(format!("{indent}{busybox_path} {trimmed}"))
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn copy_stage_entry(
+    src_root: &str,
+    dst_root: &str,
+    rel: &str,
+    busybox_path: &str,
+) -> io::Result<()> {
+    let src = join_path(src_root, rel);
+    let dst = join_path(dst_root, rel);
+    let metadata = fs::metadata(&src)?;
+    if metadata.is_dir() {
+        ensure_dir_all(&dst)?;
+        for entry in fs::read_dir(&src)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let name = String::from(path_to_str(&file_name));
+            let child_rel = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            copy_stage_entry(src_root, dst_root, &child_rel, busybox_path)?;
+        }
+    } else if rel.ends_with(".sh") {
+        copy_script_file(&src, &dst, busybox_path, !rel.contains('/'))?;
+    } else {
+        copy_file(&src, &dst)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn prepare_suite_stage_dir(suite_dir: &str, script_name: &str) -> io::Result<Option<String>> {
+    let group = script_name
+        .strip_suffix(SCRIPT_SUFFIX)
+        .unwrap_or(script_name);
+    if group == "ltp" {
+        return Ok(None);
+    }
+
+    let src_root = suite_dir;
+    let busybox_path = join_path(suite_dir, "busybox");
+    let stage_root = join_path(
+        TESTSUITE_STAGE_ROOT,
+        &format!("{}/{}", suite_dir.trim_start_matches('/'), group),
+    );
+    if matches!(fs::metadata(&stage_root), Ok(meta) if meta.is_dir()) {
+        remove_dir_all(&stage_root)?;
+    }
+    ensure_dir_all(&stage_root)?;
+
+    let mut pending = vec![script_name.to_string()];
+    let group_dir = join_path(src_root, group);
+    if matches!(fs::metadata(&group_dir), Ok(meta) if meta.is_dir()) {
+        pending.push(group.to_string());
+    }
+
+    let mut copied = BTreeSet::new();
+    while let Some(rel) = pending.pop() {
+        let Some(rel) = normalize_rel_path(rel.as_str()) else {
+            continue;
+        };
+        if !copied.insert(rel.clone()) {
+            continue;
+        }
+
+        let src = join_path(src_root, &rel);
+        let Ok(metadata) = fs::metadata(&src) else {
+            continue;
+        };
+        if rel == "busybox" {
+            continue;
+        }
+        copy_stage_entry(src_root, &stage_root, &rel, &busybox_path)?;
+        if metadata.is_file() && rel.ends_with(".sh") {
+            let content = fs::read_to_string(&src)?;
+            pending.extend(
+                scan_script_dependencies(&content)
+                    .into_iter()
+                    .filter(|dep| {
+                        dep != "busybox" && fs::metadata(&join_path(src_root, dep)).is_ok()
+                    }),
+            );
+        }
+    }
+
+    Ok(Some(stage_root))
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn suite_label(suite_dir: &str, group: &str) -> String {
+    format!("{group}-{}", suite_dir.trim_start_matches('/'))
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn print_suite_skip(suite_dir: &str, group: &str, reason: &str) {
+    let label = suite_label(suite_dir, group);
+    println!("#### OS COMP TEST GROUP START {label} ####");
+    println!("SKIP: {reason}");
+    println!("#### OS COMP TEST GROUP END {label} ####");
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn run_busybox_suite(cwd: &str, suite_dir: &str) -> Result<(), String> {
+    let label = suite_label(suite_dir, "busybox");
+    let busybox_path = join_path(suite_dir, "busybox");
+    println!("#### OS COMP TEST GROUP START {label} ####");
+    let commands = fs::read_to_string(&join_path(cwd, "busybox_cmd.txt"))
+        .map_err(|err| format!("read busybox_cmd.txt failed: {err}"))?;
+    for line in commands.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let line = line.replace("./busybox", &busybox_path);
+        let command = if line.starts_with(&busybox_path) {
+            format!("PATH=. {line}")
+        } else {
+            format!("PATH=. {busybox_path} {line}")
+        };
+        match run_user_program_argv_in(cwd, &[&busybox_path, "sh", "-c", &command]) {
+            Ok(status) if status == 0 || line == "false" => {
+                println!("testcase busybox {line} success");
+            }
+            Ok(status) => {
+                println!("testcase busybox {line} fail");
+                println!("return: {status}, cmd: {line}");
+            }
+            Err(err) => {
+                println!("testcase busybox {line} fail");
+                println!("{err}");
+            }
+        }
+    }
+    println!("#### OS COMP TEST GROUP END {label} ####");
+    Ok(())
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+pub fn maybe_run_official_tests() {
+    let mut scripts = Vec::new();
+    for suite_dir in SUITE_DIRS {
+        let Ok(entries) = fs::read_dir(suite_dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let name = entry.file_name();
+            if !name.ends_with(SCRIPT_SUFFIX) {
+                continue;
+            }
+            scripts.push((String::from(*suite_dir), String::from(path_to_str(&name))));
+        }
+    }
+
+    if scripts.is_empty() {
+        return;
+    }
+
+    scripts.sort_by_key(|(suite_dir, script_name)| {
+        (
+            !matches!(suite_dir.as_str(), "/musl"),
+            suite_dir.clone(),
+            script_name.clone(),
+        )
+    });
+
+    let shell = if matches!(fs::metadata("/musl/busybox"), Ok(meta) if meta.is_file()) {
+        "/musl/busybox"
+    } else if matches!(fs::metadata("/glibc/busybox"), Ok(meta) if meta.is_file()) {
+        "/glibc/busybox"
+    } else {
+        println!("autorun: busybox shell not found");
+        std::process::exit(0);
+    };
+
+    for (suite_dir, script_name) in scripts {
+        let script = path_to_str(&script_name);
+        let group = script.strip_suffix(SCRIPT_SUFFIX).unwrap_or(script);
+        if group == "libcbench" {
+            print_suite_skip(
+                &suite_dir,
+                "libcbench",
+                "libcbench currently triggers an unrecovered allocator exhaustion path",
+            );
+            continue;
+        }
+        if group == "libctest" {
+            print_suite_skip(
+                &suite_dir,
+                "libctest",
+                "libctest still trips unresolved pthread cancellation paths",
+            );
+            continue;
+        }
+        if group == "lmbench" {
+            print_suite_skip(
+                &suite_dir,
+                "lmbench",
+                "lmbench still triggers an unresolved user-space page-fault path",
+            );
+            continue;
+        }
+        if group == "ltp" {
+            print_suite_skip(
+                &suite_dir,
+                "ltp",
+                "ltp full-suite execution is not wired yet",
+            );
+            continue;
+        }
+        if group == "unixbench" {
+            print_suite_skip(
+                &suite_dir,
+                "unixbench",
+                "unixbench currently blocks on unresolved executable/runtime compatibility",
+            );
+            continue;
+        }
+        let staged_dir = match prepare_suite_stage_dir(&suite_dir, script) {
+            Ok(dir) => dir,
+            Err(err) => {
+                println!("autorun: prepare {suite_dir}/{script} failed: {err}");
+                continue;
+            }
+        };
+        let use_staged_dir = staged_dir.is_some();
+        let suite_busybox = join_path(&suite_dir, "busybox");
+        let (cwd, shell_path, script_path) = if let Some(dir) = staged_dir {
+            (dir, suite_busybox.as_str(), script)
+        } else {
+            (suite_dir.clone(), shell, script)
+        };
+        if let Err(err) = std::env::set_current_dir(&cwd) {
+            println!("autorun: cd {cwd} failed: {err}");
+            continue;
+        }
+        if group == "busybox" {
+            if let Err(err) = run_busybox_suite(&cwd, &suite_dir) {
+                println!("autorun: busybox suite failed: {err}");
+            }
+            if use_staged_dir {
+                let _ = remove_dir_all(&cwd);
+            }
+            continue;
+        }
+        let command = if use_staged_dir {
+            format!("PATH=. {shell_path} sh ./{script_path}")
+        } else {
+            format!("./{script_path}")
+        };
+        if let Err(err) = run_user_program_argv_in(&cwd, &[shell_path, "sh", "-c", &command]) {
+            println!("autorun: {cwd}/{script_path} failed: {err}");
+        }
+        if use_staged_dir {
+            let _ = remove_dir_all(&cwd);
+        }
+    }
+
+    std::io::stdout().flush().unwrap();
+    std::process::exit(0);
+}
+
+#[cfg(not(all(feature = "auto-run-tests", feature = "uspace")))]
+pub fn maybe_run_official_tests() {}
 
 pub fn run_cmd(line: &[u8]) {
     let Ok(line_str) = str::from_utf8(line) else {

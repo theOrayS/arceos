@@ -1,10 +1,10 @@
 use crate::{ctypes, utils::check_null_mut_ptr};
 
 use axerrno::LinuxResult;
-use axsync::Mutex;
 
 use core::ffi::c_int;
-use core::mem::{ManuallyDrop, size_of};
+use core::mem::size_of;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 static_assertions::const_assert_eq!(
     size_of::<ctypes::pthread_mutex_t>(),
@@ -12,20 +12,36 @@ static_assertions::const_assert_eq!(
 );
 
 #[repr(C)]
-pub struct PthreadMutex(Mutex<()>);
+pub struct PthreadMutex(AtomicU64);
 
 impl PthreadMutex {
     const fn new() -> Self {
-        Self(Mutex::new(()))
+        Self(AtomicU64::new(0))
     }
 
     fn lock(&self) -> LinuxResult {
-        let _guard = ManuallyDrop::new(self.0.lock());
-        Ok(())
+        let current_id = axtask::current().id().as_u64();
+        loop {
+            match self
+                .0
+                .compare_exchange_weak(0, current_id, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(()),
+                Err(owner_id) => {
+                    assert_ne!(owner_id, current_id, "pthread mutex already owned by current task");
+                    axtask::yield_now();
+                }
+            }
+        }
     }
 
     fn unlock(&self) -> LinuxResult {
-        unsafe { self.0.force_unlock() };
+        let current_id = axtask::current().id().as_u64();
+        let owner_id = self.0.swap(0, Ordering::Release);
+        assert_eq!(
+            owner_id, current_id,
+            "pthread mutex released by non-owner task"
+        );
         Ok(())
     }
 }

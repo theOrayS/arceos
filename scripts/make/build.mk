@@ -50,6 +50,9 @@ endif
 $(OUT_DIR):
 	$(call run_cmd,mkdir,-p $@)
 
+$(OUT_ELF): _cargo_build | $(OUT_DIR)
+	@:
+
 $(OUT_BIN): _cargo_build $(OUT_ELF)
 	$(call run_cmd,$(OBJCOPY),$(OUT_ELF) --strip-all -O binary $@)
 	@if [ ! -s $(OUT_BIN) ]; then \

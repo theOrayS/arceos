@@ -15,10 +15,11 @@ ramfs = ["dep:axfs_ramfs"]
 procfs = ["dep:axfs_ramfs"]
 sysfs = ["dep:axfs_ramfs"]
 fatfs = ["dep:fatfs"]
+ext4fs = ["dep:ext4-view"]
 myfs = ["dep:crate_interface"]
 use-ramdisk = []
 
-default = ["devfs", "ramfs", "fatfs", "procfs", "sysfs"]
+default = ["devfs", "ramfs", "fatfs", "ext4fs", "procfs", "sysfs"]
 
 [dependencies]
 log = "0.4"
@@ -47,6 +48,11 @@ features = [ # no std
     "log_level_trace",
     "unicode",
 ]
+
+[dependencies.ext4-view]
+version = "0.9.3"
+optional = true
+default-features = false
 
 [dev-dependencies]
 axdriver = { workspace = true, features = ["block", "ramdisk"] }

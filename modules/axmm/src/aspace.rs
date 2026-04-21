@@ -77,6 +77,49 @@ impl AddrSpace {
         Ok(())
     }
 
+    /// Clones all user mappings from another address space.
+    ///
+    /// Unlike [`Self::copy_mappings_from`], this duplicates user mappings even
+    /// when the two address spaces cover the same virtual range. Allocation
+    /// backends are recreated in the destination, and currently mapped pages
+    /// are copied page-by-page.
+    pub fn clone_user_mappings_from(&mut self, other: &AddrSpace) -> AxResult {
+        if self.va_range != other.va_range {
+            return ax_err!(InvalidInput, "address space range mismatch");
+        }
+
+        self.clear();
+
+        for area in other.areas.iter() {
+            let cloned_area =
+                MemoryArea::new(area.start(), area.size(), area.flags(), area.backend().clone());
+            self.areas
+                .map(cloned_area, &mut self.pt, false)
+                .map_err(mapping_err_to_ax_err)?;
+
+            let fault_flags = fault_flags_from_mapping(area.flags());
+            for vaddr in PageIter4K::new(area.start(), area.end())
+                .expect("memory area bounds must be 4K aligned")
+            {
+                let Ok((src_paddr, _, _)) = other.pt.query(vaddr) else {
+                    continue;
+                };
+                if self.pt.query(vaddr).is_err() && !self.handle_page_fault(vaddr, fault_flags) {
+                    return ax_err!(BadState, "failed to materialize child page");
+                }
+                let (dst_paddr, _, _) = self.pt.query(vaddr).map_err(|_| AxError::BadState)?;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        phys_to_virt(src_paddr).as_ptr(),
+                        phys_to_virt(dst_paddr).as_mut_ptr(),
+                        PAGE_SIZE_4K,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Finds a free area that can accommodate the given size.
     ///
     /// The search starts from the given hint address, and the area should be within the given limit range.
@@ -238,11 +281,9 @@ impl AddrSpace {
             return ax_err!(InvalidInput, "address not aligned");
         }
 
-        // TODO
-        self.pt
-            .cursor()
-            .protect_region(start, size, flags)
-            .map_err(|_| AxError::BadState)?;
+        self.areas
+            .protect(start, size, |_| Some(flags), &mut self.pt)
+            .map_err(mapping_err_to_ax_err)?;
         Ok(())
     }
 
@@ -304,6 +345,16 @@ impl AddrSpace {
             }
         }
         false
+    }
+}
+
+fn fault_flags_from_mapping(flags: MappingFlags) -> PageFaultFlags {
+    if flags.contains(MappingFlags::WRITE) {
+        PageFaultFlags::WRITE
+    } else if flags.contains(MappingFlags::EXECUTE) {
+        PageFaultFlags::EXECUTE
+    } else {
+        PageFaultFlags::READ
     }
 }
 

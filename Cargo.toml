@@ -69,3 +69,6 @@ axipi = { path = "modules/axipi" }
 
 [profile.release]
 lto = true
+
+[patch.crates-io]
+axcpu = { path = "vendor/axcpu" }
