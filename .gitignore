@@ -14,5 +14,4 @@ rusty-tags.vi
 *.log
 kernel-*
 .gdb_history
-vendor/
 build/
