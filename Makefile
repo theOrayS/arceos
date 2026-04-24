@@ -304,7 +304,7 @@ run-rv: kernel-rv prepare-rv-testsuite-img
 
 run-la: kernel-la prepare-la-testsuite-img
 	qemu-system-loongarch64 -kernel $(KERNEL_LA) -m $(LA_MEM) -nographic -smp $(KERNEL_SMP) -drive file=$(LA_TESTSUITE_RUN_IMG),if=none,format=qcow2,id=x0 \
-		-device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0 \
+		-device virtio-blk-pci,drive=x0 -no-reboot -device virtio-net-pci,netdev=net0,romfile= \
 		-netdev $(LA_NETDEV_ARGS) -rtc base=utc $(la_aux_drive)
 
 disasm:
