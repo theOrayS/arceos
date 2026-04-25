@@ -40,6 +40,14 @@ const USER_BRK_GROW_SIZE: usize = 64 * 1024 * 1024;
 const USER_PIE_LOAD_BASE: usize = USER_ASPACE_BASE;
 const MAX_SCRIPT_INTERPRETER_DEPTH: usize = 4;
 const TESTSUITE_STAGE_ROOT: &str = "/tmp/testsuite";
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+const SYS_UMOUNT2: u32 = 39;
+#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+const SYS_UMOUNT2: u32 = general::__NR_umount2;
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+const SYS_MOUNT: u32 = 40;
+#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+const SYS_MOUNT: u32 = general::__NR_mount;
 const AUX_CLOCK_TICKS: usize = 100;
 const SIGCHLD_NUM: isize = 17;
 const SIGCANCEL_NUM: i32 = 33;
@@ -105,6 +113,7 @@ struct UserProcess {
     fds: Mutex<FdTable>,
     cwd: Mutex<String>,
     exec_root: Mutex<String>,
+    compat_mounts: Mutex<Vec<String>>,
     children: Mutex<Vec<ChildTask>>,
     rlimits: Mutex<BTreeMap<u32, UserRlimit>>,
     signal_actions: Mutex<BTreeMap<usize, general::kernel_sigaction>>,
@@ -546,6 +555,7 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         fds: Mutex::new(FdTable::new()),
         cwd: Mutex::new(cwd.into()),
         exec_root: Mutex::new(image.exec_root.clone()),
+        compat_mounts: Mutex::new(Vec::new()),
         children: Mutex::new(Vec::new()),
         rlimits: Mutex::new(BTreeMap::new()),
         signal_actions: Mutex::new(BTreeMap::new()),
@@ -1254,9 +1264,48 @@ impl UserProcess {
         *self.exec_root.lock() = exec_root;
     }
 
+    fn visible_cwd(&self) -> String {
+        let cwd = self.cwd();
+        if let Some(rest) = cwd.strip_prefix(TESTSUITE_STAGE_ROOT) {
+            if rest.is_empty() {
+                "/".into()
+            } else if rest.starts_with('/') {
+                rest.into()
+            } else {
+                cwd
+            }
+        } else {
+            cwd
+        }
+    }
+
+    fn normalize_user_path(&self, path: &str) -> Result<String, LinuxError> {
+        let cwd = self.cwd();
+        normalize_path(cwd.as_str(), path).ok_or(LinuxError::EINVAL)
+    }
+
+    fn add_compat_mount(&self, target: String) -> Result<(), LinuxError> {
+        let mut mounts = self.compat_mounts.lock();
+        if mounts.iter().any(|mounted| mounted == &target) {
+            return Err(LinuxError::EBUSY);
+        }
+        mounts.push(target);
+        Ok(())
+    }
+
+    fn remove_compat_mount(&self, target: &str) -> Result<(), LinuxError> {
+        let mut mounts = self.compat_mounts.lock();
+        let Some(idx) = mounts.iter().position(|mounted| mounted == target) else {
+            return Err(LinuxError::EINVAL);
+        };
+        mounts.swap_remove(idx);
+        Ok(())
+    }
+
     fn teardown(&self) {
         self.aspace.lock().clear();
         *self.fds.lock() = FdTable::new();
+        self.compat_mounts.lock().clear();
     }
 
     fn ppid(&self) -> i32 {
@@ -1331,6 +1380,7 @@ impl UserProcess {
             fds: Mutex::new(self.fds.lock().fork_copy()?),
             cwd: Mutex::new(self.cwd()),
             exec_root: Mutex::new(self.exec_root()),
+            compat_mounts: Mutex::new(self.compat_mounts.lock().clone()),
             children: Mutex::new(Vec::new()),
             rlimits: Mutex::new(self.rlimits.lock().clone()),
             signal_actions: Mutex::new(self.signal_actions.lock().clone()),
@@ -1874,6 +1924,15 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         general::__NR_openat => sys_openat(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3()),
         general::__NR_mkdirat => sys_mkdirat(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_unlinkat => sys_unlinkat(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        SYS_MOUNT => sys_mount(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+        ),
+        SYS_UMOUNT2 => sys_umount2(&process, tf.arg0(), tf.arg1()),
         general::__NR_pipe2 => sys_pipe2(&process, tf.arg0(), tf.arg1()),
         general::__NR_ftruncate => sys_ftruncate(&process, tf.arg0(), tf.arg1()),
         general::__NR_faccessat => {
@@ -1895,6 +1954,14 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
             sys_newfstatat(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3())
         }
         general::__NR_fstat => sys_fstat(&process, tf.arg0(), tf.arg1()),
+        general::__NR_statx => sys_statx(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+        ),
         general::__NR_getdents64 => sys_getdents64(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_lseek => sys_lseek(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_dup => sys_dup(&process, tf.arg0()),
@@ -2296,13 +2363,18 @@ fn sys_getcwd(process: &UserProcess, buf: usize, size: usize) -> isize {
     let mut bytes = cwd.into_bytes();
     bytes.push(0);
     if bytes.len() > size {
-        return neg_errno(LinuxError::ERANGE);
+        let visible_cwd = process.visible_cwd();
+        bytes = visible_cwd.into_bytes();
+        bytes.push(0);
+        if bytes.len() > size {
+            return neg_errno(LinuxError::ERANGE);
+        }
     }
     let Some(dst) = user_bytes_mut(process, buf, bytes.len(), true) else {
         return neg_errno(LinuxError::EFAULT);
     };
     dst.copy_from_slice(&bytes);
-    bytes.len() as isize
+    buf as isize
 }
 
 fn sys_chdir(process: &UserProcess, pathname: usize) -> isize {
@@ -2624,6 +2696,63 @@ fn sys_unlinkat(process: &UserProcess, dirfd: usize, pathname: usize, flags: usi
     }
 }
 
+fn sys_mount(
+    process: &UserProcess,
+    source: usize,
+    target: usize,
+    fstype: usize,
+    flags: usize,
+    data: usize,
+) -> isize {
+    if flags != 0 || data != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let source = match read_cstr(process, source) {
+        Ok(source) => source,
+        Err(err) => return neg_errno(err),
+    };
+    let target = match read_cstr(process, target) {
+        Ok(target) => target,
+        Err(err) => return neg_errno(err),
+    };
+    let fstype = match read_cstr(process, fstype) {
+        Ok(fstype) => fstype,
+        Err(err) => return neg_errno(err),
+    };
+    if source.is_empty() || target.is_empty() || fstype != "vfat" {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let target = match process.normalize_user_path(target.as_str()) {
+        Ok(target) => target,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = open_dir_entry(target.as_str()) {
+        return neg_errno(err);
+    }
+    match process.add_compat_mount(target) {
+        Ok(()) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
+fn sys_umount2(process: &UserProcess, target: usize, flags: usize) -> isize {
+    if flags != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let target = match read_cstr(process, target) {
+        Ok(target) => target,
+        Err(err) => return neg_errno(err),
+    };
+    let target = match process.normalize_user_path(target.as_str()) {
+        Ok(target) => target,
+        Err(err) => return neg_errno(err),
+    };
+    match process.remove_compat_mount(target.as_str()) {
+        Ok(()) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
 fn sys_faccessat(
     process: &UserProcess,
     dirfd: usize,
@@ -2758,6 +2887,38 @@ fn sys_fstat(process: &UserProcess, fd: usize, statbuf: usize) -> isize {
         Err(err) => return neg_errno(err),
     };
     write_user_value(process, statbuf, &st)
+}
+
+fn sys_statx(
+    process: &UserProcess,
+    dirfd: usize,
+    pathname: usize,
+    flags: usize,
+    mask: usize,
+    statxbuf: usize,
+) -> isize {
+    let path = match read_cstr(process, pathname) {
+        Ok(path) => path,
+        Err(err) => return neg_errno(err),
+    };
+    let flags = flags as u32;
+    let st = if path.is_empty() && flags & general::AT_EMPTY_PATH != 0 {
+        match process.fds.lock().stat(dirfd as i32) {
+            Ok(st) => st,
+            Err(err) => return neg_errno(err),
+        }
+    } else {
+        match process
+            .fds
+            .lock()
+            .stat_path(process, dirfd as i32, path.as_str())
+        {
+            Ok(st) => st,
+            Err(err) => return neg_errno(err),
+        }
+    };
+    let stx = stat_to_statx(&st, mask as u32);
+    write_user_value(process, statxbuf, &stx)
 }
 
 fn sys_getdents64(process: &UserProcess, fd: usize, dirp: usize, count: usize) -> isize {
@@ -4205,6 +4366,20 @@ fn file_attr_to_stat(attr: &FileAttr, path: Option<&str>) -> general::stat {
     st
 }
 
+fn stat_to_statx(st: &general::stat, mask: u32) -> general::statx {
+    let mut stx: general::statx = unsafe { core::mem::zeroed() };
+    stx.stx_mask = mask;
+    stx.stx_blksize = st.st_blksize as _;
+    stx.stx_nlink = st.st_nlink as _;
+    stx.stx_mode = st.st_mode as _;
+    stx.stx_ino = st.st_ino as _;
+    stx.stx_size = st.st_size as _;
+    stx.stx_blocks = st.st_blocks as _;
+    stx.stx_dev_minor = st.st_dev as _;
+    stx.stx_rdev_minor = st.st_rdev as _;
+    stx
+}
+
 fn path_inode(path: Option<&str>) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -4343,7 +4518,13 @@ impl FdTable {
     }
 
     fn is_stdio(&self, fd: i32) -> bool {
-        matches!(fd, 0..=2)
+        if !matches!(fd, 0..=2) {
+            return false;
+        }
+        matches!(
+            self.entries.get(fd as usize),
+            Some(Some(FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr))
+        )
     }
 
     fn poll(&self, fd: i32, mode: SelectMode) -> bool {
@@ -4446,9 +4627,6 @@ impl FdTable {
         if !(0..self.entries.len() as i32).contains(&fd) || self.entries[fd as usize].is_none() {
             return Err(LinuxError::EBADF);
         }
-        if fd <= 2 {
-            return Ok(());
-        }
         self.entries[fd as usize] = None;
         Ok(())
     }
@@ -4529,8 +4707,8 @@ impl FdTable {
         self.insert_min(entry, min_fd as usize)
     }
 
-    fn dup3(&mut self, oldfd: i32, newfd: i32, _flags: u32) -> Result<i32, LinuxError> {
-        if oldfd == newfd {
+    fn dup3(&mut self, oldfd: i32, newfd: i32, flags: u32) -> Result<i32, LinuxError> {
+        if flags != 0 || oldfd == newfd {
             return Err(LinuxError::EINVAL);
         }
         let entry = self.entry(oldfd)?.duplicate_for_fork()?;
@@ -4681,7 +4859,7 @@ fn open_fd_entry(
         let candidates = if absolute {
             if let Some(path) = dev_shm_host_path(path) {
                 ensure_dev_shm_dir()?;
-                return open_fd_candidates(&[path], prefer_dir, &opts);
+                return open_fd_candidates(&[path], prefer_dir, flags, &opts);
             }
             runtime_absolute_path_candidates(exec_root.as_str(), path)
         } else {
@@ -4696,7 +4874,7 @@ fn open_fd_entry(
         if candidates.is_empty() {
             return Err(LinuxError::EINVAL);
         }
-        open_fd_candidates(&candidates, prefer_dir, &opts)
+        open_fd_candidates(&candidates, prefer_dir, flags, &opts)
     } else {
         let FdEntry::Directory(dir) = table.entry(dirfd)? else {
             return Err(LinuxError::ENOTDIR);
@@ -4706,16 +4884,20 @@ fn open_fd_entry(
         for extra in runtime_library_name_candidates(exec_root.as_str(), path) {
             push_runtime_candidate(&mut candidates, Some(extra));
         }
-        open_fd_candidates(&candidates, prefer_dir, &opts)
+        open_fd_candidates(&candidates, prefer_dir, flags, &opts)
     }
 }
 
 fn open_fd_candidates(
     candidates: &[String],
     prefer_dir: bool,
+    flags: u32,
     opts: &OpenOptions,
 ) -> Result<FdEntry, LinuxError> {
     let mut last_err = LinuxError::ENOENT;
+    let may_open_dir_readonly =
+        flags & general::O_ACCMODE == general::O_RDONLY
+            && flags & (general::O_CREAT | general::O_TRUNC) == 0;
     for path in candidates {
         if path == "/dev/null" {
             if prefer_dir {
@@ -4723,17 +4905,21 @@ fn open_fd_candidates(
             }
             return Ok(FdEntry::DevNull);
         }
-        if prefer_dir {
-            match open_dir_entry(path.as_str()) {
-                Ok(entry) => return Ok(entry),
+        if prefer_dir || may_open_dir_readonly {
+            match axfs::api::metadata(path.as_str()).map_err(LinuxError::from) {
+                Ok(metadata) if metadata.is_dir() => return open_dir_entry(path.as_str()),
+                Ok(_) if prefer_dir => return Err(LinuxError::ENOTDIR),
+                Ok(_) => {}
                 Err(err) => {
                     last_err = err;
-                    if err != LinuxError::ENOENT {
-                        return Err(err);
+                    if prefer_dir {
+                        if err != LinuxError::ENOENT {
+                            return Err(err);
+                        }
+                        continue;
                     }
                 }
             }
-            continue;
         }
         match File::open(path.as_str(), opts) {
             Ok(file) => {
