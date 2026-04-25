@@ -28,6 +28,16 @@ Every compatibility path must include a nearby comment with this shape:
 - Compatibility state must not be copied into real subsystem APIs. When the
   real interface exists, delete the compatibility state rather than
   synchronizing both states.
+- Do not pass tests by detecting test names, workload names, fixed staging
+  paths, or command strings and returning canned success. Test-driven fixes
+  must implement the Linux-visible behavior that the test exercises.
+- Do not hardcode broad allowlists such as one filesystem type, one device
+  path, or one flag combination unless the code is explicitly marked
+  `compat_*`, rejects unsupported states with errno, and has a documented
+  deletion condition.
+- Do not return success for unsupported state-changing operations unless the
+  compatibility layer records enough state for later validation and inverse
+  operations.
 
 ## Filesystem Compatibility Guardrails
 

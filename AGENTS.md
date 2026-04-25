@@ -79,6 +79,13 @@ syscall numbers against `examples/shell/src/uspace.rs` and
 Compatibility code must use `compat_` naming, include a milestone and deletion
 condition, and must not return fake success for unsupported states.
 
+Do not pass tests by opportunistic shortcuts. Avoid pseudo implementations,
+broad hardcoded test special cases, workload-name/path/command branches, and
+silent success for unsupported behavior. If a temporary compatibility path is
+unavoidable, it must be narrow, named `compat_*`, reject unsupported states
+with explicit errno, record enough state for inverse operations, and document
+its deletion condition in `docs/development/policies/compatibility.md`.
+
 For filesystem/fd changes, keep the focused `basic` subset green on both
 RISC-V64 and LoongArch64. Use the workspace-root test wrappers, stop only QEMU
 after the relevant `basic` section if needed, and parse saved logs with
