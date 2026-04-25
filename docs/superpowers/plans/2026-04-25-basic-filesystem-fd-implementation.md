@@ -22,8 +22,16 @@
 ## Execution Environment
 
 The host machine does not provide the Rust build environment needed for ArceOS.
-All Rust, cargo, kernel build, and QEMU make targets must run inside the running
-Docker container named `arceos-eval-fix`.
+All Rust, cargo, kernel build, and QEMU make targets must run inside the
+long-lived Docker container named `arceos-eval-fix`.
+
+`arceos-eval-fix` already exists and may be stopped. Do not delete it, recreate
+it, run `docker rm` against it, or replace it with a temporary `--rm` container.
+If it is stopped, start it with:
+
+```bash
+docker start arceos-eval-fix
+```
 
 Use these conventions throughout the plan:
 
