@@ -2881,12 +2881,18 @@ fn sys_statx(
     mask: usize,
     statxbuf: usize,
 ) -> isize {
+    let flags = flags as u32;
+    if let Err(err) = crate::linux_fs::validate_statx_flags(flags) {
+        return neg_errno(err);
+    }
     let path = match read_cstr(process, pathname) {
         Ok(path) => path,
         Err(err) => return neg_errno(err),
     };
-    let flags = flags as u32;
-    let st = if path.is_empty() && flags & general::AT_EMPTY_PATH != 0 {
+    let st = if path.is_empty() {
+        if !crate::linux_fs::statx_accepts_empty_path(flags) {
+            return neg_errno(LinuxError::ENOENT);
+        }
         match process.fds.lock().stat(dirfd as i32) {
             Ok(st) => st,
             Err(err) => return neg_errno(err),
@@ -2901,7 +2907,7 @@ fn sys_statx(
             Err(err) => return neg_errno(err),
         }
     };
-    let stx = stat_to_statx(&st, mask as u32);
+    let stx = crate::linux_fs::stat_to_statx(&st, mask as u32);
     write_user_value(process, statxbuf, &stx)
 }
 
@@ -4327,20 +4333,6 @@ fn file_attr_to_stat(attr: &FileAttr, path: Option<&str>) -> general::stat {
     st.st_blksize = 512;
     st.st_blocks = attr.blocks() as _;
     st
-}
-
-fn stat_to_statx(st: &general::stat, mask: u32) -> general::statx {
-    let mut stx: general::statx = unsafe { core::mem::zeroed() };
-    stx.stx_mask = mask;
-    stx.stx_blksize = st.st_blksize as _;
-    stx.stx_nlink = st.st_nlink as _;
-    stx.stx_mode = st.st_mode as _;
-    stx.stx_ino = st.st_ino as _;
-    stx.stx_size = st.st_size as _;
-    stx.stx_blocks = st.st_blocks as _;
-    stx.stx_dev_minor = st.st_dev as _;
-    stx.stx_rdev_minor = st.st_rdev as _;
-    stx
 }
 
 fn path_inode(path: Option<&str>) -> u64 {
