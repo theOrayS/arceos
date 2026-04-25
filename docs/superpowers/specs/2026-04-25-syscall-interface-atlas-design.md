@@ -126,15 +126,17 @@ Known interface gaps:
 
 ## Required Interface Contracts
 
-These are the interface shapes the syscall layer should be able to call. They
-are intentionally small contracts, not final internal implementations.
+These are the interface shapes the syscall layer should be able to call. The
+Rust blocks are example API sketches: crate boundaries, type names, field names,
+and exact ownership can change to match the implementation. The required
+semantics listed under each sketch are hard constraints.
 
 ### Runtime Mount Contract
 
 Provider: `axfs` or an `axfs`-owned crate/module. The syscall layer should not
 own the real mount table.
 
-Expected contract:
+Example API sketch:
 
 ```rust
 pub struct MountRequest<'a> {
@@ -170,7 +172,7 @@ Provider: memory manager plus filesystem/open-file-description layer. The
 syscall layer should construct the request and let the VMA/page-fault path own
 semantics.
 
-Expected contract:
+Example API sketch:
 
 ```rust
 pub trait FileMapping: Send + Sync {
@@ -210,7 +212,7 @@ Required semantics:
 Provider: task/process layer above `axtask`. The syscall layer can translate
 Linux flags, but process identity and lifecycle should be explicit.
 
-Expected contract:
+Example API sketch:
 
 ```rust
 pub struct Process {
@@ -252,12 +254,17 @@ Required semantics:
 
 ## Core Authority Models
 
+The structs below are example shapes for discussion and review. The rules under
+each model are the required behavior. Implementations may choose different type
+names or module boundaries if those rules remain true and the deviation is
+recorded in the implementation plan.
+
 ### File Descriptor and Open-File-Description Model
 
 This is a Phase 1 prerequisite, not an open-ended future question. Linux file
 semantics depend on separating fd slots from open file descriptions.
 
-Target model:
+Example model sketch:
 
 ```rust
 pub struct FdTable {
@@ -305,7 +312,7 @@ Rules:
 All path-taking syscalls should use one resolver. Ad hoc path joins in syscall
 handlers should be deleted as the resolver becomes available.
 
-Resolver input:
+Example resolver input:
 
 ```rust
 pub struct PathResolveRequest<'a> {
@@ -344,7 +351,7 @@ Rules:
 `AddrSpace` should execute page-table changes. A separate memory map/VMA layer
 must own Linux mmap semantics.
 
-Target model:
+Example model sketch:
 
 ```rust
 pub struct MemoryMap {
@@ -378,7 +385,12 @@ Rules:
 
 ### Concurrency and Lifecycle Model
 
-Initial lock order should be stable before broad process/thread work:
+The order below is a provisional acquisition order for short, non-blocking
+critical sections. Blocking operations must first copy or `Arc`-clone the
+needed object references, release higher-level locks, and only then sleep,
+wait, or perform potentially blocking backend I/O.
+
+Reference acquisition order:
 
 1. process registry/global pid table;
 2. `UserProcess` lifecycle state;
@@ -386,23 +398,29 @@ Initial lock order should be stable before broad process/thread work:
 4. open-file-description backend lock;
 5. `MemoryMap`;
 6. `AddrSpace`;
-7. child list or wait queue state.
+7. child list state.
 
 Rules:
 
 - Never hold `FdTable` while blocking on pipe/futex/wait queue operations.
+- Never hold `UserProcess`, `FdTable`, `MemoryMap`, or `AddrSpace` locks while
+  waiting on a wait queue, pipe condition, futex queue, or child exit.
 - A syscall that obtains an `Arc<OpenFileDescription>` may continue using it if
   another thread closes the fd slot after lookup.
 - `close` removes the fd slot; it does not destroy the open file description
   until the last `Arc` is dropped.
+- Page fault handling may consult VMA metadata, but it must not block on
+  filesystem I/O while holding unrelated process or fd-table locks.
 - `fork` snapshots fd slots and process state under process/fd locks, then
   creates the child task.
 - `execve` builds the new memory image first; the switch to new memory/fd
   close-on-exec state is committed in one step.
-- `exit` transitions the thread/process to zombie state, wakes waiters, handles
-  `clear_child_tid`, and only then releases task-local resources.
-- `wait*` observes `Running -> Zombie -> Reaped`; only one waiter can reap a
-  child.
+- `exit` transitions the thread/process to zombie state under lifecycle locks,
+  releases those locks, wakes waiters, handles `clear_child_tid`, and only then
+  releases task-local resources.
+- `wait*` checks child state under the child-list lock, releases it before
+  blocking, and observes `Running -> Zombie -> Reaped`; only one waiter can reap
+  a child.
 
 ## Syscall Atlas
 
@@ -410,6 +428,22 @@ The `nr(rv/la)` column uses the contest generic Linux ABI values from
 `testsuits-for-oskernel/basic/user/lib/syscall_ids.h`; RISC-V64 and
 LoongArch64 share these values for the tracked syscalls. `mount` and `umount2`
 are explicitly forced to 40 and 39 in `uspace.rs` for both architectures.
+
+Maintenance and source rules:
+
+- Any change that adds, removes, renames, or changes behavior of a syscall
+  dispatcher arm or `sys_*` handler must update this table in the same commit.
+- `Current handler` is sourced from `examples/shell/src/uspace.rs`, especially
+  `user_syscall` and the matching `sys_*` function definitions.
+- `nr(rv/la)` is sourced from `examples/shell/src/uspace.rs` for explicit
+  architecture overrides and from
+  `testsuits-for-oskernel/basic/user/lib/syscall_ids.h` for the generic contest
+  ABI. If those disagree, record the exception next to the syscall instead of
+  silently choosing one.
+- `Status` is based on the implementation that exists in code, not the intended
+  final design.
+- Before using the table as a gate artifact, verify it with `rg` against
+  `uspace.rs` and the testsuite syscall header.
 
 Status values:
 
@@ -582,6 +616,19 @@ Gate rule: a workload can become a promotion gate only when unsupported
 syscalls in its row return explicit Linux-style errors and no required behavior
 is still implemented as silent success.
 
+Pass/fail standards:
+
+| Gate | Pass standard |
+| --- | --- |
+| `basic` filesystem/fd | The focused cases `chdir`, `close`, `dup`, `dup2`, `fstat`, `getcwd`, `getdents`, `mkdir_`, `mount`, `open`, `openat`, `pipe`, `read`, `umount`, `unlink`, and `write` pass on RISC-V64 and LoongArch64, and the gate notes show no new `Stub-success` paths. |
+| `busybox` file commands | The file-operation section of `scripts/busybox/busybox_cmd.txt` passes: `touch`, redirection write/append, `cat`, `cut`, `od`, `head`, `tail`, `hexdump`, `md5sum`, `sort | uniq`, `stat`, `strings`, `wc`, `[ -f ]`, `more`, `rm`, `mkdir`, `mv`, `rmdir`, `grep`, `cp`, and `find`. |
+| `iozone` functional gate | The commands in `scripts/iozone/iozone_testcode.sh` complete for `-r 1k`, `-s 4m` automatic mode and the `-t 4`, `-r 1k`, `-s 1m` modes `0/1`, `0/2`, `0/3`, `0/5`, `6/7`, `9/10`, and `11/12`. This gate checks completion and data-path correctness, not final performance ranking. |
+| `UnixBench fstime` | `fstime` write/read/copy emits counts for small `-b 256 -m 500`, middle `-b 1024 -m 2000`, and big `-b 4096 -m 8000` cases. Performance regressions are tracked separately unless they cause timeout or zero/invalid counts. |
+| `lmbench` filesystem/file | The selected single-purpose microbenchmark emits a valid result and can be rerun without stale state; broaden only after the reduced case is stable. |
+| LTP filesystem gates | Each promoted LTP testcase must either pass or fail only because the documented unsupported syscall returns the documented errno. Unexpected success from compatibility code is a gate failure. |
+| Memory gates | Anonymous `brk/mmap/munmap` basic cases pass before libcbench; file-backed mmap gates require VMA-backed semantics, not eager one-shot file reads. |
+| Process/scheduler gates | Basic process cases pass before cyclictest/UnixBench/lmbench; unsupported clone/scheduler flags return documented errors rather than being ignored. |
+
 ## Memory Interface Matrix
 
 | Area | Current syscall target | Available real interface | Status | Next architectural move |
@@ -623,6 +670,22 @@ for this project is:
 5. perform the operation;
 6. copy output user memory last, and roll back state when the syscall contract
    requires atomicity.
+
+Unsupported-feature strategy:
+
+- a syscall with no dispatcher arm returns `ENOSYS`.
+- a known syscall with an unsupported flag, option, or invalid flag combination
+  usually returns `EINVAL`.
+- a known syscall whose backend capability does not exist returns
+  `EOPNOTSUPP`, `ENODEV`, or a more specific backend errno.
+- a syscall handler that exists only for future integration must not return 0
+  for unimplemented behavior.
+- `statx` unsupported fields are omitted from the returned mask; invalid flags
+  still return `EINVAL`.
+- `mount` with an unknown filesystem type returns `ENODEV` or `EOPNOTSUPP`;
+  unsupported mount flags return `EINVAL` or `EOPNOTSUPP`.
+- NUMA and page-pinning calls return explicit unsupported errors until real
+  NUMA or pinning state exists.
 
 High-frequency syscall rules:
 
@@ -763,19 +826,38 @@ Target state:
   `EOPNOTSUPP`.
 - Add small focused checks before broad workload runs.
 
-### Phase 1: Real Filesystem Interfaces
+### Phase 1A: FD, Resolver, and Errno Guardrails
 
 - Implement the fd slot/open-file-description model before expanding broad file
   semantics.
 - Add the unified path resolver and route `openat`, `mkdirat`, `unlinkat`,
   `renameat2`, `statx/newfstatat`, and `chdir` through it.
+- Add `FD_CLOEXEC`, fd status flags, and shared offset semantics for duplicated
+  fds and forked children.
+- Convert unsupported flags and missing backend capabilities to explicit errno.
+- Keep the syscall atlas updated with every touched handler.
+- Gate with focused `basic` filesystem/fd plus the busybox file commands that
+  do not require mount/devfs.
+
+### Phase 1B: Core File I/O and Metadata
+
+- Complete `fsync`, `fdatasync`, `truncate`, `ftruncate`, `pread/pwrite`,
+  `readv/writev`, `preadv/pwritev`, and repeated `getdents64` offset
+  semantics.
+- Improve metadata projection for `stat`, `fstat`, `newfstatat`, `statx`,
+  `statfs`, and `fstatfs`.
+- Make `O_APPEND`, short I/O, nonseekable fd errors, and directory fd errors
+  match the errno policy.
+- Gate with busybox file commands, iozone functional commands, UnixBench
+  `fstime`, and selected lmbench filesystem/file microbenchmarks.
+
+### Phase 1C: Runtime Mount and Device Namespace
+
 - Replace compatibility mount state with a real runtime mount/unmount API.
 - Add or route through real device/filesystem factory interfaces.
-- Complete `fsync`, `truncate`, `pread/pwrite`, `readv/writev`, and shared file
-  offset semantics.
-- Improve metadata projection for `stat`, `fstat`, `newfstatat`, and `statx`.
-- Use `busybox`, `iozone`, `UnixBench fstime`, and `lmbench` filesystem tests as
-  the promotion gate after `basic`.
+- Move `/dev/*` handling behind a devfs or device registry.
+- Delete `compat_mounts` once mounted contents are observable through VFS.
+- Gate with LTP `fs_bind`, `fs_readonly`, and mount-related busybox behavior.
 
 ### Phase 2: Memory Manager Contracts
 
@@ -798,13 +880,16 @@ Run verification inside `arceos-eval-fix`.
 
 Minimum gates:
 
-1. After filesystem/fd changes: rerun the focused `basic` filesystem/fd subset
-   on RISC-V and LoongArch where practical.
-2. After real filesystem interface changes: run busybox file commands, iozone,
-   UnixBench fstime, and lmbench filesystem/file tests.
-3. After memory changes: run `basic` memory tests, libcbench, lmbench mmap and
+1. After Phase 1A changes: rerun the focused `basic` filesystem/fd subset on
+   RISC-V and LoongArch, then run the busybox file commands that do not depend
+   on mount/devfs.
+2. After Phase 1B changes: run busybox file commands, iozone functional
+   commands, UnixBench fstime, and selected lmbench filesystem/file tests.
+3. After Phase 1C changes: run mount/devfs-focused tests, then LTP `fs_bind`
+   and `fs_readonly` reductions.
+4. After memory changes: run `basic` memory tests, libcbench, lmbench mmap and
    pagefault tests, then focused LTP memory runtests.
-4. After process/scheduling changes: run `basic` process tests, cyclictest,
+5. After process/scheduling changes: run `basic` process tests, cyclictest,
    UnixBench process tests, lmbench process/signal tests, then focused LTP
    sched/nptl runtests.
 
@@ -818,6 +903,13 @@ that reduced case to the phase gate before making another broad pass.
   it.
 - Should `statx` be backed by an extended metadata trait or by filesystem-
   specific optional fields?
+- Should the VMA layer be provided directly by `axmm`, or should the shell
+  syscall path maintain a transitional `MemoryMap` until `axmm` owns Linux VMA
+  semantics?
+- Should the unified path resolver live in the syscall layer, the `axfs` API
+  layer, or a user-namespace layer above `axfs`?
+- Should the unsupported-syscall errno policy be project-wide, or scoped first
+  to the shell/testsuite syscall path?
 - What is the intended Linux pid/thread model for `clone` and `fork` in this
   project?
 - Which workloads are the first promotion gate after `basic`: busybox file
