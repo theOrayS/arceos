@@ -19,6 +19,24 @@
 - No testsuite source files are modified.
   The existing `testsuits-for-oskernel/basic/user/src/oscomp/*` programs and `*_test.py` assertions are the acceptance tests.
 
+## Execution Environment
+
+The host machine does not provide the Rust build environment needed for ArceOS.
+All Rust, cargo, kernel build, and QEMU make targets must run inside the running
+Docker container named `arceos-eval-fix`.
+
+Use these conventions throughout the plan:
+
+```bash
+docker exec arceos-eval-fix make -C /workspace/arceos kernel-rv KERNEL_LOG=info
+docker exec arceos-eval-fix make -C /workspace/arceos kernel-la KERNEL_LOG=info
+```
+
+Host-side `git` commands and Python log parsers can run from
+`/home/majiaqi/Github/OS_Projects`. Host-side wrapper scripts such as
+`./run-testsuite-bench-rv-direct.sh` are also allowed because they enter
+`arceos-eval-fix` with `docker exec` for the build and QEMU launch path.
+
 ## Focused Result Parser
 
 Use this parser after any captured QEMU serial log. It checks only the filesystem/fd subset and ignores the other `basic` tests owned by the rest of the team.
@@ -97,10 +115,10 @@ Expected: the only tracked changes are none before implementation starts. Existi
 Run:
 
 ```bash
-make -C arceos kernel-rv KERNEL_LOG=info
+docker exec arceos-eval-fix make -C /workspace/arceos kernel-rv KERNEL_LOG=info
 ```
 
-Expected: build succeeds and produces `arceos/kernel-rv`.
+Expected: build succeeds and produces `/workspace/arceos/kernel-rv` inside the container, visible as `arceos/kernel-rv` on the host-mounted workspace.
 
 - [ ] **Step 3: Capture a baseline RISC-V serial log**
 
@@ -186,7 +204,7 @@ fn sys_getcwd(process: &UserProcess, buf: usize, size: usize) -> isize {
 Run:
 
 ```bash
-make -C arceos kernel-rv KERNEL_LOG=info
+docker exec arceos-eval-fix make -C /workspace/arceos kernel-rv KERNEL_LOG=info
 ```
 
 Expected: build succeeds.
@@ -259,7 +277,7 @@ fn dup3(&mut self, oldfd: i32, newfd: i32, flags: u32) -> Result<i32, LinuxError
 Run:
 
 ```bash
-make -C arceos kernel-rv KERNEL_LOG=info
+docker exec arceos-eval-fix make -C /workspace/arceos kernel-rv KERNEL_LOG=info
 ```
 
 Expected: build succeeds.
@@ -399,7 +417,7 @@ fn remove_compat_mount(&self, target: &str) -> Result<(), LinuxError> {
 Run:
 
 ```bash
-make -C arceos kernel-rv KERNEL_LOG=info
+docker exec arceos-eval-fix make -C /workspace/arceos kernel-rv KERNEL_LOG=info
 ```
 
 Expected: build succeeds. If `LinuxError::EBUSY` is not available in the linked `axerrno` version, replace the duplicate-mount error in `add_compat_mount` with `LinuxError::EINVAL` and keep the plan's state-machine behavior.
@@ -502,7 +520,7 @@ fn sys_umount2(process: &UserProcess, target: usize, flags: usize) -> isize {
 Run:
 
 ```bash
-make -C arceos kernel-rv KERNEL_LOG=info
+docker exec arceos-eval-fix make -C /workspace/arceos kernel-rv KERNEL_LOG=info
 ```
 
 Expected: build succeeds. If `linux_raw_sys::general` for the target does not expose `__NR_mount` or `__NR_umount2`, confirm the constants in `testsuits-for-oskernel/basic/user/lib/syscall_ids.h` and add local constants near the other syscall handling code instead of changing testsuite sources.
@@ -539,8 +557,8 @@ Expected: one match inside `open_fd_candidates`, with logic that calls `open_dir
 Run:
 
 ```bash
-make -C arceos kernel-rv KERNEL_LOG=info
-make -C arceos kernel-la KERNEL_LOG=info
+docker exec arceos-eval-fix make -C /workspace/arceos kernel-rv KERNEL_LOG=info
+docker exec arceos-eval-fix make -C /workspace/arceos kernel-la KERNEL_LOG=info
 ```
 
 Expected: both builds succeed.
@@ -696,8 +714,8 @@ Prepare a final note with:
 RISC-V focused fs/fd subset: all selected tests pass from /tmp/arceos-basic-fsfd-after-rv.log
 LoongArch focused fs/fd subset: all selected tests pass from /tmp/arceos-basic-fsfd-after-la.log
 Builds run:
-- make -C arceos kernel-rv KERNEL_LOG=info
-- make -C arceos kernel-la KERNEL_LOG=info
+- docker exec arceos-eval-fix make -C /workspace/arceos kernel-rv KERNEL_LOG=info
+- docker exec arceos-eval-fix make -C /workspace/arceos kernel-la KERNEL_LOG=info
 ```
 
 Expected: the note names any command that could not be run and why.
