@@ -113,7 +113,7 @@ struct UserProcess {
     fds: Mutex<FdTable>,
     cwd: Mutex<String>,
     exec_root: Mutex<String>,
-    compat_mounts: Mutex<Vec<String>>,
+    mount_table: Mutex<crate::linux_fs::MountTable>,
     children: Mutex<Vec<ChildTask>>,
     rlimits: Mutex<BTreeMap<u32, UserRlimit>>,
     signal_actions: Mutex<BTreeMap<usize, general::kernel_sigaction>>,
@@ -555,7 +555,7 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         fds: Mutex::new(FdTable::new()),
         cwd: Mutex::new(cwd.into()),
         exec_root: Mutex::new(image.exec_root.clone()),
-        compat_mounts: Mutex::new(Vec::new()),
+        mount_table: Mutex::new(crate::linux_fs::MountTable::new()),
         children: Mutex::new(Vec::new()),
         rlimits: Mutex::new(BTreeMap::new()),
         signal_actions: Mutex::new(BTreeMap::new()),
@@ -1284,28 +1284,10 @@ impl UserProcess {
         normalize_path(cwd.as_str(), path).ok_or(LinuxError::EINVAL)
     }
 
-    fn add_compat_mount(&self, target: String) -> Result<(), LinuxError> {
-        let mut mounts = self.compat_mounts.lock();
-        if mounts.iter().any(|mounted| mounted == &target) {
-            return Err(LinuxError::EBUSY);
-        }
-        mounts.push(target);
-        Ok(())
-    }
-
-    fn remove_compat_mount(&self, target: &str) -> Result<(), LinuxError> {
-        let mut mounts = self.compat_mounts.lock();
-        let Some(idx) = mounts.iter().position(|mounted| mounted == target) else {
-            return Err(LinuxError::EINVAL);
-        };
-        mounts.swap_remove(idx);
-        Ok(())
-    }
-
     fn teardown(&self) {
         self.aspace.lock().clear();
         *self.fds.lock() = FdTable::new();
-        self.compat_mounts.lock().clear();
+        self.mount_table.lock().clear();
     }
 
     fn ppid(&self) -> i32 {
@@ -1380,7 +1362,7 @@ impl UserProcess {
             fds: Mutex::new(self.fds.lock().fork_copy()?),
             cwd: Mutex::new(self.cwd()),
             exec_root: Mutex::new(self.exec_root()),
-            compat_mounts: Mutex::new(self.compat_mounts.lock().clone()),
+            mount_table: Mutex::new(self.mount_table.lock().clone()),
             children: Mutex::new(Vec::new()),
             rlimits: Mutex::new(self.rlimits.lock().clone()),
             signal_actions: Mutex::new(self.signal_actions.lock().clone()),
@@ -2704,9 +2686,6 @@ fn sys_mount(
     flags: usize,
     data: usize,
 ) -> isize {
-    if flags != 0 || data != 0 {
-        return neg_errno(LinuxError::EINVAL);
-    }
     let source = match read_cstr(process, source) {
         Ok(source) => source,
         Err(err) => return neg_errno(err),
@@ -2719,9 +2698,6 @@ fn sys_mount(
         Ok(fstype) => fstype,
         Err(err) => return neg_errno(err),
     };
-    if source.is_empty() || target.is_empty() || fstype != "vfat" {
-        return neg_errno(LinuxError::EINVAL);
-    }
     let target = match process.normalize_user_path(target.as_str()) {
         Ok(target) => target,
         Err(err) => return neg_errno(err),
@@ -2729,16 +2705,20 @@ fn sys_mount(
     if let Err(err) = open_dir_entry(target.as_str()) {
         return neg_errno(err);
     }
-    match process.add_compat_mount(target) {
+    let request = crate::linux_fs::MountRequest {
+        source: source.as_str(),
+        target: target.as_str(),
+        fstype: fstype.as_str(),
+        flags,
+        data,
+    };
+    match process.mount_table.lock().mount(request) {
         Ok(()) => 0,
         Err(err) => neg_errno(err),
     }
 }
 
 fn sys_umount2(process: &UserProcess, target: usize, flags: usize) -> isize {
-    if flags != 0 {
-        return neg_errno(LinuxError::EINVAL);
-    }
     let target = match read_cstr(process, target) {
         Ok(target) => target,
         Err(err) => return neg_errno(err),
@@ -2747,7 +2727,11 @@ fn sys_umount2(process: &UserProcess, target: usize, flags: usize) -> isize {
         Ok(target) => target,
         Err(err) => return neg_errno(err),
     };
-    match process.remove_compat_mount(target.as_str()) {
+    let request = crate::linux_fs::UmountRequest {
+        target: target.as_str(),
+        flags,
+    };
+    match process.mount_table.lock().umount(request) {
         Ok(()) => 0,
         Err(err) => neg_errno(err),
     }
