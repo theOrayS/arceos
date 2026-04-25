@@ -46,6 +46,40 @@ API. `RootDirectory::mount` currently takes `&'static str`, `_umount` is
 private, and there is no filesystem factory from Linux mount arguments to
 `Arc<dyn VfsOps>`.
 
+## Current `linux_fs` Wrapper Boundary
+
+`examples/shell/src/linux_fs/` is the long-lived context entry for Linux
+filesystem ABI semantics in the current shell syscall path. It is not a VFS,
+does not own backend file data, and must not duplicate `axfs::api` or
+`axfs::fops` capability.
+
+Current module responsibilities:
+
+- `mod.rs`: facade used by `uspace.rs`; keep exports small and syscall-facing.
+- `path.rs`: pure path normalization helpers. It must not depend on
+  `UserProcess`, `FdTable`, or `axfs` until a unified resolver is designed.
+- `mount.rs`: `MountTable` plus narrow compatibility `mount`/`umount2`
+  semantics. It records targets only to make the inverse operation meaningful.
+- `stat.rs`: stat/statx flag validation and projection. It reports only
+  supported fields through `requested_mask & supported_mask`.
+- `fd.rs`: reserved destination for the future fd-table and
+  open-file-description migration. Do not move fd ownership here without a
+  separate OFD plan.
+- `types.rs`: shared wrapper types only. Prefer keeping types in the module
+  that owns the behavior.
+
+When adding new filesystem syscall behavior:
+
+- Put Linux ABI argument interpretation, flag policy, and errno-order rules in
+  `linux_fs` only when the logic is independent of backend capability.
+- Keep real filesystem operations in existing `axfs::api` / `axfs::fops` call
+  sites until an explicit `axfs` interface exists.
+- Do not modify `modules/axfs/**` for shell compatibility behavior unless the
+  task is explicitly about exposing a real lower-level filesystem interface.
+- If a compatibility path must stay, name the compatibility function or state
+  with `compat_` and document the deletion condition in
+  `../policies/compatibility.md`.
+
 ## Open-File-Description Model
 
 This is a Phase 1A prerequisite. Linux semantics require fd slots and open file
@@ -161,9 +195,16 @@ Required semantics:
 
 ## Promotion Gates
 
-- Phase 1A: focused `basic` filesystem/fd subset on RISC-V64 and LoongArch64,
-  plus busybox file commands that do not need mount/devfs.
+- Phase 1A: focused `basic` filesystem/fd subset on RISC-V64 and LoongArch64.
+  The current shell path has this baseline for `chdir`, `close`, `dup`,
+  `dup2`, `fstat`, `getcwd`, `getdents`, `mkdir_`, `mount`, `open`,
+  `openat`, `pipe`, `read`, `umount`, `unlink`, and `write`. Keep it green
+  while changing filesystem/fd code.
 - Phase 1B: full busybox file commands, iozone functional commands,
   UnixBench `fstime`, selected lmbench filesystem/file tests.
 - Phase 1C: real mount/devfs tests, LTP `fs_bind`, LTP `fs_readonly`, and
   mount-related busybox behavior.
+
+Before promoting from Phase 1A to Phase 1B, make a separate OFD/path-resolver
+plan. In particular, avoid growing ad hoc fd offset, dirfd, or runtime-library
+path rules directly inside `uspace.rs`.

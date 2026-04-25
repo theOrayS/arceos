@@ -29,6 +29,20 @@ Every compatibility path must include a nearby comment with this shape:
   real interface exists, delete the compatibility state rather than
   synchronizing both states.
 
+## Filesystem Compatibility Guardrails
+
+- `linux_fs::mount::MountTable` may record targets only for the current shell
+  syscall path. It is not an `axfs` mount table and must not be used by lower
+  filesystem layers.
+- `compat_basic_mount` is allowed only for the narrow basic-suite shape that
+  mounts a block device path such as `/dev/vda2` with `fstype == "vfat"` and
+  zero flags/data. Unsupported flags, non-null data, unsupported filesystems,
+  or invalid sources must return explicit errors.
+- A successful compatibility mount must be removable through `umount2`; an
+  unmounted target must not return success.
+- `linux_fs::stat` may project existing `stat` metadata into `statx`, but it
+  must not advertise fields that are not backed by data.
+
 ## Current Known Compatibility Exits
 
 | Compatibility path | Delete when | Interim behavior |

@@ -26,6 +26,19 @@ Start here, then open only the files matching the task:
 If a change touches more than one subsystem, read each affected subsystem file
 and the relevant policy files. Do not load every document by default.
 
+## Current Filesystem/Fd Entry Point
+
+Filesystem and fd syscall work currently enters through
+`examples/shell/src/uspace.rs`, with Linux-facing filesystem semantics split
+into `examples/shell/src/linux_fs/`. Treat `linux_fs` as the current ABI
+semantics layer for the shell syscall path, not as a VFS replacement.
+
+For filesystem/fd tasks, read `interfaces/filesystem.md` first. It records the
+current `linux_fs` boundary, the `FdTable`/open-file-description target model,
+path-resolution rules, stat/statx projection policy, and runtime mount exit
+conditions. Do not expand `uspace.rs` or `linux_fs` across subsystem
+boundaries without updating that document.
+
 ## Shared Development Rules
 
 - The syscall layer translates Linux ABI details into ArceOS interfaces. It
@@ -120,9 +133,13 @@ and the relevant policy files. Do not load every document by default.
 ## Recommended Bring-Up Order
 
 1. Use `basic` to close the minimal syscall loops.
-2. After filesystem basics stabilize, promote busybox file commands, iozone,
+2. For filesystem/fd work, keep the focused `basic` subset green on both
+   RISC-V64 and LoongArch64 before broadening scope. Parse the saved QEMU logs
+   with `testsuits-for-oskernel/basic/user/src/oscomp/test_runner.py` and
+   report the exact filesystem/fd subset result.
+3. After filesystem basics stabilize, promote busybox file commands, iozone,
    lmbench filesystem cases, and UnixBench `fstime`.
-3. After memory and scheduling mature, promote cyclictest, LTP `mm`, LTP
+4. After memory and scheduling mature, promote cyclictest, LTP `mm`, LTP
    `sched`, and LTP IPC.
-4. Treat networking as a separate track using iperf, netperf, and LTP network
+5. Treat networking as a separate track using iperf, netperf, and LTP network
    runtest entries.

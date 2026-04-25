@@ -42,6 +42,13 @@ testsuite and syscall-interface work. The older `docs/superpowers/specs/`
 documents are historical design records; when they conflict with
 `docs/development/`, the `docs/development/` documents win.
 
+For filesystem/fd work, load `docs/development/interfaces/filesystem.md` before
+editing `examples/shell/src/uspace.rs` or `examples/shell/src/linux_fs/**`.
+`examples/shell/src/linux_fs/` is the Linux ABI/semantic layer for the current
+shell syscall path; it is not a VFS and must not rewrap `axfs` backend
+capability. Do not modify `modules/axfs/**` for shell compatibility behavior
+unless the task explicitly requires a real lower-level filesystem interface.
+
 Load only the documents needed for the current task:
 
 - Filesystem, fd, paths, stat, mount, dev nodes:
@@ -71,6 +78,11 @@ syscall numbers against `examples/shell/src/uspace.rs` and
 
 Compatibility code must use `compat_` naming, include a milestone and deletion
 condition, and must not return fake success for unsupported states.
+
+For filesystem/fd changes, keep the focused `basic` subset green on both
+RISC-V64 and LoongArch64. Use the workspace-root test wrappers, stop only QEMU
+after the relevant `basic` section if needed, and parse saved logs with
+`testsuits-for-oskernel/basic/user/src/oscomp/test_runner.py`.
 
 ## Coding Style & Naming Conventions
 
