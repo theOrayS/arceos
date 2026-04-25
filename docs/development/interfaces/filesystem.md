@@ -28,6 +28,11 @@ Also read:
 
 - `examples/shell/src/uspace.rs`: current syscall dispatcher, `UserProcess`,
   `FdTable`, and `FdEntry`.
+- `examples/shell/src/linux_fs/`: Linux ABI/semantic helpers used by
+  `uspace.rs`. This is not a new VFS and must not wrap axfs backend
+  capabilities. It owns current path normalization, compatibility mount state,
+  and statx projection; real filesystem operations still go through existing
+  `axfs::api` and `axfs::fops` call sites.
 - `axfs::api`: `metadata`, `read_dir`, `create_dir`, `remove_dir`,
   `remove_file`, `rename`, `current_dir`, and `set_current_dir`.
 - `axfs::api::File` and `OpenOptions`: open/create/truncate/append plus
@@ -140,7 +145,7 @@ Required semantics:
   `EOPNOTSUPP`.
 - unmount of a non-mounted target returns `EINVAL` or `ENOENT`.
 - mounted contents are observable through VFS lookup before deleting
-  `compat_mounts`.
+  `linux_fs::mount::MountTable` compatibility state.
 
 ## Metadata And Stat
 
@@ -148,6 +153,8 @@ Required semantics:
   where possible.
 - `statx` must report only fields backed by real metadata in its returned mask.
 - Missing or unsupported statx fields are omitted, not guessed.
+- Current shell `statx` projection lives in `linux_fs::stat` and must keep
+  returning `requested_mask & supported_mask`, not the raw user request.
 - Device id, inode, mode, nlink, uid/gid, block size, block count, and
   timestamps should become filesystem metadata responsibilities rather than
   syscall-local constants.

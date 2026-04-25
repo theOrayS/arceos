@@ -33,8 +33,8 @@ Every compatibility path must include a nearby comment with this shape:
 
 | Compatibility path | Delete when | Interim behavior |
 | --- | --- | --- |
-| `compat_mounts` | runtime `axfs` mount/unmount exposes mounted contents | duplicate mount returns `EBUSY`; unmounted target returns `EINVAL` or `ENOENT`; unsupported flags/data must not succeed. |
-| `statx` from `stat` | filesystem metadata returns statx-capable fields and mask | return only honest fields; invalid flags `EINVAL`; bad buffers `EFAULT`. |
+| `linux_fs::mount::MountTable` / `compat_basic_mount` | runtime `axfs` mount/unmount exposes mounted contents | duplicate mount returns `EBUSY`; unmounted target returns `EINVAL` or `ENOENT`; unsupported flags/data must not succeed. |
+| `linux_fs::stat` statx projection from `stat` | filesystem metadata returns statx-capable fields and mask | return only honest fields through `requested_mask & supported_mask`; invalid flags `EINVAL`; bad buffers `EFAULT`. |
 | test staging cwd display rewrite | user process launch has a single namespace root | path resolution and `getcwd` observe the same namespace; no display-only behavior in broad gates. |
 | `mlock* => 0` | page pinning exists or the workload explicitly accepts unsupported | replace with `ENOSYS` or `EOPNOTSUPP` before LTP mm gates. |
 | ad hoc `/dev/*` fd entries | devfs or device registry exists | only known devices succeed; unknown devices return `ENOENT` or `ENODEV`. |

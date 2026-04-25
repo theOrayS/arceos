@@ -36,8 +36,8 @@ Status values:
 | `ioctl` | 29 | `sys_ioctl` | Compat/partial | busybox tty, shell | low | syscall/dev | Route tty/device ioctls through devfs/device registry. |
 | `mkdirat` | 34 | `sys_mkdirat` | Real-partial | basic, busybox, LTP | medium | syscall/path/fs | Use unified resolver; honor mode/error matrix. |
 | `unlinkat` | 35 | `sys_unlinkat` | Real-partial | basic, busybox, LTP | medium | syscall/path/fs | Add `AT_REMOVEDIR`, dir/file checks, sticky/perms later. |
-| `umount2` | 39 | `sys_umount2` | Compat | basic, LTP fs_bind | low | axfs/syscall | Replace `compat_mounts` with real runtime unmount. |
-| `mount` | 40 | `sys_mount` | Compat | basic, LTP fs_bind/fs_readonly | low | axfs/syscall | Add runtime mount API and fs factory. |
+| `umount2` | 39 | `sys_umount2` | Compat | basic, LTP fs_bind | low | axfs/syscall | Replace `linux_fs::mount::MountTable` with real runtime unmount. |
+| `mount` | 40 | `sys_mount` | Compat | basic, LTP fs_bind/fs_readonly | low | axfs/syscall | Add runtime mount API and fs factory; delete `compat_basic_mount`. |
 | `statfs` | 43 | none | Missing | busybox `stat`, LTP | n/a | axfs | Add fs stat interface or return consistent `ENOSYS`. |
 | `fstatfs` | 44 | none | Missing | busybox, LTP | n/a | axfs | Same as `statfs`. |
 | `truncate` | 45 | none | Missing | busybox, iozone, LTP | n/a | syscall/fs | Add path truncate using resolver and file set_len. |
@@ -109,7 +109,7 @@ Status values:
 | `wait4` | 260 | `sys_wait4` | Partial | basic wait, UnixBench, lmbench | medium | task/process | Implement pid/options/rusage matrix. |
 | `prlimit64` | 261 | `sys_prlimit64` | Partial | busybox, libc | medium | process | Extend resource set as needed. |
 | `renameat2` | 276 | `sys_renameat2` | Partial | busybox `mv`, LTP | low | syscall/path/fs | Honor flags and overwrite/cross-fs rules. |
-| `statx` | 291 | `sys_statx` | Compat | busybox `stat`, LTP | low | fs/syscall | Back with real metadata and honest masks. |
+| `statx` | 291 | `sys_statx` | Compat | busybox `stat`, LTP | medium | fs/syscall | `linux_fs::stat` returns honest masks; back remaining fields with real metadata. |
 | `rseq` | 293 | none | Missing | modern libc/nptl | n/a | task | Return `ENOSYS` unless libc requires registration. |
 | `clone3` | 435 | none | Missing | LTP sched/nptl | n/a | task/process | Add only after clone contract is stable. |
 | `openat2` | 437 | none | Missing | LTP fs | n/a | path/fs | Add resolver flags after `openat` is correct. |
