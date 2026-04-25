@@ -39,7 +39,10 @@ mod tests {
 
     #[test]
     fn joins_relative_path_to_cwd() {
-        assert_eq!(resolve_cwd_path("/tmp/test", "a/b"), Some("/tmp/test/a/b".into()));
+        assert_eq!(
+            resolve_cwd_path("/tmp/test", "a/b"),
+            Some("/tmp/test/a/b".into())
+        );
     }
 
     #[test]

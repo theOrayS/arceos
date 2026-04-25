@@ -1997,10 +1997,22 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         ),
         general::__NR_mprotect => sys_mprotect(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_munmap => sys_munmap(&process, tf, tf.arg0(), tf.arg1()),
-        general::__NR_mbind => sys_mbind(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3(), tf.arg4()),
-        general::__NR_get_mempolicy => {
-            sys_get_mempolicy(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3(), tf.arg4())
-        }
+        general::__NR_mbind => sys_mbind(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+        ),
+        general::__NR_get_mempolicy => sys_get_mempolicy(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+        ),
         general::__NR_set_mempolicy => sys_set_mempolicy(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_mlock
         | general::__NR_munlock
@@ -3109,12 +3121,7 @@ fn sys_sched_getscheduler(process: &UserProcess, pid: i32) -> isize {
     0
 }
 
-fn sys_sched_setaffinity(
-    process: &UserProcess,
-    pid: i32,
-    cpusetsize: usize,
-    mask: usize,
-) -> isize {
+fn sys_sched_setaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mask: usize) -> isize {
     if !is_same_sched_target(process, pid) {
         return neg_errno(LinuxError::ESRCH);
     }
@@ -4095,8 +4102,10 @@ fn resolve_runtime_support_file(exec_root: &str, path: &str) -> Result<String, S
     } else if !path.contains('/') {
         runtime_library_name_candidates(exec_root, path)
     } else {
-        vec![crate::linux_fs::normalize_path("/", path)
-            .ok_or_else(|| format!("invalid path: {path}"))?]
+        vec![
+            crate::linux_fs::normalize_path("/", path)
+                .ok_or_else(|| format!("invalid path: {path}"))?,
+        ]
     };
     candidates
         .into_iter()
@@ -4611,7 +4620,9 @@ impl FdTable {
                 &file.file.get_attr().map_err(LinuxError::from)?,
                 Some(file.path.as_str()),
             )),
-            Ok(FdEntry::Directory(dir)) => Ok(file_attr_to_stat(&dir.attr, Some(dir.path.as_str()))),
+            Ok(FdEntry::Directory(dir)) => {
+                Ok(file_attr_to_stat(&dir.attr, Some(dir.path.as_str())))
+            }
             Ok(_) => Err(LinuxError::EINVAL),
             Err(err) => Err(err),
         }
@@ -4852,9 +4863,8 @@ fn open_fd_candidates(
     opts: &OpenOptions,
 ) -> Result<FdEntry, LinuxError> {
     let mut last_err = LinuxError::ENOENT;
-    let may_open_dir_readonly =
-        flags & general::O_ACCMODE == general::O_RDONLY
-            && flags & (general::O_CREAT | general::O_TRUNC) == 0;
+    let may_open_dir_readonly = flags & general::O_ACCMODE == general::O_RDONLY
+        && flags & (general::O_CREAT | general::O_TRUNC) == 0;
     for path in candidates {
         if path == "/dev/null" {
             if prefer_dir {

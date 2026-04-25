@@ -67,7 +67,7 @@ pub fn stat_to_statx(st: &general::stat, mask: u32) -> general::statx {
 #[cfg(test)]
 mod tests {
     use super::{
-        stat_to_statx, validate_statx_flags, STATX_MODE, STATX_SIZE, STATX_SUPPORTED_MASK,
+        STATX_MODE, STATX_SIZE, STATX_SUPPORTED_MASK, stat_to_statx, validate_statx_flags,
     };
     use axerrno::LinuxError;
     use linux_raw_sys::general;
