@@ -25,6 +25,7 @@ The basic test programs are external ELF programs. Their libc wrappers in
 - `dup2()` calls `dup3(old, new, 0)`.
 - `mount()` calls `mount(...)`.
 - `umount()` calls `umount2(path, 0)`.
+- `getcwd()` returns the raw syscall value as a `char *`.
 
 Therefore the implementation target is ArceOS shell's user syscall layer in
 `examples/shell/src/uspace.rs`, not the generic `arceos_posix_api` C ABI layer.
@@ -73,9 +74,13 @@ Expected fd behavior:
 
 - `write(1, buf, len)` and duplicated stdout fds write to the console and
   return `len`.
-- `close(fd)` releases non-stdio slots and returns `EBADF` for invalid fds.
+- `close(fd)` releases any valid fd slot, including stdio slots, and returns
+  `EBADF` for invalid fds. After closing fd 0, 1, or 2, later operations on
+  that fd should fail until it is reused by a later open or dup.
 - `dup(fd)` allocates the lowest available fd greater than or equal to 0.
 - `dup3(old, new, 0)` replaces `new` with a duplicated entry and returns `new`.
+- `dup3(old, new, flags)` returns `EINVAL` when `flags != 0` for this
+  milestone. `dup3(old, old, 0)` also returns `EINVAL`.
 - `pipe2(pipefd, 0)` creates read and write endpoints that survive `fork`
   through `FdEntry::duplicate_for_fork`.
 
@@ -94,9 +99,15 @@ Expected path behavior:
 - `open(path, O_CREATE | O_RDWR)` creates a regular file when absent.
 - `open(path, O_DIRECTORY)` opens a directory entry and stores it as
   `FdEntry::Directory`.
+- `open(path, O_RDONLY)` also opens a directory as `FdEntry::Directory` when
+  `path` names a directory. The `getdents` test depends on `open(".", O_RDONLY)`
+  producing a fd accepted by `getdents64`.
 - `mkdirat(AT_FDCWD, "test_mkdir", mode)` creates a directory.
 - `chdir("test_chdir")` updates only the current process cwd.
-- `getcwd(buf, size)` writes the cwd plus the trailing NUL into user memory.
+- `getcwd(buf, size)` writes the cwd plus the trailing NUL into user memory and
+  returns the original `buf` user address on success. It returns negative errno
+  on failure. Returning the byte length is not compatible with this testsuite's
+  libc wrapper, which treats the syscall result as `char *`.
 - `unlinkat(AT_FDCWD, path, 0)` removes a regular file and later open should
   fail.
 
@@ -121,18 +132,24 @@ For the basic `fstat` test, the critical requirements are:
 
 ### Mount and Umount
 
-Implement a compatibility-level `sys_mount` and `sys_umount2` for this milestone.
+Implement a compatibility-level `sys_mount` and `sys_umount2` for this milestone
+with minimal per-process state, not a pure "shape check" that returns success
+for every request.
 
 Behavior:
 
 - Validate that user pointers for string arguments are readable when non-null.
 - Read `source`, `target`, and `fstype` strings for tracing and validation.
-- Accept the basic test's `mount("/dev/vda2", "./mnt", "vfat", 0, NULL)`.
-- Return 0 for a valid-looking mount request where the target path exists or can
-  be resolved as a normal test path.
-- Return 0 for `umount2("./mnt", 0)` after the compatibility mount path.
-- Return `EINVAL` for unsupported nonzero `umount2` flags that should not be
-  silently ignored.
+- Accept the basic test's `mount("/dev/vda2", "./mnt", "vfat", 0, NULL)` when
+  flags are 0 and the target resolves to an existing directory.
+- Store the normalized target path in a per-process compatibility mount set.
+  A second mount of the same normalized target returns `EBUSY`.
+- `umount2(target, 0)` succeeds only when the normalized target exists in that
+  process's compatibility mount set; it removes the target from the set.
+- `umount2` returns `EINVAL` for unsupported nonzero flags.
+- This compatibility layer does not require `/dev/vda2` to be a real block
+  device, because the basic test does not access mounted contents and ArceOS
+  does not currently expose a runtime mount API for this path.
 
 This does not create a real secondary VFS mount. A full runtime mount API would
 require exposing or redesigning `axfs::root` mount ownership and lifetimes, and
@@ -148,7 +165,8 @@ Use existing helpers:
 - `LinuxError::from(axfs error)` when forwarding `axfs` failures.
 
 Avoid panics in syscall paths. Invalid fds, non-directory dirfds, short user
-buffers, unsupported flags, and bad pointers must return Linux errors.
+buffers, unsupported flags, bad pointers, duplicate compat mounts, and umounts
+of targets that were not compat-mounted must return Linux errors.
 
 ## Verification
 
