@@ -40,8 +40,8 @@ become the architecture.
    marked, bounded to a milestone, and returns real errors for unsupported
    states. Silent success for unimplemented behavior is not acceptable.
 3. If a teammate-owned layer is expected to provide an interface, design the
-   syscall side around that real interface and leave a narrow adapter or TODO,
-   not a hardcoded replacement.
+   syscall side around that real interface and leave a narrow adapter or
+   tracked follow-up, not a hardcoded replacement.
 4. Prefer returning a Linux-compatible errno over pretending success. This is
    required for LTP and keeps later integration failures visible.
 5. File descriptors, address spaces, and task relationships should each have one
@@ -124,6 +124,395 @@ Known interface gaps:
 - The current eager address-space copy is acceptable for functional bring-up but
   will be expensive for `UnixBench`, `lmbench`, and shell-heavy workloads.
 
+## Required Interface Contracts
+
+These are the interface shapes the syscall layer should be able to call. They
+are intentionally small contracts, not final internal implementations.
+
+### Runtime Mount Contract
+
+Provider: `axfs` or an `axfs`-owned crate/module. The syscall layer should not
+own the real mount table.
+
+Expected contract:
+
+```rust
+pub struct MountRequest<'a> {
+    pub source: &'a str,
+    pub target: &'a str,
+    pub fstype: &'a str,
+    pub flags: MountFlags,
+    pub data: Option<&'a [u8]>,
+}
+
+pub trait FileSystemFactory: Send + Sync {
+    fn mount(&self, request: &MountRequest<'_>) -> AxResult<Arc<dyn VfsOps>>;
+    fn supports(&self, fstype: &str) -> bool;
+}
+
+pub fn mount(request: MountRequest<'_>) -> AxResult<()>;
+pub fn umount(target: &str, flags: UmountFlags) -> AxResult<()>;
+pub fn is_mount_point(path: &str) -> bool;
+```
+
+Required semantics:
+
+- `target` must resolve to an existing directory in the current namespace.
+- duplicate targets return `EBUSY`.
+- unknown `fstype` returns `ENODEV` or `EOPNOTSUPP`, not success.
+- unsupported `flags` or incompatible `data` return `EINVAL` or `EOPNOTSUPP`.
+- unmount of a non-mounted target returns `EINVAL` or `ENOENT`.
+- the VFS layer owns mount-point crossing during later path resolution.
+
+### File-Backed Mapping Contract
+
+Provider: memory manager plus filesystem/open-file-description layer. The
+syscall layer should construct the request and let the VMA/page-fault path own
+semantics.
+
+Expected contract:
+
+```rust
+pub trait FileMapping: Send + Sync {
+    fn len(&self) -> AxResult<u64>;
+    fn readable(&self) -> bool;
+    fn writable(&self) -> bool;
+    fn read_page(&self, file_offset: u64, dst: &mut [u8]) -> AxResult<usize>;
+    fn write_page(&self, file_offset: u64, src: &[u8]) -> AxResult<usize>;
+    fn flush_range(&self, file_offset: u64, len: usize) -> AxResult<()>;
+}
+
+pub enum VmaKind {
+    Heap,
+    Anonymous,
+    File { mapping: Arc<dyn FileMapping>, offset: u64, shared: bool },
+    Stack,
+    SharedMemory,
+    Guard,
+}
+
+pub fn mmap_file(request: FileMmapRequest) -> Result<VirtAddr, LinuxError>;
+```
+
+Required semantics:
+
+- file-backed `mmap` stores file identity, mapping offset, length, permissions,
+  and shared/private mode in a VMA.
+- page fault asks the VMA how to fill the page; `AddrSpace` only installs or
+  removes mappings.
+- `MAP_SHARED` dirty pages must have a defined flush/writeback path.
+- `pread/pwrite` and `mmap` must not depend on the current file offset.
+- file lifetime is held by `Arc<dyn FileMapping>` or an equivalent stable open
+  file object until the VMA is destroyed.
+
+### Task and Process Contract
+
+Provider: task/process layer above `axtask`. The syscall layer can translate
+Linux flags, but process identity and lifecycle should be explicit.
+
+Expected contract:
+
+```rust
+pub struct Process {
+    pub pid: Pid,
+    pub tgid: Pid,
+    pub parent: Option<Pid>,
+    pub children: ChildSet,
+    pub threads: ThreadGroup,
+    pub fd_table: Arc<Mutex<FdTable>>,
+    pub memory: Arc<Mutex<MemoryMap>>,
+    pub exit_state: ExitState,
+}
+
+pub struct Thread {
+    pub tid: Tid,
+    pub tgid: Pid,
+    pub task: AxTaskRef,
+    pub clear_child_tid: AtomicUsize,
+    pub robust_list: RobustListState,
+    pub signal_mask: SignalSet,
+}
+
+pub enum ExitState {
+    Running,
+    Zombie { code: i32 },
+    Reaped,
+}
+```
+
+Required semantics:
+
+- `pid` identifies a process leader; `tid` identifies a task/thread.
+- thread-group exit and single-thread exit are distinct states.
+- parent/child ownership and zombie reaping are not inferred from raw task ids.
+- `clone` decides whether memory, fd table, cwd/fs state, and signal handlers
+  are shared or copied from flags.
+- `execve` closes `FD_CLOEXEC` fds and replaces memory atomically from the
+  caller's point of view.
+
+## Core Authority Models
+
+### File Descriptor and Open-File-Description Model
+
+This is a Phase 1 prerequisite, not an open-ended future question. Linux file
+semantics depend on separating fd slots from open file descriptions.
+
+Target model:
+
+```rust
+pub struct FdTable {
+    entries: Vec<Option<FdSlot>>,
+}
+
+pub struct FdSlot {
+    pub fd_flags: FdFlags, // FD_CLOEXEC lives here.
+    pub desc: Arc<OpenFileDescription>,
+}
+
+pub struct OpenFileDescription {
+    pub status_flags: Mutex<OpenStatusFlags>, // O_APPEND, O_NONBLOCK, etc.
+    pub offset: Mutex<u64>,
+    pub backend: OpenFileBackend,
+}
+
+pub enum OpenFileBackend {
+    Regular(Arc<dyn FileIo>),
+    Directory(Arc<dyn DirectoryIo>),
+    Pipe(PipeEndpoint),
+    CharDevice(Arc<dyn DeviceIo>),
+    DevNull,
+}
+```
+
+Rules:
+
+- `dup`, `dup2`, and `dup3` create a new `FdSlot` pointing at the same
+  `OpenFileDescription`.
+- `fork` copies fd slots, but those slots point at the same open file
+  descriptions.
+- `clone(CLONE_FILES)` shares the whole `FdTable`; without `CLONE_FILES`, it
+  copies fd slots.
+- `execve` removes only slots with `FD_CLOEXEC`.
+- `read`, `write`, `lseek`, and `getdents64` use and update the shared offset
+  in `OpenFileDescription`.
+- `pread`, `pwrite`, `preadv`, and `pwritev` use their explicit offset and do
+  not change the shared offset.
+- `O_APPEND` is stored in `OpenFileDescription.status_flags`; writes append
+  atomically with respect to that description.
+
+### Path Resolution Model
+
+All path-taking syscalls should use one resolver. Ad hoc path joins in syscall
+handlers should be deleted as the resolver becomes available.
+
+Resolver input:
+
+```rust
+pub struct PathResolveRequest<'a> {
+    pub dirfd: Option<i32>,       // None means AT_FDCWD.
+    pub path: &'a str,
+    pub flags: ResolveFlags,     // AT_* plus syscall-specific lookup rules.
+    pub must_be_dir: bool,
+    pub allow_empty_path: bool,
+}
+```
+
+Rules:
+
+- a null pathname pointer returns `EFAULT`.
+- an empty path returns `ENOENT` unless the syscall explicitly accepts
+  `AT_EMPTY_PATH`; then the fd object is used.
+- absolute paths start at the process namespace root and ignore `dirfd`.
+- relative paths start at process cwd for `AT_FDCWD`, otherwise at the directory
+  referenced by `dirfd`; a non-directory `dirfd` returns `ENOTDIR`.
+- `.` is ignored; `..` walks to the parent but cannot escape namespace root.
+- trailing slash requires the final object to be a directory; otherwise return
+  `ENOTDIR`.
+- unknown `AT_*` flags return `EINVAL`.
+- if symlinks are unsupported by the active filesystem, symlink creation returns
+  `ENOSYS` and symlink traversal returns `ELOOP` or `EOPNOTSUPP`; this must be
+  consistent per syscall.
+- `AT_SYMLINK_NOFOLLOW` is accepted for stat-like calls, but has no observable
+  effect until symlink objects exist.
+- `AT_EMPTY_PATH` is initially supported only for `fstatat/statx`-style
+  metadata queries; other uses return `EINVAL`.
+- mount-point crossing is handled by VFS lookup after real runtime mounts
+  exist, not by syscall-local path rewriting.
+
+### VMA and Address-Space Model
+
+`AddrSpace` should execute page-table changes. A separate memory map/VMA layer
+must own Linux mmap semantics.
+
+Target model:
+
+```rust
+pub struct MemoryMap {
+    vmas: BTreeMap<VirtAddr, Vma>,
+}
+
+pub struct Vma {
+    pub start: VirtAddr,
+    pub end: VirtAddr,
+    pub perms: VmaPerms,
+    pub flags: VmaFlags,
+    pub kind: VmaKind,
+}
+```
+
+Rules:
+
+- VMA types are `Heap`, `Anonymous`, `File`, `Stack`, `SharedMemory`, and
+  `Guard`.
+- `mmap`, `munmap`, `mprotect`, and `mremap` update VMAs first, then ask
+  `AddrSpace` to update mappings.
+- unmap/protect/remap can split and merge VMAs.
+- page-table flags are derived from VMA permissions; they are not the semantic
+  source of truth.
+- page fault looks up the VMA, checks access, fills anonymous/file/shared pages,
+  and then calls `AddrSpace` to install the mapping.
+- file-backed mappings store file offset rounded to page boundaries plus the
+  intra-page delta required by Linux `mmap`.
+- `MAP_PRIVATE` and `fork` should move toward COW; eager copy is only a
+  functional bring-up path.
+
+### Concurrency and Lifecycle Model
+
+Initial lock order should be stable before broad process/thread work:
+
+1. process registry/global pid table;
+2. `UserProcess` lifecycle state;
+3. `FdTable`;
+4. open-file-description backend lock;
+5. `MemoryMap`;
+6. `AddrSpace`;
+7. child list or wait queue state.
+
+Rules:
+
+- Never hold `FdTable` while blocking on pipe/futex/wait queue operations.
+- A syscall that obtains an `Arc<OpenFileDescription>` may continue using it if
+  another thread closes the fd slot after lookup.
+- `close` removes the fd slot; it does not destroy the open file description
+  until the last `Arc` is dropped.
+- `fork` snapshots fd slots and process state under process/fd locks, then
+  creates the child task.
+- `execve` builds the new memory image first; the switch to new memory/fd
+  close-on-exec state is committed in one step.
+- `exit` transitions the thread/process to zombie state, wakes waiters, handles
+  `clear_child_tid`, and only then releases task-local resources.
+- `wait*` observes `Running -> Zombie -> Reaped`; only one waiter can reap a
+  child.
+
+## Syscall Atlas
+
+The `nr(rv/la)` column uses the contest generic Linux ABI values from
+`testsuits-for-oskernel/basic/user/lib/syscall_ids.h`; RISC-V64 and
+LoongArch64 share these values for the tracked syscalls. `mount` and `umount2`
+are explicitly forced to 40 and 39 in `uspace.rs` for both architectures.
+
+Status values:
+
+- `Real-partial`: handler calls a real ArceOS interface but Linux semantics are
+  incomplete.
+- `Partial`: handler exists, but either the backing contract is not yet the
+  right authority or important Linux behavior is still missing.
+- `Compat`: handler intentionally emulates only a bounded test need.
+- `Compat/partial`: a real handler exists but still contains compatibility
+  behavior that must be removed before broad gates.
+- `Stub-success`: handler returns success without implementing the operation;
+  this must not pass broad-suite gates.
+- `Missing`: no handler or no real implementation; expected result is
+  `ENOSYS`, `EINVAL`, or `EOPNOTSUPP` depending on syscall contract.
+
+| Syscall | nr(rv/la) | Current handler | Status | Required by workload | Errno fidelity | Owner | Next action |
+| --- | ---: | --- | --- | --- | --- | --- | --- |
+| `getcwd` | 17 | `sys_getcwd` | Real-partial | basic, busybox, LTP | medium | syscall/path | Keep return ABI as `buf`; remove display rewrites after namespace fix. |
+| `dup` | 23 | `sys_dup` | Real-partial | basic, busybox, lmbench | medium | syscall/fd | Move to fd slot + shared open-file-description model. |
+| `dup3` | 24 | `sys_dup3` | Real-partial | basic, busybox, pthreads | medium | syscall/fd | Implement `O_CLOEXEC`; keep unsupported flags as `EINVAL`. |
+| `fcntl` | 25 | `sys_fcntl` | Partial | busybox, LTP, nptl | low | syscall/fd | Add fd flags, status flags, locks only when required. |
+| `ioctl` | 29 | `sys_ioctl` | Compat/partial | busybox tty, shell | low | syscall/dev | Route tty/device ioctls through devfs/device registry. |
+| `mkdirat` | 34 | `sys_mkdirat` | Real-partial | basic, busybox, LTP | medium | syscall/path/fs | Use unified resolver; honor mode/error matrix. |
+| `unlinkat` | 35 | `sys_unlinkat` | Real-partial | basic, busybox, LTP | medium | syscall/path/fs | Add `AT_REMOVEDIR`, dir/file checks, sticky/perms later. |
+| `umount2` | 39 | `sys_umount2` | Compat | basic, LTP fs_bind | low | axfs/syscall | Replace `compat_mounts` with real runtime unmount. |
+| `mount` | 40 | `sys_mount` | Compat | basic, LTP fs_bind/fs_readonly | low | axfs/syscall | Add runtime mount API and fs factory. |
+| `statfs` | 43 | none | Missing | busybox `stat`, LTP | n/a | axfs | Add fs stat interface or return consistent `ENOSYS` before gate. |
+| `fstatfs` | 44 | none | Missing | busybox, LTP | n/a | axfs | Same as `statfs`. |
+| `truncate` | 45 | none | Missing | busybox, iozone, LTP | n/a | syscall/fs | Add path-based truncate using resolver + file set_len. |
+| `ftruncate` | 46 | `sys_ftruncate` | Real-partial | busybox, iozone, LTP | medium | syscall/fd/fs | Move to open-file-description backend. |
+| `fallocate` | 47 | none | Missing | iozone, LTP | n/a | fs | Return `EOPNOTSUPP` until filesystem allocation exists. |
+| `faccessat` | 48 | `sys_faccessat` | Compat/partial | busybox, LTP perms | low | syscall/path/fs | Add real permission model or bounded `access(2)` semantics. |
+| `chdir` | 49 | `sys_chdir` | Real-partial | basic, busybox, shell | medium | syscall/path | Use unified resolver and namespace root. |
+| `fchdir` | 50 | none | Missing | busybox, LTP | n/a | syscall/fd/path | Add once directory fd model is stable. |
+| `openat` | 56 | `sys_openat` | Real-partial | basic, busybox, iozone, lmbench, LTP | medium | syscall/fd/path/fs | Complete flags, mode, path resolver, OFD model. |
+| `close` | 57 | `sys_close` | Real-partial | all | medium | syscall/fd | Slot removal only; backend lifetime via OFD `Arc`. |
+| `pipe2` | 59 | `sys_pipe2` | Real-partial | basic, UnixBench, lmbench, nptl | medium | syscall/fd/ipc | Add flags, blocking semantics, close wakeups. |
+| `getdents64` | 61 | `sys_getdents64` | Real-partial | basic, busybox `find`, LTP | medium | syscall/fd/fs | Store directory offset in OFD; support repeated reads. |
+| `lseek` | 62 | `sys_lseek` | Real-partial | busybox, iozone, lmbench | medium | syscall/fd/fs | Use shared OFD offset; reject nonseekable fds. |
+| `read` | 63 | `sys_read` | Real-partial | all | medium | syscall/fd | Validate fd before user buffer; use OFD offset. |
+| `write` | 64 | `sys_write` | Real-partial | all | medium | syscall/fd | Add `O_APPEND`, short writes, pipe close errors. |
+| `readv` | 65 | `sys_readv` | Partial | busybox, iozone, nptl | low | syscall/fd | Match partial iovec and fault ordering. |
+| `writev` | 66 | `sys_writev` | Partial | busybox, iozone, nptl | low | syscall/fd | Same as `readv`. |
+| `pread64` | 67 | `sys_pread64` | Partial | iozone, lmbench | medium | syscall/fd/fs | Ensure explicit offset does not alter OFD offset. |
+| `pwrite64` | 68 | none | Missing | iozone, UnixBench | n/a | syscall/fd/fs | Add offset write backend. |
+| `preadv` | 69 | none | Missing | iozone | n/a | syscall/fd/fs | Add after scalar pread/pwrite semantics. |
+| `pwritev` | 70 | none | Missing | iozone | n/a | syscall/fd/fs | Add after scalar pread/pwrite semantics. |
+| `sendfile` | 71 | none | Missing | busybox/coreutils possible | n/a | syscall/fd/fs | Defer; return `ENOSYS` until needed. |
+| `pselect6` | 72 | `sys_pselect6` | Partial | busybox, lmbench select | low | syscall/fd/signal | Finish fd readiness and signal mask semantics. |
+| `readlinkat` | 78 | none | Missing | busybox, LTP symlink | n/a | path/fs | Defer symlink support; return `ENOSYS` or `EINVAL` consistently. |
+| `sync` | 81 | none | Missing | busybox, LTP | n/a | fs | Add global flush or explicit `ENOSYS`. |
+| `fsync` | 82 | none | Missing | iozone, UnixBench, LTP | n/a | syscall/fd/fs | Wire to backend `flush`. |
+| `fdatasync` | 83 | none | Missing | iozone, LTP | n/a | syscall/fd/fs | Same as `fsync`, data-only if supported. |
+| `utimensat` | 88 | `sys_utimensat` | Compat/partial | busybox, LTP | low | fs/path | Add timestamp metadata or bounded errors. |
+| `exit` | 93 | `sys_exit` | Real-partial | all process tests | medium | task/syscall | Separate thread exit and process exit. |
+| `exit_group` | 94 | `sys_exit_group` | Real-partial | libc/nptl | medium | task/syscall | Finish thread-group teardown. |
+| `waitid` | 95 | none | Missing | LTP process | n/a | task/syscall | Add after wait state model. |
+| `set_tid_address` | 96 | `sys_set_tid_address` | Partial | nptl, libc | medium | task/futex | Keep clear-child-tid wake semantics accurate. |
+| `futex` | 98 | `sys_futex` | Partial | nptl, lmbench, LTP | low | sync/task | Expand op set; define alignment/fault ordering. |
+| `set_robust_list` | 99 | `sys_set_robust_list` | Partial | nptl | low | task/futex | Implement robust-list exit handling. |
+| `get_robust_list` | 100 | `sys_get_robust_list` | Partial | nptl, LTP | low | task/futex | Validate pid/tid model. |
+| `nanosleep` | 101 | `sys_nanosleep` | Real-partial | basic sleep, busybox | medium | task/time | Add signal interruption behavior. |
+| `clock_gettime` | 113 | `sys_clock_gettime` | Real-partial | busybox, cyclictest | medium | time | Ensure clock ids and precision. |
+| `clock_nanosleep` | 115 | `sys_clock_nanosleep` | Partial | cyclictest | low | task/time | Add absolute sleeps and interruption. |
+| `sched_setparam` | 118 | `sys_sched_setparam` | Partial | cyclictest, LTP sched | low | task/sched | Map to real scheduler or reject unsupported policy. |
+| `sched_setscheduler` | 119 | `sys_sched_setscheduler` | Partial | cyclictest, LTP sched | low | task/sched | Same. |
+| `sched_getscheduler` | 120 | `sys_sched_getscheduler` | Partial | cyclictest, LTP sched | low | task/sched | Same. |
+| `sched_getparam` | 121 | `sys_sched_getparam` | Partial | cyclictest, LTP sched | low | task/sched | Same. |
+| `sched_setaffinity` | 122 | `sys_sched_setaffinity` | Partial | LTP sched | low | task/sched | Validate cpuset sizes and task ids. |
+| `sched_getaffinity` | 123 | `sys_sched_getaffinity` | Partial | LTP sched | low | task/sched | Same. |
+| `sched_yield` | 124 | `sys_sched_yield` | Real-partial | basic yield, UnixBench | medium | task | Keep simple; add signal interactions later. |
+| `kill/tkill/tgkill` | 129/130/131 | `sys_kill/sys_tkill/sys_tgkill` | Partial | nptl, lmbench sig, LTP | low | task/signal | Finish pid/tid lookup and delivery semantics. |
+| `rt_sigaction` | 134 | `sys_rt_sigaction` | Partial | nptl, busybox | low | signal | Complete flags, restorer, masks. |
+| `rt_sigprocmask` | 135 | `sys_rt_sigprocmask` | Partial | nptl | low | signal | Finish thread-local masks. |
+| `rt_sigtimedwait` | 137 | `sys_rt_sigtimedwait` | Partial | LTP signal | low | signal | Define pending signal queue. |
+| `rt_sigreturn` | 139 | `sys_rt_sigreturn` | Partial | signal tests | low | signal | Verify arch frame layout. |
+| `times` | 153 | `sys_times` | Partial | basic, UnixBench | medium | time/task | Fill process CPU times when available. |
+| `getrusage` | 165 | `sys_getrusage` | Partial | wait4, UnixBench | low | task/time | Add child/self resource accounting. |
+| `gettimeofday` | 169 | `sys_gettimeofday` | Real-partial | busybox, lmbench | medium | time | Confirm tz behavior. |
+| `getpid/getppid/gettid` | 172/173/178 | inline | Partial | basic, all process tests | medium | task/process | Separate pid/tgid/tid. |
+| `shmget/shmctl/shmat/shmdt` | 194-197 | none | Missing | LTP mm | n/a | mm/ipc | Add shared-memory object model or return `ENOSYS`. |
+| `brk` | 214 | `sys_brk` | Partial | basic, libcbench | medium | mm/syscall | Move heap into VMA model. |
+| `munmap` | 215 | `sys_munmap` | Partial | basic, libcbench, LTP | medium | mm/syscall | Use VMA splitting/merging. |
+| `mremap` | 216 | none | Missing | LTP mm | n/a | mm | Add after VMA model. |
+| `clone` | 220 | `sys_clone` | Partial | basic, nptl, UnixBench, lmbench | low | task/mm/fd | Freeze supported flags; reject rest deterministically. |
+| `execve` | 221 | `sys_execve` | Real-partial | basic, busybox shell, UnixBench | medium | task/loader/fd | Add close-on-exec and atomic replacement. |
+| `mmap` | 222 | `sys_mmap` | Partial | basic, libcbench, iozone, lmbench | low | mm/fs/fd | Replace eager file read with VMA file mapping. |
+| `mprotect` | 226 | `sys_mprotect` | Partial | libc, nptl, LTP | low | mm | Use VMA permissions and splitting. |
+| `msync` | 227 | none | Missing | mmap IO, LTP | n/a | mm/fs | Add after file-backed mapping. |
+| `mlock/munlock/mlockall/munlockall/mlock2` | 228-231/284 | inline `0` | Stub-success | LTP mm | bad | mm/syscall | Replace silent success with real pinning or `ENOSYS/EOPNOTSUPP`. |
+| `mincore` | 232 | none | Missing | LTP mm | n/a | mm | Add VMA/page residency query. |
+| `madvise` | 233 | none | Missing | LTP mm/libc | n/a | mm | Add supported advice or `EINVAL/EOPNOTSUPP`. |
+| `mbind/get_mempolicy/set_mempolicy` | 235-237 | `sys_mbind/sys_get_mempolicy/sys_set_mempolicy` | Compat/partial | LTP numa | low | mm/numa | Return explicit unsupported semantics unless NUMA exists. |
+| `migrate_pages/move_pages` | 238/239 | none | Missing | LTP numa | n/a | mm/numa | Return `ENOSYS` until NUMA support. |
+| `wait4` | 260 | `sys_wait4` | Partial | basic wait, UnixBench, lmbench | medium | task/process | Implement full pid/options/rusage matrix. |
+| `prlimit64` | 261 | `sys_prlimit64` | Partial | busybox, libc | medium | process | Extend resource set as needed. |
+| `renameat2` | 276 | `sys_renameat2` | Partial | busybox `mv`, LTP | low | syscall/path/fs | Honor flags and overwrite/cross-fs rules. |
+| `statx` | 291 | `sys_statx` | Compat | busybox `stat`, LTP | low | fs/syscall | Back with real metadata and honest masks. |
+| `rseq` | 293 | none | Missing | modern libc/nptl | n/a | task | Return `ENOSYS` unless libc requires registration. |
+| `clone3` | 435 | none | Missing | LTP sched/nptl | n/a | task/process | Add only after clone contract is stable. |
+| `openat2` | 437 | none | Missing | LTP fs | n/a | path/fs | Add resolver flags after `openat` is correct. |
+| `mount_setattr` | 442 | none | Missing | LTP fs_bind | n/a | axfs | Add after real mount API. |
+
 ## Filesystem Interface Matrix
 
 | Area | Current syscall target | Available real interface | Status | Next architectural move |
@@ -166,6 +555,33 @@ LTP filesystem runtests require negative-path correctness. This means hardcoded
 Unsupported mount flags, permissions, readonly filesystems, invalid dirfds, bad
 buffers, and non-directory paths should return explicit Linux-compatible errno.
 
+## Workload Gate Matrix
+
+| Workload | Syscall/behavior focus | Expected current result | Promotion gate | Reduction target |
+| --- | --- | --- | --- | --- |
+| `basic` filesystem/fd | `openat`, `close`, `dup`, `dup3`, `fstat`, `getcwd`, `getdents64`, `mkdirat`, `mount`, `umount2`, `pipe2`, `read`, `unlinkat`, `write` | Should pass focused subset with current compatibility mount | Phase 0 regression | Individual `basic/user/src/oscomp/*.c` case and matching Python assertion. |
+| `busybox` file commands | `openat`, `read/write`, `lseek`, `statx/newfstatat/fstat`, `getdents64`, `mkdirat`, `unlinkat`, `renameat2`, `utimensat`, `faccessat`, `readlinkat` | Partial; likely failures around metadata, recursive dir ops, symlink/readlink, timestamps | Phase 1 filesystem gate | Single busybox applet command with one temp directory. |
+| `iozone` | `openat`, `read/write`, `pread64/pwrite64`, `readv/writev`, `preadv/pwritev`, `lseek`, `ftruncate`, `fsync/fdatasync`, file-backed `mmap/msync` | Partial; `pwrite*`, `fsync`, `msync`, and real file-backed mmap are gaps | Phase 1 IO gate, then Phase 2 mmap gate | One iozone mode and block size, then reduce to scalar syscall reproducer. |
+| `UnixBench fstime` | repeated create/write/read/copy/unlink plus `fork/wait/times` overhead | Partial; fd offset, metadata, and process cost may dominate | Phase 1 performance smoke | `fstime` small-file case before medium/large. |
+| `lmbench` fs/file | `lat_syscall` read/write/open/stat/fstat, `lmdd`, `lat_fs`, `bw_file_rd`, `bw_mmap_rd` | Partial; mmap read path not semantically complete | Phase 1/2 latency gate | One lmbench microbenchmark invocation. |
+| LTP `fs` | open/read/write/stat/getdents/link/unlink/rename/truncate/error paths | Not gate-ready until errno matrix and resolver are stable | Phase 1 negative-path gate | One LTP syscall testcase under `testcases/kernel/syscalls`. |
+| LTP `fs_bind` | real `mount`, `umount2`, mount propagation/attributes where applicable | Not gate-ready; current mount is compatibility-only | After real runtime mount API | Smallest mount/umount testcase first. |
+| LTP `fs_perms_simple` | permission checks, ownership, access, readonly cases | Not gate-ready; permission model incomplete | After permission metadata contract | One permission testcase with fixed uid/gid assumptions. |
+| LTP `fs_readonly` | write rejection on readonly mounts/filesystems | Not gate-ready; readonly mount state missing | After real mount flags | One readonly mount write attempt. |
+| `basic` memory | `brk`, `mmap`, `munmap` | Should be functional for simple anonymous cases | Phase 0/2 regression | Individual basic memory case. |
+| `libcbench` | allocator pressure, anonymous mmap/brk, string memory access | Partial; depends on VMA robustness | Phase 2 allocator smoke | Single libcbench subtest. |
+| `lmbench` memory | `lat_pagefault`, `lat_mmap`, `bw_mmap_rd` | Partial; lazy fault and file-backed mmap are weak | Phase 2 memory gate | One lmbench memory case. |
+| LTP `mm/hugetlb/numa` | `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `mincore`, `mlock`, NUMA policy, shared memory | Not gate-ready | Phase 2/3 after VMA contracts | One syscall testcase; unsupported NUMA should be explicit `ENOSYS/EOPNOTSUPP`. |
+| `basic` process | `clone`, `execve`, `exit`, `fork`, `getpid`, `getppid`, `sleep`, `times`, `wait`, `yield` | Partial; current supported clone paths need fixed contract | Phase 0/3 regression | Individual basic process case. |
+| `cyclictest` | `sched_*`, sleep/clock, thread creation, priority behavior | Partial; scheduler policy mapping incomplete | Phase 3 scheduler gate | Single-thread cyclictest before multi-thread/hackbench. |
+| `UnixBench` process | context switch, pipe, spawn, execl, syscall overhead | Partial; fork/exec/wait and pipe semantics/perf | Phase 3 process perf gate | One UnixBench process test. |
+| `lmbench` process/signal | `fork/exec/shell`, context switch, pipe, select, signal latency | Partial; signal/futex/select semantics incomplete | Phase 3 process/signal gate | One lmbench subtest. |
+| LTP `sched/nptl/cpuhotplug` | clone/thread groups, futex, robust list, signals, scheduler APIs | Not gate-ready | Phase 3 after process/thread model | One LTP syscall or nptl testcase. |
+
+Gate rule: a workload can become a promotion gate only when unsupported
+syscalls in its row return explicit Linux-style errors and no required behavior
+is still implemented as silent success.
+
 ## Memory Interface Matrix
 
 | Area | Current syscall target | Available real interface | Status | Next architectural move |
@@ -193,6 +609,101 @@ buffers, and non-directory paths should return explicit Linux-compatible errno.
 | `sleep/yield` | scheduling calls | sleep/yield APIs | Real enough | Preserve signal interruption behavior later. |
 | `sched_*` | scheduler ABI | priority/affinity APIs | Partial | Map Linux policies carefully; unsupported realtime settings must return explicit errno. |
 | futex/signals | synchronization and delivery | wait queues, partial signal code | Partial | Needed before broad LTP nptl and lmbench signal paths. |
+
+## Errno and User-Memory Policy
+
+Linux tests often check both errno value and validation order. The default rule
+for this project is:
+
+1. validate syscall number and architecture dispatch;
+2. validate scalar flags and impossible argument combinations that do not touch
+   user memory;
+3. validate fd/pid/tid handles before user data buffers for fd/process syscalls;
+4. copy input user memory before performing visible state changes;
+5. perform the operation;
+6. copy output user memory last, and roll back state when the syscall contract
+   requires atomicity.
+
+High-frequency syscall rules:
+
+| Syscall | Validation order | Required errno behavior |
+| --- | --- | --- |
+| `openat` | flags/mode shape, pathname pointer/string, dirfd if relative, path resolution, create/open | bad pathname pointer `EFAULT`; unknown flags `EINVAL`; bad relative dirfd `EBADF`; non-directory dirfd `ENOTDIR`; missing path `ENOENT`; unsupported create/symlink/perms `EOPNOTSUPP` or real fs errno. |
+| `read` | fd lookup, fd readable, user buffer if count > 0, backend read | bad fd before bad buffer gives `EBADF`; write-only/non-readable fd `EBADF`; directory fd `EISDIR`; bad buffer `EFAULT`; pipe closed behavior must distinguish EOF vs `EPIPE` where relevant. |
+| `write` | fd lookup, fd writable, user buffer if count > 0, backend write | bad fd before bad buffer gives `EBADF`; read-only/non-writable fd `EBADF`; bad buffer `EFAULT`; closed pipe `EPIPE` plus signal later; unsupported append/special device must not return fake success. |
+| `statx` | flags/mask, pathname pointer unless `AT_EMPTY_PATH`, dirfd/path resolution, metadata query, output buffer | unknown flags `EINVAL`; bad output pointer `EFAULT`; unsupported fields are omitted from returned mask, not guessed; no fake success for unimplemented path flags. |
+| `mmap` | length, flag combinations, page alignment, fd/mode for file mappings, address range, VMA install | length 0 `EINVAL`; unsupported flags `EINVAL` or `EOPNOTSUPP`; bad fd `EBADF`; offset alignment `EINVAL`; permission mismatch `EACCES`; no address space `ENOMEM`. |
+| `clone` | flag combination, required stack/tid pointers for supported modes, memory/fd/process creation, parent/child tid writes | unsupported flag combination returns `EINVAL` once contract is frozen; bad `ptid/ctid` pointers `EFAULT`; resource exhaustion `EAGAIN` or `ENOMEM`; no ignored flags. |
+| `wait4/waitid` | option flags, child selection, wait state, output status/rusage write | unknown options `EINVAL`; no matching child `ECHILD`; nonblocking no-child-exited returns 0 for `WNOHANG`; bad output pointer `EFAULT` when writing a result. |
+| `futex` | aligned user address, op command, op-specific user pointers, value check, queue operation | unaligned/null futex address `EINVAL`; bad user address `EFAULT`; unsupported op `ENOSYS` or `EOPNOTSUPP`; value mismatch `EAGAIN`; timeout `ETIMEDOUT`; signal interruption `EINTR`. |
+
+Any syscall-local deviation from this table must be documented next to the
+handler with the workload that requires it.
+
+## Minimum Process/Thread Boundary
+
+Before Phase 3, the current `clone` behavior should be frozen as a documented
+subset instead of growing by ignored flags.
+
+Phase 0/1 allowed process-like modes:
+
+- `fork`/`clone` with no sharing flags and exit signal 0 or `SIGCHLD`.
+- optional `CLONE_SETTLS`, `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`, and
+  `CLONE_CHILD_CLEARTID` only if the corresponding user pointer is valid.
+- `CLONE_VFORK | CLONE_VM` may be accepted only if parent blocking and shared
+  address-space lifetime are implemented; otherwise return `EINVAL`.
+
+Phase 0/1 allowed thread-like mode:
+
+- exactly the pthread-style sharing set required by libc:
+  `CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_SYSVSEM |
+  CLONE_THREAD`, plus optional TLS and tid flags.
+- child stack must be nonzero.
+- the new thread shares process memory and fd table; `tid` differs from `tgid`.
+
+Rejected modes:
+
+- unknown or unmodeled flags return `EINVAL`, not success.
+- partial sharing combinations, such as `CLONE_FILES` without the rest of the
+  thread model, return `EINVAL` until their lifecycle semantics are defined.
+- `clone3` returns `ENOSYS` until the `clone` contract is complete.
+
+## Compatibility-Only Exit Rules
+
+Compatibility code is allowed only as a bridge to a named milestone. It must be
+easy to find and safe to delete.
+
+Naming and comment format:
+
+```rust
+// compat(<milestone>): <why this exists>
+// delete-when: <real interface or test gate that removes it>
+```
+
+Rules:
+
+- function names, fields, or modules that hold fake state must use the
+  `compat_` prefix.
+- every compatibility path must list a milestone and a deletion condition.
+- compatibility code may emulate a narrow successful path, but must return
+  explicit errors for unsupported states.
+- no compatibility path may claim success for a state-changing operation unless
+  it records enough state to make the matching inverse operation meaningful.
+- no new `Stub-success` syscall is allowed after Phase 0.
+- before any broad suite gate, run a source scan for `compat_`, `Stub-success`,
+  and direct `=> 0` syscall arms; each hit must be justified in the gate notes.
+- compatibility state must not be copied into real subsystem APIs. When the real
+  interface exists, the compatibility state is deleted rather than synchronized.
+
+Current compatibility exits:
+
+| Compatibility path | Delete when | Required interim behavior |
+| --- | --- | --- |
+| `compat_mounts` | runtime `axfs` mount/unmount can expose mounted contents | keep target state machine; duplicate mount `EBUSY`; unmounted target `EINVAL/ENOENT`; no fake success for flags/data. |
+| `statx` from `stat` | filesystem metadata returns statx-capable fields and mask | report only honest fields; unknown flags `EINVAL`; bad buffers `EFAULT`. |
+| test staging cwd display rewrite | user process launch has a single namespace root | path resolution and getcwd observe the same namespace; no display-only behavior in broad gates. |
+| `mlock* => 0` | real page pinning exists or workload explicitly accepts unsupported | replace with `ENOSYS/EOPNOTSUPP` before LTP mm. |
+| `/dev/*` ad hoc fd entries | devfs/device registry exists | only known devices succeed; unknown devices return `ENOENT` or `ENODEV`. |
 
 ## Replacement Path for Current Compatibility Code
 
@@ -245,10 +756,19 @@ Target state:
 - Keep the existing basic filesystem/fd pass as the regression baseline.
 - Label compatibility-only paths in code and docs.
 - Ensure unsupported syscall flags return errors, not accidental success.
+- Add the syscall atlas table to review for every new syscall handler.
+- Freeze the supported `clone` flag subset and convert ignored sharing flags to
+  explicit errors.
+- Replace any new silent-success stub with `ENOSYS`, `EINVAL`, or
+  `EOPNOTSUPP`.
 - Add small focused checks before broad workload runs.
 
 ### Phase 1: Real Filesystem Interfaces
 
+- Implement the fd slot/open-file-description model before expanding broad file
+  semantics.
+- Add the unified path resolver and route `openat`, `mkdirat`, `unlinkat`,
+  `renameat2`, `statx/newfstatat`, and `chdir` through it.
 - Replace compatibility mount state with a real runtime mount/unmount API.
 - Add or route through real device/filesystem factory interfaces.
 - Complete `fsync`, `truncate`, `pread/pwrite`, `readv/writev`, and shared file
@@ -298,10 +818,7 @@ that reduced case to the phase gate before making another broad pass.
   it.
 - Should `statx` be backed by an extended metadata trait or by filesystem-
   specific optional fields?
-- Should file offsets live in shared open-file descriptions instead of directly
-  inside duplicated `FdEntry` values?
 - What is the intended Linux pid/thread model for `clone` and `fork` in this
   project?
 - Which workloads are the first promotion gate after `basic`: busybox file
   commands or iozone?
-
