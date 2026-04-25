@@ -1281,7 +1281,7 @@ impl UserProcess {
 
     fn normalize_user_path(&self, path: &str) -> Result<String, LinuxError> {
         let cwd = self.cwd();
-        normalize_path(cwd.as_str(), path).ok_or(LinuxError::EINVAL)
+        crate::linux_fs::resolve_cwd_path(cwd.as_str(), path).ok_or(LinuxError::EINVAL)
     }
 
     fn teardown(&self) {
@@ -4058,7 +4058,8 @@ fn current_cwd() -> String {
 }
 
 fn resolve_host_path(cwd: String, path: &str) -> Result<String, String> {
-    normalize_path(cwd.as_str(), path).ok_or_else(|| format!("invalid path: {path}"))
+    crate::linux_fs::normalize_path(cwd.as_str(), path)
+        .ok_or_else(|| format!("invalid path: {path}"))
 }
 
 fn derive_exec_root_from_path(path: &str) -> String {
@@ -4088,7 +4089,8 @@ fn resolve_runtime_support_file(exec_root: &str, path: &str) -> Result<String, S
     } else if !path.contains('/') {
         runtime_library_name_candidates(exec_root, path)
     } else {
-        vec![normalize_path("/", path).ok_or_else(|| format!("invalid path: {path}"))?]
+        vec![crate::linux_fs::normalize_path("/", path)
+            .ok_or_else(|| format!("invalid path: {path}"))?]
     };
     candidates
         .into_iter()
@@ -4097,7 +4099,7 @@ fn resolve_runtime_support_file(exec_root: &str, path: &str) -> Result<String, S
 }
 
 fn runtime_absolute_path_candidates(exec_root: &str, path: &str) -> Vec<String> {
-    let Some(normalized) = normalize_path("/", path) else {
+    let Some(normalized) = crate::linux_fs::normalize_path("/", path) else {
         return Vec::new();
     };
     let mut candidates = vec![normalized.clone()];
@@ -4229,7 +4231,7 @@ fn runtime_root_candidates(exec_root: &str, path: &str) -> Vec<String> {
 }
 
 fn join_runtime_root(root: &str, path: &str) -> Option<String> {
-    let normalized = normalize_path("/", path)?;
+    let normalized = crate::linux_fs::normalize_path("/", path)?;
     if root == "/" {
         return Some(normalized);
     }
@@ -4286,29 +4288,6 @@ fn is_musl_runtime_name(name: &str) -> bool {
 
 fn looks_like_runtime_library_name(name: &str) -> bool {
     name.starts_with("ld-") || name.contains(".so")
-}
-
-fn normalize_path(base: &str, path: &str) -> Option<String> {
-    let mut parts = Vec::new();
-    let input = if path.starts_with('/') {
-        path.to_string()
-    } else if base == "/" {
-        format!("/{path}")
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), path)
-    };
-    for part in input.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            _ => parts.push(part),
-        }
-    }
-    let mut normalized = String::from("/");
-    normalized.push_str(&parts.join("/"));
-    Some(normalized)
 }
 
 trait CCharSlot: Copy {
@@ -4848,7 +4827,8 @@ fn open_fd_entry(
             runtime_absolute_path_candidates(exec_root.as_str(), path)
         } else {
             let cwd = process.cwd();
-            let primary = normalize_path(cwd.as_str(), path).ok_or(LinuxError::EINVAL)?;
+            let primary =
+                crate::linux_fs::normalize_path(cwd.as_str(), path).ok_or(LinuxError::EINVAL)?;
             let mut candidates = vec![primary];
             for extra in runtime_library_name_candidates(exec_root.as_str(), path) {
                 push_runtime_candidate(&mut candidates, Some(extra));
@@ -4863,7 +4843,8 @@ fn open_fd_entry(
         let FdEntry::Directory(dir) = table.entry(dirfd)? else {
             return Err(LinuxError::ENOTDIR);
         };
-        let primary = normalize_path(dir.path.as_str(), path).ok_or(LinuxError::EINVAL)?;
+        let primary =
+            crate::linux_fs::normalize_path(dir.path.as_str(), path).ok_or(LinuxError::EINVAL)?;
         let mut candidates = vec![primary];
         for extra in runtime_library_name_candidates(exec_root.as_str(), path) {
             push_runtime_candidate(&mut candidates, Some(extra));
@@ -4928,7 +4909,7 @@ fn open_fd_candidates(
 }
 
 fn dev_shm_host_path(path: &str) -> Option<String> {
-    let normalized = normalize_path("/", path)?;
+    let normalized = crate::linux_fs::normalize_path("/", path)?;
     let rel = normalized.strip_prefix("/dev/shm/")?;
     if rel.is_empty() {
         return None;
@@ -4980,16 +4961,16 @@ fn resolve_dirfd_path(
     path: &str,
 ) -> Result<String, LinuxError> {
     if path.starts_with('/') {
-        return normalize_path("/", path).ok_or(LinuxError::EINVAL);
+        return crate::linux_fs::normalize_path("/", path).ok_or(LinuxError::EINVAL);
     }
     if dirfd == general::AT_FDCWD {
         let cwd = process.cwd();
-        return normalize_path(cwd.as_str(), path).ok_or(LinuxError::EINVAL);
+        return crate::linux_fs::normalize_path(cwd.as_str(), path).ok_or(LinuxError::EINVAL);
     }
     let FdEntry::Directory(dir) = table.entry(dirfd)? else {
         return Err(LinuxError::ENOTDIR);
     };
-    normalize_path(dir.path.as_str(), path).ok_or(LinuxError::EINVAL)
+    crate::linux_fs::normalize_path(dir.path.as_str(), path).ok_or(LinuxError::EINVAL)
 }
 
 fn dirent_type(ty: FileType) -> u32 {
