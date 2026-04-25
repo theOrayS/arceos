@@ -18,6 +18,9 @@ fn path_to_str(path: &str) -> &str {
 mod cmd;
 
 #[cfg(feature = "uspace")]
+mod linux_fs;
+
+#[cfg(feature = "uspace")]
 mod uspace;
 
 #[cfg(feature = "use-ramfs")]
