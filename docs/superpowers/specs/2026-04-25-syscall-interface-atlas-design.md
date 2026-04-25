@@ -2,6 +2,17 @@
 
 Date: 2026-04-25
 
+Status: historical design record.
+
+Canonical long-lived interface rules now live under `docs/development/`:
+
+- `docs/development/README.md`
+- `docs/development/interfaces/`
+- `docs/development/policies/`
+
+Use those documents for current development. This file records the original
+design discussion that led to the long-lived split.
+
 ## Goal
 
 Build a shared implementation map for the ArceOS syscall work that covers the
