@@ -9,6 +9,11 @@ pub mod path;
 pub mod stat;
 pub mod types;
 
+pub use fd::{
+    FdFlags, OpenFileBackend, OpenFileDescription, OpenStatusFlags, SharedOpenFileDescription,
+};
 pub use mount::{MountRequest, MountTable, UmountRequest};
-pub use path::{normalize_path, resolve_cwd_path};
+pub use path::{
+    ResolveOptions, normalize_path, resolve_at_path, resolve_cwd_path,
+};
 pub use stat::{stat_to_statx, statx_accepts_empty_path, validate_statx_flags};

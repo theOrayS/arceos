@@ -30,9 +30,9 @@ Status values:
 | Syscall | nr(rv/la) | Current handler | Status | Required by workload | Errno fidelity | Owner | Next action |
 | --- | ---: | --- | --- | --- | --- | --- | --- |
 | `getcwd` | 17 | `sys_getcwd` | Real-partial | basic, busybox, LTP | medium | syscall/path | Keep return ABI as `buf`; remove display rewrites after namespace fix. |
-| `dup` | 23 | `sys_dup` | Real-partial | basic, busybox, lmbench | medium | syscall/fd | Move to fd slot + shared open-file-description model. |
-| `dup3` | 24 | `sys_dup3` | Real-partial | basic, busybox, pthreads | medium | syscall/fd | Implement `O_CLOEXEC`; keep unsupported flags as `EINVAL`. |
-| `fcntl` | 25 | `sys_fcntl` | Partial | busybox, LTP, nptl | low | syscall/fd | Add fd flags, status flags, locks when required. |
+| `dup` | 23 | `sys_dup` | Real-partial | basic, busybox, lmbench | medium | syscall/fd | Uses fd slots with shared open-file-description; new duplicate clears `FD_CLOEXEC`. |
+| `dup3` | 24 | `sys_dup3` | Real-partial | basic, busybox, pthreads | medium | syscall/fd | Supports `O_CLOEXEC`; unsupported flags remain `EINVAL`. |
+| `fcntl` | 25 | `sys_fcntl` | Real-partial | busybox, LTP, nptl | low | syscall/fd | Supports `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`, `F_SETFD`, `F_GETFL`, `F_SETFL`; locks remain unsupported. |
 | `ioctl` | 29 | `sys_ioctl` | Compat/partial | busybox tty, shell | low | syscall/dev | Route tty/device ioctls through devfs/device registry. |
 | `mkdirat` | 34 | `sys_mkdirat` | Real-partial | basic, busybox, LTP | medium | syscall/path/fs | Use unified resolver; honor mode/error matrix. |
 | `unlinkat` | 35 | `sys_unlinkat` | Real-partial | basic, busybox, LTP | medium | syscall/path/fs | Add `AT_REMOVEDIR`, dir/file checks, sticky/perms later. |
@@ -97,7 +97,7 @@ Status values:
 | `munmap` | 215 | `sys_munmap` | Partial | basic, libcbench, LTP | medium | mm/syscall | Use VMA splitting/merging. |
 | `mremap` | 216 | none | Missing | LTP mm | n/a | mm | Add after VMA model. |
 | `clone` | 220 | `sys_clone` | Partial | basic, nptl, UnixBench, lmbench | low | task/mm/fd | Freeze supported flags; reject rest deterministically. |
-| `execve` | 221 | `sys_execve` | Real-partial | basic, busybox shell, UnixBench | medium | task/loader/fd | Add close-on-exec and atomic replacement. |
+| `execve` | 221 | `sys_execve` | Real-partial | basic, busybox shell, UnixBench | medium | task/loader/fd | Closes `FD_CLOEXEC` slots after successful image load; atomic replacement remains incomplete. |
 | `mmap` | 222 | `sys_mmap` | Partial | basic, libcbench, iozone, lmbench | low | mm/fs/fd | Replace eager file read with VMA file mapping. |
 | `mprotect` | 226 | `sys_mprotect` | Partial | libc, nptl, LTP | low | mm | Use VMA permissions and splitting. |
 | `msync` | 227 | none | Missing | mmap IO, LTP | n/a | mm/fs | Add after file-backed mapping. |
@@ -108,7 +108,7 @@ Status values:
 | `migrate_pages/move_pages` | 238/239 | none | Missing | LTP numa | n/a | mm/numa | Return `ENOSYS` until NUMA support. |
 | `wait4` | 260 | `sys_wait4` | Partial | basic wait, UnixBench, lmbench | medium | task/process | Implement pid/options/rusage matrix. |
 | `prlimit64` | 261 | `sys_prlimit64` | Partial | busybox, libc | medium | process | Extend resource set as needed. |
-| `renameat2` | 276 | `sys_renameat2` | Partial | busybox `mv`, LTP | low | syscall/path/fs | Honor flags and overwrite/cross-fs rules. |
+| `renameat2` | 276 | `sys_renameat2` | Compat/partial | busybox `mv`, LTP | low | syscall/path/fs | Real file rename via `axfs::api::rename`; `compat_empty_dir_rename` covers unsupported empty-directory rename until axfs grows directory rename semantics. |
 | `statx` | 291 | `sys_statx` | Compat | busybox `stat`, LTP | medium | fs/syscall | `linux_fs::stat` returns honest masks; back remaining fields with real metadata. |
 | `rseq` | 293 | none | Missing | modern libc/nptl | n/a | task | Return `ENOSYS` unless libc requires registration. |
 | `clone3` | 435 | none | Missing | LTP sched/nptl | n/a | task/process | Add only after clone contract is stable. |

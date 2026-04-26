@@ -59,6 +59,7 @@ Every compatibility path must include a nearby comment with this shape:
 | --- | --- | --- |
 | `linux_fs::mount::MountTable` / `compat_basic_mount` | runtime `axfs` mount/unmount exposes mounted contents | duplicate mount returns `EBUSY`; unmounted target returns `EINVAL` or `ENOENT`; unsupported flags/data must not succeed. |
 | `linux_fs::stat` statx projection from `stat` | filesystem metadata returns statx-capable fields and mask | return only honest fields through `requested_mask & supported_mask`; invalid flags `EINVAL`; bad buffers `EFAULT`. |
+| `compat_empty_dir_rename` | `axfs::api::rename` supports directory rename semantics | only after real rename returns unsupported, empty directory rename is emulated with create-destination/remove-source and rollback on remove failure; existing destination and non-directory source return explicit errno. |
 | test staging cwd display rewrite | user process launch has a single namespace root | path resolution and `getcwd` observe the same namespace; no display-only behavior in broad gates. |
 | `mlock* => 0` | page pinning exists or the workload explicitly accepts unsupported | replace with `ENOSYS` or `EOPNOTSUPP` before LTP mm gates. |
 | ad hoc `/dev/*` fd entries | devfs or device registry exists | only known devices succeed; unknown devices return `ENOENT` or `ENODEV`. |

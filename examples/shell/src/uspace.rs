@@ -11,7 +11,7 @@ use axhal::paging::MappingFlags;
 use axhal::trap::{
     PAGE_FAULT, PageFaultFlags, SYSCALL, register_trap_handler, register_user_return_handler,
 };
-use axio::{PollState, SeekFrom};
+use axio::PollState;
 use axmm::AddrSpace;
 use axns::AxNamespace;
 use axsync::Mutex;
@@ -40,6 +40,7 @@ const USER_BRK_GROW_SIZE: usize = 64 * 1024 * 1024;
 const USER_PIE_LOAD_BASE: usize = USER_ASPACE_BASE;
 const MAX_SCRIPT_INTERPRETER_DEPTH: usize = 4;
 const TESTSUITE_STAGE_ROOT: &str = "/tmp/testsuite";
+const AT_FDCWD_I32: i32 = -100;
 #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 const SYS_UMOUNT2: u32 = 39;
 #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
@@ -134,7 +135,7 @@ struct BrkState {
 }
 
 struct FdTable {
-    entries: Vec<Option<FdEntry>>,
+    entries: Vec<Option<FdSlot>>,
 }
 
 enum FdEntry {
@@ -142,22 +143,14 @@ enum FdEntry {
     Stdout,
     Stderr,
     DevNull,
-    File(FileEntry),
-    Directory(DirectoryEntry),
+    File(crate::linux_fs::SharedOpenFileDescription),
+    Directory(crate::linux_fs::SharedOpenFileDescription),
     Pipe(PipeEndpoint),
 }
 
-#[derive(Clone)]
-struct FileEntry {
-    file: File,
-    path: String,
-}
-
-#[derive(Clone)]
-struct DirectoryEntry {
-    dir: Directory,
-    attr: FileAttr,
-    path: String,
+struct FdSlot {
+    fd_flags: crate::linux_fs::FdFlags,
+    entry: FdEntry,
 }
 
 struct ChildTask {
@@ -2093,16 +2086,13 @@ fn sys_read(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize
 
 fn sys_pread64(process: &UserProcess, fd: usize, buf: usize, count: usize, offset: usize) -> isize {
     with_writable_slice(process, buf, count, |dst| {
-        let mut table = process.fds.lock();
-        let FdEntry::File(file) = table.entry_mut(fd as i32)? else {
+        let table = process.fds.lock();
+        let FdEntry::File(desc) = table.entry(fd as i32)? else {
             return Err(LinuxError::EBADF);
         };
         let mut filled = 0usize;
         while filled < dst.len() {
-            let read = file
-                .file
-                .read_at(offset as u64 + filled as u64, &mut dst[filled..])
-                .map_err(LinuxError::from)?;
+            let read = desc.pread_file(&mut dst[filled..], offset as u64 + filled as u64)?;
             if read == 0 {
                 break;
             }
@@ -2408,6 +2398,7 @@ fn sys_execve(
         Ok(image) => image,
         Err(_) => return neg_errno(LinuxError::ENOEXEC),
     };
+    process.fds.lock().close_cloexec();
     let context = make_uspace_context(entry, stack_ptr, argc);
     let kstack_top = axtask::current()
         .kernel_stack_top()
@@ -2665,26 +2656,41 @@ fn sys_mkdirat(process: &UserProcess, dirfd: usize, pathname: usize, _mode: usiz
         Ok(path) => path,
         Err(err) => return neg_errno(err),
     };
-    match process
-        .fds
-        .lock()
-        .mkdirat(process, dirfd as i32, path.as_str())
-    {
+    let abs_path = {
+        let table = process.fds.lock();
+        match resolve_dirfd_path(process, &table, dirfd as i32, path.as_str()) {
+            Ok(path) => path,
+            Err(err) => return neg_errno(err),
+        }
+    };
+    match directory_create_dir(abs_path.as_str()) {
         Ok(()) => 0,
         Err(err) => neg_errno(err),
     }
 }
 
 fn sys_unlinkat(process: &UserProcess, dirfd: usize, pathname: usize, flags: usize) -> isize {
+    let flags = flags as u32;
+    if flags & !general::AT_REMOVEDIR != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
     let path = match read_cstr(process, pathname) {
         Ok(path) => path,
         Err(err) => return neg_errno(err),
     };
-    match process
-        .fds
-        .lock()
-        .unlinkat(process, dirfd as i32, path.as_str(), flags as u32)
-    {
+    let abs_path = {
+        let table = process.fds.lock();
+        match resolve_dirfd_path(process, &table, dirfd as i32, path.as_str()) {
+            Ok(path) => path,
+            Err(err) => return neg_errno(err),
+        }
+    };
+    let result = if flags & general::AT_REMOVEDIR != 0 {
+        directory_remove_dir(abs_path.as_str())
+    } else {
+        directory_remove_file(abs_path.as_str())
+    };
+    match result {
         Ok(()) => 0,
         Err(err) => neg_errno(err),
     }
@@ -2760,11 +2766,14 @@ fn sys_faccessat(
         Ok(path) => path,
         Err(err) => return neg_errno(err),
     };
-    match process
-        .fds
-        .lock()
-        .stat_path(process, dirfd as i32, path.as_str())
-    {
+    let abs_path = {
+        let table = process.fds.lock();
+        match resolve_dirfd_path(process, &table, dirfd as i32, path.as_str()) {
+            Ok(path) => path,
+            Err(err) => return neg_errno(err),
+        }
+    };
+    match stat_path_abs(abs_path.as_str()) {
         Ok(_) => 0,
         Err(err) => neg_errno(err),
     }
@@ -2842,7 +2851,7 @@ fn sys_renameat2(
         };
         (old_abs, new_abs)
     };
-    match axfs::api::rename(old_abs_path.as_str(), new_abs_path.as_str()) {
+    match rename_path_abs(old_abs_path.as_str(), new_abs_path.as_str()) {
         Ok(()) => 0,
         Err(err) => neg_errno(LinuxError::from(err)),
     }
@@ -2866,11 +2875,14 @@ fn sys_newfstatat(
         Ok(path) => path,
         Err(err) => return neg_errno(err),
     };
-    let st = match process
-        .fds
-        .lock()
-        .stat_path(process, dirfd as i32, path.as_str())
-    {
+    let abs_path = {
+        let table = process.fds.lock();
+        match resolve_dirfd_path(process, &table, dirfd as i32, path.as_str()) {
+            Ok(path) => path,
+            Err(err) => return neg_errno(err),
+        }
+    };
+    let st = match stat_path_abs(abs_path.as_str()) {
         Ok(st) => st,
         Err(err) => return neg_errno(err),
     };
@@ -2910,11 +2922,14 @@ fn sys_statx(
             Err(err) => return neg_errno(err),
         }
     } else {
-        match process
-            .fds
-            .lock()
-            .stat_path(process, dirfd as i32, path.as_str())
-        {
+        let abs_path = {
+            let table = process.fds.lock();
+            match resolve_dirfd_path(process, &table, dirfd as i32, path.as_str()) {
+                Ok(path) => path,
+                Err(err) => return neg_errno(err),
+            }
+        };
+        match stat_path_abs(abs_path.as_str()) {
             Ok(st) => st,
             Err(err) => return neg_errno(err),
         }
@@ -4452,10 +4467,23 @@ impl FdEntry {
             Self::Stdout => Ok(Self::Stdout),
             Self::Stderr => Ok(Self::Stderr),
             Self::DevNull => Ok(Self::DevNull),
-            Self::File(file) => Ok(Self::File(file.clone())),
-            Self::Directory(dir) => Ok(Self::Directory(dir.clone())),
+            Self::File(desc) => Ok(Self::File(Arc::clone(desc))),
+            Self::Directory(desc) => Ok(Self::Directory(Arc::clone(desc))),
             Self::Pipe(pipe) => Ok(Self::Pipe(pipe.clone())),
         }
+    }
+}
+
+impl FdSlot {
+    fn new(entry: FdEntry, fd_flags: crate::linux_fs::FdFlags) -> Self {
+        Self { fd_flags, entry }
+    }
+
+    fn duplicate_for_fork(&self) -> Result<Self, LinuxError> {
+        Ok(Self {
+            fd_flags: self.fd_flags,
+            entry: self.entry.duplicate_for_fork()?,
+        })
     }
 }
 
@@ -4463,9 +4491,18 @@ impl FdTable {
     fn new() -> Self {
         Self {
             entries: vec![
-                Some(FdEntry::Stdin),
-                Some(FdEntry::Stdout),
-                Some(FdEntry::Stderr),
+                Some(FdSlot::new(
+                    FdEntry::Stdin,
+                    crate::linux_fs::FdFlags::empty(),
+                )),
+                Some(FdSlot::new(
+                    FdEntry::Stdout,
+                    crate::linux_fs::FdFlags::empty(),
+                )),
+                Some(FdSlot::new(
+                    FdEntry::Stderr,
+                    crate::linux_fs::FdFlags::empty(),
+                )),
             ],
         }
     }
@@ -4474,11 +4511,21 @@ impl FdTable {
         let mut entries = Vec::with_capacity(self.entries.len());
         for entry in &self.entries {
             entries.push(match entry {
-                Some(entry) => Some(entry.duplicate_for_fork()?),
+                Some(slot) => Some(slot.duplicate_for_fork()?),
                 None => None,
             });
         }
         Ok(Self { entries })
+    }
+
+    fn dirfd_base_path(&self, dirfd: i32) -> Result<Option<String>, LinuxError> {
+        if dirfd == AT_FDCWD_I32 {
+            return Ok(None);
+        }
+        match self.entry(dirfd)? {
+            FdEntry::Directory(desc) => Ok(Some(desc.path().to_string())),
+            _ => Err(LinuxError::ENOTDIR),
+        }
     }
 
     fn is_stdio(&self, fd: i32) -> bool {
@@ -4487,7 +4534,10 @@ impl FdTable {
         }
         matches!(
             self.entries.get(fd as usize),
-            Some(Some(FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr))
+            Some(Some(FdSlot {
+                entry: FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr,
+                ..
+            }))
         )
     }
 
@@ -4514,10 +4564,10 @@ impl FdTable {
     }
 
     fn read(&mut self, fd: i32, dst: &mut [u8]) -> Result<usize, LinuxError> {
-        match self.entry_mut(fd)? {
+        match self.entry(fd)? {
             FdEntry::Stdin => Ok(0),
             FdEntry::DevNull => Ok(0),
-            FdEntry::File(file) => file.file.read(dst).map_err(LinuxError::from),
+            FdEntry::File(desc) => desc.read_file(dst),
             FdEntry::Directory(_) => Err(LinuxError::EISDIR),
             FdEntry::Pipe(pipe) => pipe.read(dst),
             _ => Err(LinuxError::EBADF),
@@ -4525,13 +4575,13 @@ impl FdTable {
     }
 
     fn write(&mut self, fd: i32, src: &[u8]) -> Result<usize, LinuxError> {
-        match self.entry_mut(fd)? {
+        match self.entry(fd)? {
             FdEntry::Stdout | FdEntry::Stderr => {
                 axhal::console::write_bytes(src);
                 Ok(src.len())
             }
             FdEntry::DevNull => Ok(src.len()),
-            FdEntry::File(file) => file.file.write(src).map_err(LinuxError::from),
+            FdEntry::File(desc) => desc.write_file(src),
             FdEntry::Pipe(pipe) => pipe.write(src),
             _ => Err(LinuxError::EBADF),
         }
@@ -4545,46 +4595,9 @@ impl FdTable {
         flags: u32,
     ) -> Result<i32, LinuxError> {
         let entry = open_fd_entry(process, self, dirfd, path, flags)?;
-        self.insert(entry)
-    }
-
-    fn mkdirat(&mut self, process: &UserProcess, dirfd: i32, path: &str) -> Result<(), LinuxError> {
-        if path.starts_with('/') || dirfd == general::AT_FDCWD {
-            let cwd = process.cwd();
-            let abs_path = resolve_host_path(cwd, path).map_err(|_| LinuxError::EINVAL)?;
-            return directory_create_dir(abs_path.as_str());
-        }
-        let FdEntry::Directory(dir) = self.entry(dirfd)? else {
-            return Err(LinuxError::ENOTDIR);
-        };
-        dir.dir.create_dir(path).map_err(LinuxError::from)
-    }
-
-    fn unlinkat(
-        &mut self,
-        process: &UserProcess,
-        dirfd: i32,
-        path: &str,
-        flags: u32,
-    ) -> Result<(), LinuxError> {
-        let remove_dir = flags & general::AT_REMOVEDIR != 0;
-        if path.starts_with('/') || dirfd == general::AT_FDCWD {
-            let cwd = process.cwd();
-            let abs_path = resolve_host_path(cwd, path).map_err(|_| LinuxError::EINVAL)?;
-            return if remove_dir {
-                directory_remove_dir(abs_path.as_str())
-            } else {
-                directory_remove_file(abs_path.as_str())
-            };
-        }
-        let FdEntry::Directory(dir) = self.entry(dirfd)? else {
-            return Err(LinuxError::ENOTDIR);
-        };
-        if remove_dir {
-            dir.dir.remove_dir(path).map_err(LinuxError::from)
-        } else {
-            dir.dir.remove_file(path).map_err(LinuxError::from)
-        }
+        let mut fd_flags = crate::linux_fs::FdFlags::empty();
+        fd_flags.set_cloexec(flags & general::O_CLOEXEC != 0);
+        self.insert_with_flags(entry, fd_flags)
     }
 
     fn close(&mut self, fd: i32) -> Result<(), LinuxError> {
@@ -4595,65 +4608,91 @@ impl FdTable {
         Ok(())
     }
 
+    fn close_cloexec(&mut self) {
+        for slot in &mut self.entries {
+            if slot.as_ref().is_some_and(|slot| slot.fd_flags.cloexec()) {
+                *slot = None;
+            }
+        }
+    }
+
     fn stat(&mut self, fd: i32) -> Result<general::stat, LinuxError> {
         match self.entry_mut(fd)? {
             FdEntry::Stdin => Ok(stdio_stat(true)),
             FdEntry::Stdout | FdEntry::Stderr => Ok(stdio_stat(false)),
             FdEntry::DevNull => Ok(stdio_stat(false)),
-            FdEntry::File(file) => Ok(file_attr_to_stat(
-                &file.file.get_attr().map_err(LinuxError::from)?,
-                Some(file.path.as_str()),
-            )),
-            FdEntry::Directory(dir) => Ok(file_attr_to_stat(&dir.attr, Some(dir.path.as_str()))),
+            FdEntry::File(desc) | FdEntry::Directory(desc) => {
+                Ok(file_attr_to_stat(&desc.attr()?, Some(desc.path())))
+            }
             FdEntry::Pipe(pipe) => Ok(pipe.stat()),
         }
     }
 
-    fn stat_path(
-        &mut self,
-        process: &UserProcess,
-        dirfd: i32,
-        path: &str,
-    ) -> Result<general::stat, LinuxError> {
-        match open_fd_entry(process, self, dirfd, path, general::O_RDONLY) {
-            Ok(FdEntry::File(file)) => Ok(file_attr_to_stat(
-                &file.file.get_attr().map_err(LinuxError::from)?,
-                Some(file.path.as_str()),
-            )),
-            Ok(FdEntry::Directory(dir)) => {
-                Ok(file_attr_to_stat(&dir.attr, Some(dir.path.as_str())))
-            }
-            Ok(_) => Err(LinuxError::EINVAL),
-            Err(err) => Err(err),
-        }
-    }
-
     fn truncate(&mut self, fd: i32, size: u64) -> Result<(), LinuxError> {
-        match self.entry_mut(fd)? {
-            FdEntry::File(file) => file.file.truncate(size).map_err(LinuxError::from),
+        match self.entry(fd)? {
+            FdEntry::File(desc) => desc.truncate_file(size),
             FdEntry::DevNull => Ok(()),
             _ => Err(LinuxError::EINVAL),
         }
     }
 
-    fn fcntl(&mut self, fd: i32, cmd: u32, _arg: usize) -> Result<i32, LinuxError> {
-        let _ = self.entry(fd)?;
+    fn file_status_flags(&self, fd: i32) -> Result<u32, LinuxError> {
+        match self.entry(fd)? {
+            FdEntry::File(desc) | FdEntry::Directory(desc) => Ok(desc.status_flags.lock().raw()),
+            FdEntry::Pipe(pipe) => Ok(if pipe.readable {
+                general::O_RDONLY
+            } else {
+                general::O_WRONLY
+            }),
+            FdEntry::Stdin => Ok(general::O_RDONLY),
+            FdEntry::Stdout | FdEntry::Stderr => Ok(general::O_WRONLY),
+            FdEntry::DevNull => Ok(general::O_RDWR),
+        }
+    }
+
+    fn set_file_status_flags(&mut self, fd: i32, flags: u32) -> Result<(), LinuxError> {
+        match self.entry(fd)? {
+            FdEntry::File(desc) | FdEntry::Directory(desc) => {
+                desc.status_flags.lock().set_raw(flags);
+                Ok(())
+            }
+            FdEntry::Pipe(_) | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr | FdEntry::DevNull => Ok(()),
+        }
+    }
+
+    fn fcntl(&mut self, fd: i32, cmd: u32, arg: usize) -> Result<i32, LinuxError> {
+        let _ = self.slot(fd)?;
         match cmd {
-            general::F_DUPFD | general::F_DUPFD_CLOEXEC => self.dup_min(fd, _arg as i32),
-            general::F_GETFD | general::F_SETFD | general::F_GETFL | general::F_SETFL => Ok(0),
+            general::F_DUPFD => self.dup_min_with_flags(
+                fd,
+                arg as i32,
+                crate::linux_fs::FdFlags::empty(),
+            ),
+            general::F_DUPFD_CLOEXEC => {
+                let mut fd_flags = crate::linux_fs::FdFlags::empty();
+                fd_flags.set_cloexec(true);
+                self.dup_min_with_flags(fd, arg as i32, fd_flags)
+            }
+            general::F_GETFD => Ok(self.slot(fd)?.fd_flags.raw() as i32),
+            general::F_SETFD => {
+                self.slot_mut(fd)?.fd_flags = crate::linux_fs::FdFlags::from_raw(arg as u32);
+                Ok(0)
+            }
+            general::F_GETFL => Ok(self.file_status_flags(fd)? as i32),
+            general::F_SETFL => {
+                let mutable_flags = arg as u32
+                    & (crate::linux_fs::OpenStatusFlags::APPEND
+                        | crate::linux_fs::OpenStatusFlags::NONBLOCK);
+                self.set_file_status_flags(fd, mutable_flags)?;
+                Ok(0)
+            }
             _ => Ok(0),
         }
     }
 
     fn lseek(&mut self, fd: i32, offset: i64, whence: u32) -> Result<u64, LinuxError> {
-        let pos = match whence {
-            general::SEEK_SET => SeekFrom::Start(offset.max(0) as u64),
-            general::SEEK_CUR => SeekFrom::Current(offset),
-            general::SEEK_END => SeekFrom::End(offset),
-            _ => return Err(LinuxError::EINVAL),
-        };
-        match self.entry_mut(fd)? {
-            FdEntry::File(file) => file.file.seek(pos).map_err(LinuxError::from),
+        match self.entry(fd)? {
+            FdEntry::File(desc) => desc.seek_file(offset, whence),
             FdEntry::DevNull => Ok(0),
             FdEntry::Directory(_) => Err(LinuxError::EISDIR),
             FdEntry::Pipe(_) => Err(LinuxError::ESPIPE),
@@ -4666,18 +4705,29 @@ impl FdTable {
     }
 
     fn dup_min(&mut self, fd: i32, min_fd: i32) -> Result<i32, LinuxError> {
+        self.dup_min_with_flags(fd, min_fd, crate::linux_fs::FdFlags::empty())
+    }
+
+    fn dup_min_with_flags(
+        &mut self,
+        fd: i32,
+        min_fd: i32,
+        fd_flags: crate::linux_fs::FdFlags,
+    ) -> Result<i32, LinuxError> {
         if min_fd < 0 {
             return Err(LinuxError::EINVAL);
         }
         let entry = self.entry(fd)?.duplicate_for_fork()?;
-        self.insert_min(entry, min_fd as usize)
+        self.insert_min_with_flags(entry, min_fd as usize, fd_flags)
     }
 
     fn dup3(&mut self, oldfd: i32, newfd: i32, flags: u32) -> Result<i32, LinuxError> {
-        if flags != 0 || oldfd == newfd {
+        if flags & !general::O_CLOEXEC != 0 || oldfd == newfd {
             return Err(LinuxError::EINVAL);
         }
         let entry = self.entry(oldfd)?.duplicate_for_fork()?;
+        let mut fd_flags = crate::linux_fs::FdFlags::empty();
+        fd_flags.set_cloexec(flags & general::O_CLOEXEC != 0);
         if newfd < 0 {
             return Err(LinuxError::EBADF);
         }
@@ -4685,18 +4735,21 @@ impl FdTable {
         if self.entries.len() <= newfd {
             self.entries.resize_with(newfd + 1, || None);
         }
-        self.entries[newfd] = Some(entry);
+        self.entries[newfd] = Some(FdSlot::new(entry, fd_flags));
         Ok(newfd as i32)
     }
 
     fn getdents64(&mut self, fd: i32, dst: &mut [u8]) -> Result<usize, LinuxError> {
-        let entry = self.entry_mut(fd)?;
-        let FdEntry::Directory(dir) = entry else {
+        let FdEntry::Directory(desc) = self.entry(fd)? else {
             return Err(LinuxError::ENOTDIR);
         };
+        let crate::linux_fs::OpenFileBackend::Directory(dir_backend) = &desc.backend else {
+            return Err(LinuxError::ENOTDIR);
+        };
+        let mut dir = dir_backend.dir.lock();
         let mut read_buf: [fops::DirEntry; 16] =
             core::array::from_fn(|_| fops::DirEntry::default());
-        let count = dir.dir.read_dir(&mut read_buf).map_err(LinuxError::from)?;
+        let count = dir.read_dir(&mut read_buf).map_err(LinuxError::from)?;
         let mut written = 0usize;
         for (idx, item) in read_buf[..count].iter().enumerate() {
             let name = item.name_as_bytes();
@@ -4731,30 +4784,30 @@ impl FdTable {
     }
 
     fn read_file_at(&mut self, fd: i32, offset: u64, len: usize) -> Result<Vec<u8>, LinuxError> {
-        let FdEntry::File(file) = self.entry_mut(fd)? else {
+        let FdEntry::File(desc) = self.entry(fd)? else {
             return Err(LinuxError::EBADF);
         };
-        let mut buf = vec![0u8; len];
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            let read = file
-                .file
-                .read_at(offset + filled as u64, &mut buf[filled..])
-                .map_err(LinuxError::from)?;
-            if read == 0 {
-                break;
-            }
-            filled += read;
-        }
-        buf.truncate(filled);
-        Ok(buf)
+        desc.read_file_at(offset, len)
     }
 
     fn insert(&mut self, entry: FdEntry) -> Result<i32, LinuxError> {
-        self.insert_min(entry, 0)
+        self.insert_with_flags(entry, crate::linux_fs::FdFlags::empty())
     }
 
-    fn insert_min(&mut self, entry: FdEntry, min_fd: usize) -> Result<i32, LinuxError> {
+    fn insert_with_flags(
+        &mut self,
+        entry: FdEntry,
+        fd_flags: crate::linux_fs::FdFlags,
+    ) -> Result<i32, LinuxError> {
+        self.insert_min_with_flags(entry, 0, fd_flags)
+    }
+
+    fn insert_min_with_flags(
+        &mut self,
+        entry: FdEntry,
+        min_fd: usize,
+        fd_flags: crate::linux_fs::FdFlags,
+    ) -> Result<i32, LinuxError> {
         if self.entries.len() < min_fd {
             self.entries.resize_with(min_fd, || None);
         }
@@ -4765,24 +4818,40 @@ impl FdTable {
             .skip(min_fd)
             .find(|(_, slot)| slot.is_none())
         {
-            *slot = Some(entry);
+            *slot = Some(FdSlot::new(entry, fd_flags));
             return Ok(idx as i32);
         }
-        self.entries.push(Some(entry));
+        self.entries.push(Some(FdSlot::new(entry, fd_flags)));
         Ok((self.entries.len() - 1) as i32)
     }
 
     fn entry(&self, fd: i32) -> Result<&FdEntry, LinuxError> {
         self.entries
             .get(fd as usize)
-            .and_then(|entry| entry.as_ref())
+            .and_then(|slot| slot.as_ref())
+            .map(|slot| &slot.entry)
             .ok_or(LinuxError::EBADF)
     }
 
     fn entry_mut(&mut self, fd: i32) -> Result<&mut FdEntry, LinuxError> {
         self.entries
             .get_mut(fd as usize)
-            .and_then(|entry| entry.as_mut())
+            .and_then(|slot| slot.as_mut())
+            .map(|slot| &mut slot.entry)
+            .ok_or(LinuxError::EBADF)
+    }
+
+    fn slot(&self, fd: i32) -> Result<&FdSlot, LinuxError> {
+        self.entries
+            .get(fd as usize)
+            .and_then(|slot| slot.as_ref())
+            .ok_or(LinuxError::EBADF)
+    }
+
+    fn slot_mut(&mut self, fd: i32) -> Result<&mut FdSlot, LinuxError> {
+        self.entries
+            .get_mut(fd as usize)
+            .and_then(|slot| slot.as_mut())
             .ok_or(LinuxError::EBADF)
     }
 }
@@ -4847,7 +4916,7 @@ fn open_fd_entry(
             return Err(LinuxError::ENOTDIR);
         };
         let primary =
-            crate::linux_fs::normalize_path(dir.path.as_str(), path).ok_or(LinuxError::EINVAL)?;
+            crate::linux_fs::normalize_path(dir.path(), path).ok_or(LinuxError::EINVAL)?;
         let mut candidates = vec![primary];
         for extra in runtime_library_name_candidates(exec_root.as_str(), path) {
             push_runtime_candidate(&mut candidates, Some(extra));
@@ -4890,10 +4959,12 @@ fn open_fd_candidates(
         }
         match File::open(path.as_str(), opts) {
             Ok(file) => {
-                return Ok(FdEntry::File(FileEntry {
+                let desc = Arc::new(crate::linux_fs::OpenFileDescription::new_file(
                     file,
-                    path: path.clone(),
-                }));
+                    path.clone(),
+                    crate::linux_fs::OpenStatusFlags::from_raw(flags & !general::O_CLOEXEC),
+                ));
+                return Ok(FdEntry::File(desc));
             }
             Err(err) => {
                 let err = LinuxError::from(err);
@@ -4937,11 +5008,12 @@ fn open_dir_entry(path: &str) -> Result<FdEntry, LinuxError> {
     let dir = Directory::open_dir(path, &opts).map_err(LinuxError::from)?;
     let file = File::open(path, &opts).map_err(LinuxError::from)?;
     let attr = file.get_attr().map_err(LinuxError::from)?;
-    Ok(FdEntry::Directory(DirectoryEntry {
+    let desc = Arc::new(crate::linux_fs::OpenFileDescription::new_directory(
         dir,
         attr,
-        path: path.into(),
-    }))
+        path.into(),
+    ));
+    Ok(FdEntry::Directory(desc))
 }
 
 fn directory_create_dir(path: &str) -> Result<(), LinuxError> {
@@ -4956,23 +5028,97 @@ fn directory_remove_dir(path: &str) -> Result<(), LinuxError> {
     axfs::api::remove_dir(path).map_err(LinuxError::from)
 }
 
+fn rename_path_abs(old_path: &str, new_path: &str) -> Result<(), LinuxError> {
+    match axfs::api::rename(old_path, new_path).map_err(LinuxError::from) {
+        Ok(()) => Ok(()),
+        Err(LinuxError::EOPNOTSUPP | LinuxError::ENOSYS) => {
+            compat_empty_dir_rename(old_path, new_path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn compat_empty_dir_rename(old_path: &str, new_path: &str) -> Result<(), LinuxError> {
+    // compat(busybox-filesystem-phase1b): axfs currently reports unsupported
+    // for directory rename, while BusyBox `mv empty_dir new_dir` needs the
+    // Linux-visible state change.
+    // delete-when: axfs::api::rename supports directory rename semantics.
+    let old_meta = axfs::api::metadata(old_path).map_err(LinuxError::from)?;
+    if !old_meta.is_dir() {
+        return Err(LinuxError::EOPNOTSUPP);
+    }
+    match axfs::api::metadata(new_path) {
+        Ok(_) => return Err(LinuxError::EEXIST),
+        Err(err) if LinuxError::from(err) == LinuxError::ENOENT => {}
+        Err(err) => return Err(LinuxError::from(err)),
+    }
+    axfs::api::create_dir(new_path).map_err(LinuxError::from)?;
+    match axfs::api::remove_dir(old_path).map_err(LinuxError::from) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = axfs::api::remove_dir(new_path);
+            Err(err)
+        }
+    }
+}
+
+fn stat_path_abs(path: &str) -> Result<general::stat, LinuxError> {
+    if path == "/dev/null" {
+        return Ok(stdio_stat(false));
+    }
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    match File::open(path, &opts) {
+        Ok(file) => {
+            let attr = file.get_attr().map_err(LinuxError::from)?;
+            Ok(file_attr_to_stat(&attr, Some(path)))
+        }
+        Err(err) => {
+            let err = LinuxError::from(err);
+            if err != LinuxError::EISDIR {
+                return Err(err);
+            }
+            match open_dir_entry(path)? {
+                FdEntry::Directory(desc) => Ok(file_attr_to_stat(&desc.attr()?, Some(desc.path()))),
+                _ => Err(LinuxError::EINVAL),
+            }
+        }
+    }
+}
+
 fn resolve_dirfd_path(
     process: &UserProcess,
     table: &FdTable,
     dirfd: i32,
     path: &str,
 ) -> Result<String, LinuxError> {
-    if path.starts_with('/') {
-        return crate::linux_fs::normalize_path("/", path).ok_or(LinuxError::EINVAL);
-    }
-    if dirfd == general::AT_FDCWD {
-        let cwd = process.cwd();
-        return crate::linux_fs::normalize_path(cwd.as_str(), path).ok_or(LinuxError::EINVAL);
-    }
-    let FdEntry::Directory(dir) = table.entry(dirfd)? else {
-        return Err(LinuxError::ENOTDIR);
-    };
-    crate::linux_fs::normalize_path(dir.path.as_str(), path).ok_or(LinuxError::EINVAL)
+    let cwd = process.cwd();
+    let dirfd_base = table.dirfd_base_path(dirfd)?;
+    crate::linux_fs::resolve_at_path(
+        cwd.as_str(),
+        dirfd_base.as_deref(),
+        path,
+        crate::linux_fs::ResolveOptions::default(),
+    )
+    .map(|resolved| resolved.path)
+}
+
+#[allow(dead_code)]
+fn resolve_dirfd_path_allow_empty(
+    process: &UserProcess,
+    table: &FdTable,
+    dirfd: i32,
+    path: &str,
+) -> Result<String, LinuxError> {
+    let cwd = process.cwd();
+    let dirfd_base = table.dirfd_base_path(dirfd)?;
+    crate::linux_fs::resolve_at_path(
+        cwd.as_str(),
+        dirfd_base.as_deref(),
+        path,
+        crate::linux_fs::ResolveOptions::allow_empty(),
+    )
+    .map(|resolved| resolved.path)
 }
 
 fn dirent_type(ty: FileType) -> u32 {
