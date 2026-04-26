@@ -226,6 +226,27 @@ impl WaitQueue {
         count
     }
 
+    /// Transfers up to `count` tasks from this wait queue to another wait queue
+    /// and invokes `on_task` for each moved task before enqueueing it.
+    pub fn requeue_with<F>(&self, mut count: usize, target: &WaitQueue, mut on_task: F) -> usize
+    where
+        F: FnMut(&AxTaskRef),
+    {
+        let tasks: Vec<_> = {
+            let mut wq = self.queue.lock();
+            count = count.min(wq.len());
+            wq.drain(..count).collect()
+        };
+        if !tasks.is_empty() {
+            for task in &tasks {
+                on_task(task);
+            }
+            let mut wq = target.queue.lock();
+            wq.extend(tasks);
+        }
+        count
+    }
+
     /// Returns the number of tasks in the wait queue.
     pub fn len(&self) -> usize {
         self.queue.lock().len()

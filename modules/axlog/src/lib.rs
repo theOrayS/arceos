@@ -53,12 +53,88 @@ extern crate log;
 use core::fmt::{self, Write};
 use core::str::FromStr;
 
+use kspin::SpinNoIrq;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 #[cfg(not(feature = "std"))]
 use crate_interface::call_interface;
 
 pub use log::{debug, error, info, trace, warn};
+
+const KERNEL_LOG_CAPACITY: usize = 64 * 1024;
+
+struct KernelLogBuffer {
+    buf: [u8; KERNEL_LOG_CAPACITY],
+    head: usize,
+    len: usize,
+}
+
+impl KernelLogBuffer {
+    const fn new() -> Self {
+        Self {
+            buf: [0; KERNEL_LOG_CAPACITY],
+            head: 0,
+            len: 0,
+        }
+    }
+
+    fn append(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let data = if data.len() > KERNEL_LOG_CAPACITY {
+            &data[data.len() - KERNEL_LOG_CAPACITY..]
+        } else {
+            data
+        };
+        let overflow = self
+            .len
+            .saturating_add(data.len())
+            .saturating_sub(KERNEL_LOG_CAPACITY);
+        if overflow > 0 {
+            self.head = (self.head + overflow) % KERNEL_LOG_CAPACITY;
+            self.len -= overflow;
+        }
+        let tail = (self.head + self.len) % KERNEL_LOG_CAPACITY;
+        let first = core::cmp::min(data.len(), KERNEL_LOG_CAPACITY - tail);
+        self.buf[tail..tail + first].copy_from_slice(&data[..first]);
+        let remain = data.len() - first;
+        if remain > 0 {
+            self.buf[..remain].copy_from_slice(&data[first..]);
+        }
+        self.len += data.len();
+    }
+
+    fn read_into(&self, dst: &mut [u8]) -> usize {
+        let read_len = core::cmp::min(dst.len(), self.len);
+        if read_len == 0 {
+            return 0;
+        }
+        let first = core::cmp::min(read_len, KERNEL_LOG_CAPACITY - self.head);
+        dst[..first].copy_from_slice(&self.buf[self.head..self.head + first]);
+        let remain = read_len - first;
+        if remain > 0 {
+            dst[first..read_len].copy_from_slice(&self.buf[..remain]);
+        }
+        read_len
+    }
+
+    fn clear(&mut self) {
+        self.head = 0;
+        self.len = 0;
+    }
+}
+
+struct KernelLogWriter<'a>(&'a mut KernelLogBuffer);
+
+impl Write for KernelLogWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0.append(s.as_bytes());
+        Ok(())
+    }
+}
+
+static KERNEL_LOG_BUFFER: SpinNoIrq<KernelLogBuffer> = SpinNoIrq::new(KernelLogBuffer::new());
 
 /// Prints to the console.
 ///
@@ -156,6 +232,7 @@ impl Log for Logger {
         let level = record.level();
         let line = record.line().unwrap_or(0);
         let path = record.target();
+        capture_record(level, path, line, record.args());
         let args_color = match level {
             Level::Error => ColorCode::Red,
             Level::Warn => ColorCode::Yellow,
@@ -226,7 +303,6 @@ impl Log for Logger {
 
 /// Prints the formatted string to the console.
 pub fn print_fmt(args: fmt::Arguments) -> fmt::Result {
-    use kspin::SpinNoIrq; // TODO: more efficient
     static LOCK: SpinNoIrq<()> = SpinNoIrq::new(());
 
     let _guard = LOCK.lock();
@@ -259,4 +335,82 @@ pub fn set_max_level(level: &str) {
         .ok()
         .unwrap_or(LevelFilter::Off);
     log::set_max_level(lf);
+}
+
+pub fn kernel_log_len() -> usize {
+    KERNEL_LOG_BUFFER.lock().len
+}
+
+pub fn read_kernel_log(dst: &mut [u8], clear: bool) -> usize {
+    let mut buffer = KERNEL_LOG_BUFFER.lock();
+    let read_len = buffer.read_into(dst);
+    if clear {
+        buffer.clear();
+    }
+    read_len
+}
+
+fn capture_record(level: Level, path: &str, line: u32, args: &fmt::Arguments<'_>) {
+    let priority = match level {
+        Level::Error => 3,
+        Level::Warn => 4,
+        Level::Info => 6,
+        Level::Debug | Level::Trace => 7,
+    };
+    let mut buffer = KERNEL_LOG_BUFFER.lock();
+    let mut writer = KernelLogWriter(&mut buffer);
+
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "std")] {
+            let _ = writer.write_fmt(format_args!(
+                "<{priority}>[{path}:{line}] {args}\n",
+                priority = priority,
+                path = path,
+                line = line,
+                args = args,
+            ));
+        } else {
+            let cpu_id = call_interface!(LogIf::current_cpu_id);
+            let tid = call_interface!(LogIf::current_task_id);
+            let now = call_interface!(LogIf::current_time);
+            match (cpu_id, tid) {
+                (Some(cpu_id), Some(tid)) => {
+                    let _ = writer.write_fmt(format_args!(
+                        "<{priority}>[{:>3}.{:06} {cpu_id}:{tid} {path}:{line}] {args}\n",
+                        now.as_secs(),
+                        now.subsec_micros(),
+                        priority = priority,
+                        cpu_id = cpu_id,
+                        tid = tid,
+                        path = path,
+                        line = line,
+                        args = args,
+                    ));
+                }
+                (Some(cpu_id), None) => {
+                    let _ = writer.write_fmt(format_args!(
+                        "<{priority}>[{:>3}.{:06} {cpu_id} {path}:{line}] {args}\n",
+                        now.as_secs(),
+                        now.subsec_micros(),
+                        priority = priority,
+                        cpu_id = cpu_id,
+                        path = path,
+                        line = line,
+                        args = args,
+                    ));
+                }
+                (None, _) => {
+                    let _ = writer.write_fmt(format_args!(
+                        "<{priority}>[{:>3}.{:06} {path}:{line}] {args}\n",
+                        now.as_secs(),
+                        now.subsec_micros(),
+                        priority = priority,
+                        path = path,
+                        line = line,
+                        args = args,
+                    ));
+                }
+            }
+        }
+    }
 }

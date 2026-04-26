@@ -11,7 +11,7 @@ use smoltcp::socket::tcp::{self, ConnectError, State};
 use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
 
 use super::addr::UNSPECIFIED_ENDPOINT;
-use super::{ETH0, LISTEN_TABLE, SOCKET_SET, SocketSetWrapper};
+use super::{ETH0, LISTEN_TABLE, LOOPBACK, SOCKET_SET, SocketSetWrapper};
 
 // State transitions:
 // CLOSED -(connect)-> BUSY -> CONNECTING -> CONNECTED -(shutdown)-> BUSY -> CLOSED
@@ -72,24 +72,16 @@ impl TcpSocket {
         }
     }
 
-    /// Returns the local address and port, or
-    /// [`Err(NotConnected)`](AxError::NotConnected) if not connected.
+    /// Returns the local address and port.
     pub fn local_addr(&self) -> AxResult<SocketAddr> {
-        match self.get_state() {
-            STATE_CONNECTED | STATE_LISTENING => {
-                Ok(SocketAddr::from(unsafe { self.local_addr.get().read() }))
-            }
-            _ => Err(AxError::NotConnected),
-        }
+        Ok(SocketAddr::from(unsafe { self.local_addr.get().read() }))
     }
 
     /// Returns the remote address and port, or
     /// [`Err(NotConnected)`](AxError::NotConnected) if not connected.
     pub fn peer_addr(&self) -> AxResult<SocketAddr> {
         match self.get_state() {
-            STATE_CONNECTED | STATE_LISTENING => {
-                Ok(SocketAddr::from(unsafe { self.peer_addr.get().read() }))
-            }
+            STATE_CONNECTED => Ok(SocketAddr::from(unsafe { self.peer_addr.get().read() })),
             _ => Err(AxError::NotConnected),
         }
     }
@@ -124,7 +116,11 @@ impl TcpSocket {
 
             // TODO: check remote addr unreachable
             let bound_endpoint = self.bound_endpoint()?;
-            let iface = &ETH0.iface;
+            let iface = if remote_addr.ip().is_loopback() {
+                &LOOPBACK.iface
+            } else {
+                &ETH0.iface
+            };
             let (local_endpoint, remote_endpoint) = SOCKET_SET
                 .with_socket_mut::<tcp::Socket, _, _>(handle, |socket| {
                     socket
@@ -331,6 +327,7 @@ impl TcpSocket {
 
     /// Whether the socket is readable or writable.
     pub fn poll(&self) -> AxResult<PollState> {
+        SOCKET_SET.poll_interfaces();
         match self.get_state() {
             STATE_CONNECTING => self.poll_connect(),
             STATE_CONNECTED => self.poll_stream(),

@@ -12,6 +12,31 @@ use super::fd_ops::FileLike;
 use crate::ctypes;
 use crate::utils::char_ptr_to_str;
 
+pub(crate) enum SocketSpec {
+    Tcp,
+    Udp,
+}
+
+pub(crate) fn resolve_socket_spec(
+    domain: u32,
+    socktype: u32,
+    protocol: u32,
+) -> LinuxResult<SocketSpec> {
+    if domain != ctypes::AF_INET {
+        return Err(LinuxError::EAFNOSUPPORT);
+    }
+    match socktype {
+        ctypes::SOCK_STREAM if protocol == ctypes::IPPROTO_TCP || protocol == 0 => {
+            Ok(SocketSpec::Tcp)
+        }
+        ctypes::SOCK_DGRAM if protocol == ctypes::IPPROTO_UDP || protocol == 0 => {
+            Ok(SocketSpec::Udp)
+        }
+        ctypes::SOCK_STREAM | ctypes::SOCK_DGRAM => Err(LinuxError::EPROTONOSUPPORT),
+        _ => Err(LinuxError::ESOCKTNOSUPPORT),
+    }
+}
+
 pub enum Socket {
     Udp(Mutex<UdpSocket>),
     Tcp(Mutex<TcpSocket>),
@@ -212,7 +237,7 @@ fn from_sockaddr(
     if addr.is_null() {
         return Err(LinuxError::EFAULT);
     }
-    if addrlen != size_of::<ctypes::sockaddr>() as _ {
+    if addrlen != size_of::<ctypes::sockaddr>() as ctypes::socklen_t {
         return Err(LinuxError::EINVAL);
     }
 
@@ -233,16 +258,9 @@ pub fn sys_socket(domain: c_int, socktype: c_int, protocol: c_int) -> c_int {
     debug!("sys_socket <= {} {} {}", domain, socktype, protocol);
     let (domain, socktype, protocol) = (domain as u32, socktype as u32, protocol as u32);
     syscall_body!(sys_socket, {
-        match (domain, socktype, protocol) {
-            (ctypes::AF_INET, ctypes::SOCK_STREAM, ctypes::IPPROTO_TCP)
-            | (ctypes::AF_INET, ctypes::SOCK_STREAM, 0) => {
-                Socket::Tcp(Mutex::new(TcpSocket::new())).add_to_fd_table()
-            }
-            (ctypes::AF_INET, ctypes::SOCK_DGRAM, ctypes::IPPROTO_UDP)
-            | (ctypes::AF_INET, ctypes::SOCK_DGRAM, 0) => {
-                Socket::Udp(Mutex::new(UdpSocket::new())).add_to_fd_table()
-            }
-            _ => Err(LinuxError::EINVAL),
+        match resolve_socket_spec(domain, socktype, protocol)? {
+            SocketSpec::Tcp => Socket::Tcp(Mutex::new(TcpSocket::new())).add_to_fd_table(),
+            SocketSpec::Udp => Socket::Udp(Mutex::new(UdpSocket::new())).add_to_fd_table(),
         }
     })
 }

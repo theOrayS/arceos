@@ -1,9 +1,28 @@
+#[cfg(feature = "uspace")]
+use alloc::{collections::BTreeMap, sync::Arc};
 use axerrno::LinuxError;
+#[cfg(feature = "uspace")]
+use axsync::Mutex;
 use core::ffi::{c_int, c_long};
 use core::time::Duration;
+#[cfg(feature = "uspace")]
+use lazyinit::LazyInit;
+#[cfg(feature = "uspace")]
+use linux_raw_sys::general;
 
 use crate::ctypes;
 use crate::ctypes::{CLOCK_MONOTONIC, CLOCK_REALTIME};
+
+#[cfg(feature = "uspace")]
+type TimerCallback = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(feature = "uspace")]
+struct RealTimerState {
+    generation: u64,
+    deadline: axhal::time::TimeValue,
+    interval: Duration,
+    callback: TimerCallback,
+}
 
 impl From<ctypes::timespec> for Duration {
     fn from(ts: ctypes::timespec) -> Self {
@@ -89,4 +108,236 @@ pub unsafe fn sys_nanosleep(req: *const ctypes::timespec, rem: *mut ctypes::time
         }
         Ok(0)
     })
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn timespec_to_duration(ts: general::timespec) -> Result<Duration, LinuxError> {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(LinuxError::EINVAL);
+    }
+    Ok(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn clock_now_duration(clockid: u32) -> Result<Duration, LinuxError> {
+    match clockid {
+        general::CLOCK_REALTIME | general::CLOCK_REALTIME_COARSE | general::CLOCK_TAI => {
+            Ok(axhal::time::wall_time())
+        }
+        general::CLOCK_MONOTONIC
+        | general::CLOCK_MONOTONIC_RAW
+        | general::CLOCK_MONOTONIC_COARSE
+        | general::CLOCK_BOOTTIME
+        | general::CLOCK_PROCESS_CPUTIME_ID
+        | general::CLOCK_THREAD_CPUTIME_ID => Ok(axhal::time::monotonic_time()),
+        general::CLOCK_REALTIME_ALARM | general::CLOCK_BOOTTIME_ALARM => Err(LinuxError::EINVAL),
+        _ => Err(LinuxError::EINVAL),
+    }
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn clock_gettime_value(clockid: u32) -> Result<general::timespec, LinuxError> {
+    let now = clock_now_duration(clockid)?;
+    Ok(general::timespec {
+        tv_sec: now.as_secs() as _,
+        tv_nsec: now.subsec_nanos() as _,
+    })
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn clock_getres_value(clockid: u32) -> Result<general::timespec, LinuxError> {
+    clock_now_duration(clockid)?;
+    Ok(general::timespec {
+        tv_sec: 0,
+        tv_nsec: 1,
+    })
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn gettimeofday_values() -> (general::timeval, general::timezone) {
+    let now = axhal::time::wall_time();
+    (
+        general::timeval {
+            tv_sec: now.as_secs() as _,
+            tv_usec: now.subsec_micros() as _,
+        },
+        general::timezone {
+            tz_minuteswest: 0,
+            tz_dsttime: 0,
+        },
+    )
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn sleep_duration(duration: Duration) {
+    #[cfg(feature = "multitask")]
+    axtask::sleep(duration);
+    #[cfg(not(feature = "multitask"))]
+    axhal::time::busy_wait(duration);
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn nanosleep(req: general::timespec) -> Result<(), LinuxError> {
+    sleep_duration(timespec_to_duration(req)?);
+    Ok(())
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn clock_nanosleep(
+    clockid: u32,
+    flags: u32,
+    req: general::timespec,
+) -> Result<(), LinuxError> {
+    let deadline = timespec_to_duration(req)?;
+    if flags & !general::TIMER_ABSTIME != 0 {
+        return Err(LinuxError::EINVAL);
+    }
+    if flags & general::TIMER_ABSTIME != 0 {
+        let now = clock_now_duration(clockid)?;
+        if let Some(delta) = deadline.checked_sub(now) {
+            sleep_duration(delta);
+        }
+        return Ok(());
+    }
+    sleep_duration(deadline);
+    Ok(())
+}
+
+#[cfg(feature = "uspace")]
+fn real_timer_states() -> &'static Mutex<BTreeMap<i32, RealTimerState>> {
+    static REAL_TIMERS: LazyInit<Mutex<BTreeMap<i32, RealTimerState>>> = LazyInit::new();
+    REAL_TIMERS.call_once(|| Mutex::new(BTreeMap::new()));
+    &REAL_TIMERS
+}
+
+#[cfg(feature = "uspace")]
+fn duration_from_timeval(tv: general::timeval) -> Result<Duration, LinuxError> {
+    if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+        return Err(LinuxError::EINVAL);
+    }
+    Ok(Duration::new(tv.tv_sec as u64, (tv.tv_usec as u32) * 1000))
+}
+
+#[cfg(feature = "uspace")]
+fn timeval_from_duration(duration: Duration) -> general::timeval {
+    general::timeval {
+        tv_sec: duration.as_secs() as _,
+        tv_usec: duration.subsec_micros() as _,
+    }
+}
+
+#[cfg(feature = "uspace")]
+fn zero_itimerval() -> general::itimerval {
+    general::itimerval {
+        it_interval: timeval_from_duration(Duration::ZERO),
+        it_value: timeval_from_duration(Duration::ZERO),
+    }
+}
+
+#[cfg(feature = "uspace")]
+fn itimerval_from_state(state: &RealTimerState, now: axhal::time::TimeValue) -> general::itimerval {
+    let remaining = state.deadline.saturating_sub(now);
+    general::itimerval {
+        it_interval: timeval_from_duration(state.interval),
+        it_value: timeval_from_duration(remaining),
+    }
+}
+
+#[cfg(feature = "uspace")]
+fn run_real_timer(pid: i32, generation: u64) {
+    loop {
+        let (deadline, callback) = {
+            let states = real_timer_states().lock();
+            let Some(state) = states.get(&pid) else {
+                return;
+            };
+            if state.generation != generation {
+                return;
+            }
+            (state.deadline, state.callback.clone())
+        };
+
+        let now = axhal::time::wall_time();
+        if deadline > now {
+            axtask::sleep_until(deadline);
+        }
+
+        let next_deadline = {
+            let mut states = real_timer_states().lock();
+            let Some(state) = states.get_mut(&pid) else {
+                return;
+            };
+            if state.generation != generation {
+                return;
+            }
+            if state.interval.is_zero() {
+                states.remove(&pid);
+                None
+            } else {
+                let next = axhal::time::wall_time() + state.interval;
+                state.deadline = next;
+                Some(next)
+            }
+        };
+
+        callback();
+
+        if next_deadline.is_none() {
+            return;
+        }
+    }
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn set_real_interval_timer<F>(
+    pid: i32,
+    value: general::itimerval,
+    callback: F,
+) -> Result<general::itimerval, LinuxError>
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    let interval = duration_from_timeval(value.it_interval)?;
+    let initial = duration_from_timeval(value.it_value)?;
+    let now = axhal::time::wall_time();
+    let callback: TimerCallback = Arc::new(callback);
+
+    let old_value = {
+        let states = real_timer_states().lock();
+        states
+            .get(&pid)
+            .map(|state| itimerval_from_state(state, now))
+            .unwrap_or_else(zero_itimerval)
+    };
+
+    if initial.is_zero() {
+        real_timer_states().lock().remove(&pid);
+        return Ok(old_value);
+    }
+
+    let generation = {
+        let mut states = real_timer_states().lock();
+        let generation = states
+            .get(&pid)
+            .map(|state| state.generation.wrapping_add(1))
+            .unwrap_or(1);
+        states.insert(
+            pid,
+            RealTimerState {
+                generation,
+                deadline: now + initial,
+                interval,
+                callback,
+            },
+        );
+        generation
+    };
+
+    axtask::spawn(move || run_real_timer(pid, generation));
+    Ok(old_value)
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn clear_process_interval_timer(pid: i32) {
+    real_timer_states().lock().remove(&pid);
 }

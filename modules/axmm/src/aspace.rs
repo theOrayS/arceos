@@ -91,8 +91,12 @@ impl AddrSpace {
         self.clear();
 
         for area in other.areas.iter() {
-            let cloned_area =
-                MemoryArea::new(area.start(), area.size(), area.flags(), area.backend().clone());
+            let cloned_area = MemoryArea::new(
+                area.start(),
+                area.size(),
+                area.flags(),
+                area.backend().clone(),
+            );
             self.areas
                 .map(cloned_area, &mut self.pt, false)
                 .map_err(mapping_err_to_ax_err)?;
@@ -245,6 +249,31 @@ impl AddrSpace {
         Ok(())
     }
 
+    fn ensure_pages_present(
+        &mut self,
+        start: VirtAddr,
+        size: usize,
+        access_flags: PageFaultFlags,
+    ) -> AxResult {
+        if size == 0 {
+            return Ok(());
+        }
+        if !self.contains_range(start, size) {
+            return ax_err!(InvalidInput, "address out of range");
+        }
+        let Some(end) = start.checked_add(size) else {
+            return ax_err!(InvalidInput, "address range overflow");
+        };
+        for vaddr in PageIter4K::new(start.align_down_4k(), end.align_up_4k())
+            .expect("address range must be valid")
+        {
+            if self.pt.query(vaddr).is_err() && !self.handle_page_fault(vaddr, access_flags) {
+                return ax_err!(BadAddress, "failed to materialize page");
+            }
+        }
+        Ok(())
+    }
+
     /// To read data from the address space.
     ///
     /// # Arguments
@@ -263,7 +292,8 @@ impl AddrSpace {
     ///
     /// * `start_vaddr` - The start virtual address to write.
     /// * `buf` - The buffer to write to the address space.
-    pub fn write(&self, start: VirtAddr, buf: &[u8]) -> AxResult {
+    pub fn write(&mut self, start: VirtAddr, buf: &[u8]) -> AxResult {
+        self.ensure_pages_present(start, buf.len(), PageFaultFlags::WRITE)?;
         self.process_area_data(start, buf.len(), |dst, offset, write_size| unsafe {
             core::ptr::copy_nonoverlapping(buf.as_ptr().add(offset), dst.as_mut_ptr(), write_size);
         })

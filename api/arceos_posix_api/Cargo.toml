@@ -29,7 +29,22 @@ net = ["dep:axnet", "axfeat/net", "fd"]
 pipe = ["fd"]
 select = ["fd"]
 epoll = ["fd"]
-uspace = ["axns/thread-local"]
+uspace = [
+    "alloc",
+    "irq",
+    "multitask",
+    "fd",
+    "fs",
+    "dep:axmm",
+    "dep:crate_interface",
+    "dep:lazyinit",
+    "dep:linkme",
+    "dep:linux-raw-sys",
+    "dep:memory_addr",
+    "dep:xmas-elf",
+    "axhal/uspace",
+    "axns/thread-local",
+]
 
 [dependencies]
 # ArceOS modules
@@ -44,6 +59,7 @@ axtask = { workspace = true, optional = true }
 axfs = { workspace = true, optional = true }
 axnet = { workspace = true, optional = true }
 axns = { workspace = true, optional = true }
+axmm = { workspace = true, optional = true }
 
 # Other crates
 axio = "0.2"
@@ -53,6 +69,18 @@ static_assertions = "1.1.0"
 spin = { version = "0.10" }
 lazy_static = { version = "1.5", features = ["spin_no_std"] }
 ctor_bare = "0.2"
+crate_interface = { version = "0.3", optional = true }
+lazyinit = { version = "0.2", optional = true }
+linkme = { version = "0.3.35", optional = true }
+linux-raw-sys = { version = "0.12.1", default-features = false, features = ["auxvec", "general", "ioctl", "no_std", "system"], optional = true }
+memory_addr = { version = "0.4", optional = true }
+xmas-elf = { version = "0.10", optional = true }
 
 [build-dependencies]
 bindgen ={ version = "0.72" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+riscv = "0.16"
+
+[target.'cfg(target_arch = "loongarch64")'.dependencies]
+loongArch64 = "0.2.4"

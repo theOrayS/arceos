@@ -151,26 +151,10 @@ name = "arceos-shell"
 version = "0.1.0"
 dependencies = [
  "arceos_posix_api",
- "axerrno 0.1.2",
- "axfs",
  "axfs_ramfs",
  "axfs_vfs",
- "axhal",
- "axio",
- "axmm",
- "axns",
  "axstd",
- "axsync",
- "axtask",
  "crate_interface",
- "kspin",
- "lazyinit",
- "linkme",
- "linux-raw-sys",
- "loongArch64",
- "memory_addr",
- "riscv",
- "xmas-elf",
 ]
 
 [[package]]
@@ -208,17 +192,26 @@ dependencies = [
  "axhal",
  "axio",
  "axlog",
+ "axmm",
  "axnet",
  "axns",
  "axruntime",
  "axsync",
  "axtask",
  "bindgen",
+ "crate_interface",
  "ctor_bare",
  "flatten_objects",
  "lazy_static",
+ "lazyinit",
+ "linkme",
+ "linux-raw-sys",
+ "loongArch64",
+ "memory_addr",
+ "riscv",
  "spin 0.10.0",
  "static_assertions",
+ "xmas-elf",
 ]
 
 [[package]]
