@@ -116,6 +116,9 @@ Required semantics:
 - `clone(CLONE_FILES)` shares the whole fd table; without `CLONE_FILES`, clone
   copies fd slots according to the process model.
 - `execve` closes only slots with `FD_CLOEXEC`.
+- Process exit closes all fd slots when the last user thread exits; `wait4`
+  only reaps status and must not be required for pipe EOF or descriptor
+  release.
 - `read`, `write`, `lseek`, and `getdents64` use and update the shared offset.
 - `pread`, `pwrite`, `preadv`, and `pwritev` use explicit offsets and do not
   update the shared offset.

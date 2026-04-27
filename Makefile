@@ -67,7 +67,7 @@ KERNEL_LA_CONFIG ?= $(KERNEL_BUILD_DIR)/loongarch64.axconfig.toml
 KERNEL_RV_TARGET_DIR ?= $(KERNEL_TARGET_DIR)/riscv64
 KERNEL_LA_TARGET_DIR ?= $(KERNEL_TARGET_DIR)/loongarch64
 KERNEL_RV_AXCONFIG_WRITES ?= -w plat.phys-memory-size=0x4000_0000
-KERNEL_LA_AXCONFIG_WRITES ?= -w plat.phys-memory-size=0x4000_0000
+KERNEL_LA_AXCONFIG_WRITES ?= -w plat.phys-memory-size=0x7000_0000
 KERNEL_RV ?= $(CURDIR)/kernel-rv
 KERNEL_LA ?= $(CURDIR)/kernel-la
 TESTSUITE_DIR ?= $(abspath $(CURDIR)/../testsuits-for-oskernel)
@@ -78,7 +78,7 @@ LA_TESTSUITE_RUN_IMG ?= /tmp/arceos-sdcard-la.run.qcow2
 RV_AUX_DISK ?= $(CURDIR)/disk.img
 LA_AUX_DISK ?= $(CURDIR)/disk-la.img
 RV_MEM ?= 1G
-LA_MEM ?= 1G
+LA_MEM ?= 2G
 RV_NETDEV_ARGS ?= user,id=net
 LA_NETDEV_ARGS ?= user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555
 DOCKER_IMAGE ?= orays-arceos-dev

@@ -4,7 +4,10 @@ use alloc::{
     string::{String, ToString},
     sync::Arc,
 };
-use axfs_vfs::{VfsDirEntry, VfsError, VfsNodeAttr, VfsNodeOps, VfsNodePerm, VfsNodeRef, VfsNodeType, VfsOps, VfsResult};
+use axfs_vfs::{
+    VfsDirEntry, VfsError, VfsNodeAttr, VfsNodeOps, VfsNodePerm, VfsNodeRef, VfsNodeType, VfsOps,
+    VfsResult,
+};
 use axsync::Mutex;
 use core::{cell::UnsafeCell, error::Error, fmt};
 use ext4_view::{Ext4, Ext4Error, Ext4Read, FileType};
@@ -39,8 +42,8 @@ struct Ext4DirNode {
 
 impl Ext4FileSystem {
     pub fn new(disk: Disk) -> Self {
-        let ext4 = Ext4::load(Box::new(Ext4Disk(disk)))
-            .expect("failed to initialize ext4 filesystem");
+        let ext4 =
+            Ext4::load(Box::new(Ext4Disk(disk))).expect("failed to initialize ext4 filesystem");
         let fs = Arc::new(LockedExt4::new(ext4));
         Self {
             root_dir: Arc::new(Ext4DirNode::new(fs, "/".into())),
@@ -177,9 +180,8 @@ impl VfsNodeOps for Ext4DirNode {
     }
 
     fn parent(&self) -> Option<VfsNodeRef> {
-        self.parent_path().map(|path| {
-            Arc::new(Self::new(self.fs.clone(), path)) as VfsNodeRef
-        })
+        self.parent_path()
+            .map(|path| Arc::new(Self::new(self.fs.clone(), path)) as VfsNodeRef)
     }
 
     fn lookup(self: Arc<Self>, path: &str) -> VfsResult<VfsNodeRef> {

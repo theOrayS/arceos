@@ -128,7 +128,8 @@ impl RootDirectory {
                 Err(AxError::NotFound) => {}
                 Err(err) => return Err(err),
             },
-            Err(AxError::Unsupported | AxError::ReadOnlyFilesystem | AxError::PermissionDenied) => {}
+            Err(AxError::Unsupported | AxError::ReadOnlyFilesystem | AxError::PermissionDenied) => {
+            }
             Err(AxError::NotFound) => {}
             Err(err) => return Err(err),
         }

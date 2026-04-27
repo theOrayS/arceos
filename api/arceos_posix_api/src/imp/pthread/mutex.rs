@@ -28,7 +28,10 @@ impl PthreadMutex {
             {
                 Ok(_) => return Ok(()),
                 Err(owner_id) => {
-                    assert_ne!(owner_id, current_id, "pthread mutex already owned by current task");
+                    assert_ne!(
+                        owner_id, current_id,
+                        "pthread mutex already owned by current task"
+                    );
                     axtask::yield_now();
                 }
             }

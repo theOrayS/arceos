@@ -708,14 +708,6 @@ pub fn maybe_run_official_tests() {
             );
             continue;
         }
-        if group == "unixbench" {
-            print_suite_skip(
-                &suite_dir,
-                "unixbench",
-                "unixbench currently blocks on unresolved executable/runtime compatibility",
-            );
-            continue;
-        }
         let staged_dir = match prepare_suite_stage_dir(&suite_dir, script) {
             Ok(dir) => dir,
             Err(err) => {

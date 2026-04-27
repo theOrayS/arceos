@@ -4,8 +4,8 @@ use axerrno::LinuxError;
 use axfs::fops::{Directory, File, FileAttr};
 use axio::SeekFrom;
 use axsync::Mutex;
-use std::sync::Arc;
 use std::string::String;
+use std::sync::Arc;
 use std::vec::Vec;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -92,6 +92,12 @@ pub struct OpenFileDescription {
 }
 
 pub type SharedOpenFileDescription = Arc<OpenFileDescription>;
+
+pub fn advance_explicit_offset(offset: u64, completed: usize) -> Result<u64, LinuxError> {
+    offset
+        .checked_add(completed as u64)
+        .ok_or(LinuxError::EINVAL)
+}
 
 impl OpenFileDescription {
     pub fn new_file(file: File, path: String, status_flags: OpenStatusFlags) -> Self {
@@ -188,10 +194,23 @@ impl OpenFileDescription {
         let OpenFileBackend::File(file) = &self.backend else {
             return Err(LinuxError::EISDIR);
         };
-        let mut file = file.file.lock();
-        file.seek(SeekFrom::Start(offset))
-            .map_err(LinuxError::from)?;
-        file.read(dst).map_err(LinuxError::from)
+        let file = file.file.lock();
+        file.read_at(offset, dst).map_err(LinuxError::from)
+    }
+
+    pub fn pwrite_file(&self, src: &[u8], offset: u64) -> Result<usize, LinuxError> {
+        let OpenFileBackend::File(file) = &self.backend else {
+            return Err(LinuxError::EBADF);
+        };
+        let file = file.file.lock();
+        file.write_at(offset, src).map_err(LinuxError::from)
+    }
+
+    pub fn sync_file(&self) -> Result<(), LinuxError> {
+        let OpenFileBackend::File(file) = &self.backend else {
+            return Err(LinuxError::EINVAL);
+        };
+        compat_sync_unsupported_flush(file.file.lock().flush().map_err(LinuxError::from))
     }
 
     pub fn read_file_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, LinuxError> {
@@ -219,5 +238,33 @@ impl OpenFileDescription {
             return Err(LinuxError::EINVAL);
         };
         file.file.lock().truncate(size).map_err(LinuxError::from)
+    }
+}
+
+fn compat_sync_unsupported_flush(result: Result<(), LinuxError>) -> Result<(), LinuxError> {
+    // compat(Phase 1B iozone/unixbench): current axfs file writes are synchronous,
+    // while backends without fsync support can surface VFS default InvalidInput.
+    // delete-when: axfs exposes real per-filesystem fsync/writeback capability.
+    match result {
+        Err(LinuxError::EINVAL | LinuxError::EOPNOTSUPP) => Ok(()),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_offset_advances_by_completed_bytes() {
+        assert_eq!(advance_explicit_offset(4096, 128), Ok(4224));
+    }
+
+    #[test]
+    fn explicit_offset_overflow_is_invalid() {
+        assert_eq!(
+            advance_explicit_offset(u64::MAX - 3, 4),
+            Err(LinuxError::EINVAL)
+        );
     }
 }

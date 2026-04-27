@@ -49,12 +49,16 @@ const SYS_UMOUNT2: u32 = general::__NR_umount2;
 const SYS_MOUNT: u32 = 40;
 #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
 const SYS_MOUNT: u32 = general::__NR_mount;
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+const SYS_RT_SIGSUSPEND: u32 = 133;
+#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+const SYS_RT_SIGSUSPEND: u32 = general::__NR_rt_sigsuspend;
 const AUX_CLOCK_TICKS: usize = 100;
 const SIGCHLD_NUM: isize = 17;
 const SIGCANCEL_NUM: i32 = 33;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 const SI_TKILL_CODE: i32 = -6;
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 const SA_NODEFER_FLAG: u64 = 0x4000_0000;
 const KERNEL_SIGSET_BYTES: usize = size_of::<u64>();
 const SIG_BLOCK_HOW: usize = 0;
@@ -64,8 +68,16 @@ const RLIMIT_STACK_RESOURCE: u32 = 3;
 const RLIMIT_NOFILE_RESOURCE: u32 = 7;
 const DEFAULT_NOFILE_LIMIT: u64 = 1024;
 const FD_SETSIZE: usize = 1024;
+const IOV_MAX: usize = 1024;
 const BITS_PER_USIZE: usize = usize::BITS as usize;
 const FD_SET_WORDS: usize = FD_SETSIZE.div_ceil(BITS_PER_USIZE);
+const IPC_PRIVATE: usize = 0;
+const IPC_CREAT: u32 = 0o1000;
+const IPC_EXCL: u32 = 0o2000;
+const IPC_RMID: usize = 0;
+const SHM_RDONLY: u32 = 0o10000;
+const SHM_RND: u32 = 0o20000;
+const SHM_REMAP: u32 = 0o40000;
 #[cfg(target_arch = "riscv64")]
 const RISCV_SIGNAL_SIGSET_RESERVED_BYTES: usize = 120;
 #[cfg(target_arch = "riscv64")]
@@ -74,6 +86,10 @@ const RISCV_SIGNAL_FPSTATE_BYTES: usize = 528;
 const SS_DISABLE: i32 = 2;
 #[cfg(target_arch = "riscv64")]
 const RISCV_SIGTRAMP_CODE: [u32; 3] = [0x08b0_0893, 0x0000_0073, 0x0010_0073];
+#[cfg(target_arch = "loongarch64")]
+const LOONGARCH_SIGNAL_UCONTEXT_BYTES: usize = 256;
+#[cfg(target_arch = "loongarch64")]
+const LOONGARCH_SIGTRAMP_CODE: [u32; 3] = [0x0382_2c0b, 0x002b_0000, 0x002a_0000];
 
 const ST_MODE_DIR: u32 = 0o040000;
 const ST_MODE_FILE: u32 = 0o100000;
@@ -85,7 +101,6 @@ const AUX_PLATFORM: &str = "riscv64";
 const AUX_PLATFORM: &str = "loongarch64";
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
-
 macro_rules! user_trace {
     ($($arg:tt)*) => {};
 }
@@ -95,6 +110,8 @@ struct UserTaskExt {
     clear_child_tid: AtomicUsize,
     pending_signal: AtomicI32,
     signal_mask: AtomicU64,
+    signal_wait: WaitQueue,
+    sigsuspend_active: AtomicBool,
     futex_wait: AtomicUsize,
     robust_list_head: AtomicUsize,
     robust_list_len: AtomicUsize,
@@ -115,14 +132,19 @@ struct UserProcess {
     cwd: Mutex<String>,
     exec_root: Mutex<String>,
     mount_table: Mutex<crate::linux_fs::MountTable>,
+    shm_attachments: Mutex<BTreeMap<usize, i32>>,
     children: Mutex<Vec<ChildTask>>,
     rlimits: Mutex<BTreeMap<u32, UserRlimit>>,
     signal_actions: Mutex<BTreeMap<usize, general::kernel_sigaction>>,
+    itimer_real_deadline_us: AtomicU64,
+    itimer_real_interval_us: AtomicU64,
+    child_exit_seq: AtomicUsize,
     pid: AtomicI32,
     ppid: i32,
     live_threads: AtomicUsize,
     exit_group_code: AtomicI32,
     exit_code: AtomicI32,
+    parent_exit_signal: i32,
     exit_wait: WaitQueue,
 }
 
@@ -172,19 +194,22 @@ enum RingBufferStatus {
     Normal,
 }
 
-const PIPE_BUF_SIZE: usize = 256;
+const PIPE_BUF_SIZE: usize = 4096;
 
 struct PipeRingBuffer {
     data: [u8; PIPE_BUF_SIZE],
     head: usize,
     tail: usize,
     status: RingBufferStatus,
+    readers: usize,
+    writers: usize,
 }
 
-#[derive(Clone)]
 struct PipeEndpoint {
     readable: bool,
     buffer: Arc<Mutex<PipeRingBuffer>>,
+    read_wait: Arc<WaitQueue>,
+    write_wait: Arc<WaitQueue>,
 }
 
 struct LoadedProgram {
@@ -251,6 +276,13 @@ struct RiscvSignalInfo {
     bytes: [u8; 128],
 }
 
+#[cfg(target_arch = "loongarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LoongArchSignalInfo {
+    bytes: [u8; 128],
+}
+
 #[cfg(target_arch = "riscv64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -304,6 +336,16 @@ struct RiscvSignalFrame {
     trampoline: [u32; 3],
 }
 
+#[cfg(target_arch = "loongarch64")]
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct LoongArchSignalFrame {
+    saved_mask: u64,
+    info: LoongArchSignalInfo,
+    ucontext: [u8; LOONGARCH_SIGNAL_UCONTEXT_BYTES],
+    trampoline: [u32; 3],
+}
+
 #[cfg(target_arch = "riscv64")]
 const _: [(); RISCV_SIGNAL_FPSTATE_BYTES] = [(); size_of::<RiscvSignalFpState>()];
 #[cfg(target_arch = "riscv64")]
@@ -312,6 +354,8 @@ const _: [(); 784] = [(); size_of::<RiscvSignalSigcontext>()];
 const _: [(); 960] = [(); size_of::<RiscvSignalUcontext>()];
 #[cfg(target_arch = "riscv64")]
 const _: [(); 1104] = [(); size_of::<RiscvSignalFrame>()];
+#[cfg(target_arch = "loongarch64")]
+const _: [(); 416] = [(); size_of::<LoongArchSignalFrame>()];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -328,12 +372,14 @@ struct UserSchedParam {
 const NO_EXIT_GROUP_CODE: i32 = i32::MIN;
 
 impl PipeRingBuffer {
-    const fn new() -> Self {
+    const fn new(readers: usize, writers: usize) -> Self {
         Self {
             data: [0; PIPE_BUF_SIZE],
             head: 0,
             tail: 0,
             status: RingBufferStatus::Empty,
+            readers,
+            writers,
         }
     }
 
@@ -377,15 +423,21 @@ impl PipeRingBuffer {
 
 impl PipeEndpoint {
     fn new_pair() -> (Self, Self) {
-        let buffer = Arc::new(Mutex::new(PipeRingBuffer::new()));
+        let buffer = Arc::new(Mutex::new(PipeRingBuffer::new(1, 1)));
+        let read_wait = Arc::new(WaitQueue::new());
+        let write_wait = Arc::new(WaitQueue::new());
         (
             Self {
                 readable: true,
                 buffer: buffer.clone(),
+                read_wait: read_wait.clone(),
+                write_wait: write_wait.clone(),
             },
             Self {
                 readable: false,
                 buffer,
+                read_wait,
+                write_wait,
             },
         )
     }
@@ -394,8 +446,12 @@ impl PipeEndpoint {
         !self.readable
     }
 
-    fn peer_closed(&self) -> bool {
-        Arc::strong_count(&self.buffer) == 1
+    fn peer_closed_locked(&self, ring: &PipeRingBuffer) -> bool {
+        if self.readable {
+            ring.writers == 0
+        } else {
+            ring.readers == 0
+        }
     }
 
     fn read(&self, dst: &mut [u8]) -> Result<usize, LinuxError> {
@@ -407,20 +463,23 @@ impl PipeEndpoint {
             let mut ring = self.buffer.lock();
             let available = ring.available_read();
             if available == 0 {
-                if read_len > 0 || self.peer_closed() {
+                if read_len > 0 || self.peer_closed_locked(&ring) {
                     return Ok(read_len);
                 }
                 drop(ring);
-                axtask::yield_now();
+                self.read_wait.wait_until(|| {
+                    let ring = self.buffer.lock();
+                    ring.available_read() > 0 || self.peer_closed_locked(&ring)
+                });
                 continue;
             }
-            for _ in 0..available {
-                if read_len == dst.len() {
-                    return Ok(read_len);
-                }
+            let to_read = cmp::min(available, dst.len() - read_len);
+            for _ in 0..to_read {
                 dst[read_len] = ring.read_byte();
                 read_len += 1;
             }
+            drop(ring);
+            self.write_wait.notify_all(true);
             if read_len > 0 {
                 return Ok(read_len);
             }
@@ -435,19 +494,29 @@ impl PipeEndpoint {
         let mut written = 0usize;
         while written < src.len() {
             let mut ring = self.buffer.lock();
+            if self.peer_closed_locked(&ring) {
+                return if written > 0 {
+                    Ok(written)
+                } else {
+                    Err(LinuxError::EPIPE)
+                };
+            }
             let available = ring.available_write();
             if available == 0 {
                 drop(ring);
-                axtask::yield_now();
+                self.write_wait.wait_until(|| {
+                    let ring = self.buffer.lock();
+                    ring.available_write() > 0 || self.peer_closed_locked(&ring)
+                });
                 continue;
             }
-            for _ in 0..available {
-                if written == src.len() {
-                    return Ok(written);
-                }
+            let to_write = cmp::min(available, src.len() - written);
+            for _ in 0..to_write {
                 ring.write_byte(src[written]);
                 written += 1;
             }
+            drop(ring);
+            self.read_wait.notify_all(true);
         }
         Ok(written)
     }
@@ -463,11 +532,180 @@ impl PipeEndpoint {
 
     fn poll(&self) -> PollState {
         let ring = self.buffer.lock();
+        let peer_closed = self.peer_closed_locked(&ring);
         PollState {
-            readable: self.readable && (ring.available_read() > 0 || self.peer_closed()),
-            writable: self.writable() && (ring.available_write() > 0 || self.peer_closed()),
+            readable: self.readable && (ring.available_read() > 0 || peer_closed),
+            writable: self.writable() && (ring.available_write() > 0 || peer_closed),
         }
     }
+}
+
+impl Clone for PipeEndpoint {
+    fn clone(&self) -> Self {
+        {
+            let mut ring = self.buffer.lock();
+            if self.readable {
+                ring.readers += 1;
+            } else {
+                ring.writers += 1;
+            }
+        }
+        Self {
+            readable: self.readable,
+            buffer: Arc::clone(&self.buffer),
+            read_wait: Arc::clone(&self.read_wait),
+            write_wait: Arc::clone(&self.write_wait),
+        }
+    }
+}
+
+impl Drop for PipeEndpoint {
+    fn drop(&mut self) {
+        {
+            let mut ring = self.buffer.lock();
+            if self.readable {
+                ring.readers = ring.readers.saturating_sub(1);
+            } else {
+                ring.writers = ring.writers.saturating_sub(1);
+            }
+        }
+        if self.readable {
+            self.write_wait.notify_all(true);
+        } else {
+            self.read_wait.notify_all(true);
+        }
+    }
+}
+
+// compat(Phase 1B iozone): minimal SysV shared memory registry for private
+// process-shared benchmark coordination segments.
+// delete-when: axmm owns real shared-memory VM objects and SysV IPC registry.
+struct CompatShmSegment {
+    size: usize,
+    pages: usize,
+    kernel_vaddr: usize,
+    phys_start: usize,
+    marked_removed: bool,
+    attachments: usize,
+}
+
+struct CompatShmRegistry {
+    next_id: i32,
+    segments: BTreeMap<i32, CompatShmSegment>,
+}
+
+impl CompatShmRegistry {
+    const fn new() -> Self {
+        Self {
+            next_id: 1,
+            segments: BTreeMap::new(),
+        }
+    }
+
+    fn allocate_private(&mut self, size: usize) -> Result<i32, LinuxError> {
+        if size == 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        let pages = align_up(size, PAGE_SIZE_4K) / PAGE_SIZE_4K;
+        let kernel_vaddr = axalloc::global_allocator()
+            .alloc_pages(pages, PAGE_SIZE_4K)
+            .map_err(|_| LinuxError::ENOMEM)?;
+        unsafe {
+            core::ptr::write_bytes(kernel_vaddr as *mut u8, 0, pages * PAGE_SIZE_4K);
+        }
+        let phys_start = axhal::mem::virt_to_phys(VirtAddr::from(kernel_vaddr)).as_usize();
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).unwrap_or(1).max(1);
+        self.segments.insert(
+            id,
+            CompatShmSegment {
+                size: pages * PAGE_SIZE_4K,
+                pages,
+                kernel_vaddr,
+                phys_start,
+                marked_removed: false,
+                attachments: 0,
+            },
+        );
+        Ok(id)
+    }
+}
+
+fn compat_shm_table() -> &'static Mutex<CompatShmRegistry> {
+    static SHM: LazyInit<Mutex<CompatShmRegistry>> = LazyInit::new();
+    if !SHM.is_inited() {
+        SHM.init_once(Mutex::new(CompatShmRegistry::new()));
+    }
+    &SHM
+}
+
+fn compat_shm_free_segment(segment: CompatShmSegment) {
+    axalloc::global_allocator().dealloc_pages(segment.kernel_vaddr, segment.pages);
+}
+
+fn compat_shm_prepare_attach(shmid: i32) -> Result<(usize, usize), LinuxError> {
+    let mut registry = compat_shm_table().lock();
+    let segment = registry
+        .segments
+        .get_mut(&shmid)
+        .ok_or(LinuxError::EINVAL)?;
+    if segment.marked_removed {
+        return Err(LinuxError::EINVAL);
+    }
+    segment.attachments = segment
+        .attachments
+        .checked_add(1)
+        .ok_or(LinuxError::EINVAL)?;
+    Ok((segment.phys_start, segment.size))
+}
+
+fn compat_shm_detach(shmid: i32) {
+    let mut registry = compat_shm_table().lock();
+    let Some(segment) = registry.segments.get_mut(&shmid) else {
+        return;
+    };
+    segment.attachments = segment.attachments.saturating_sub(1);
+    if segment.marked_removed
+        && segment.attachments == 0
+        && let Some(segment) = registry.segments.remove(&shmid)
+    {
+        compat_shm_free_segment(segment);
+    }
+}
+
+fn compat_shm_segment_size(shmid: i32) -> Option<usize> {
+    compat_shm_table()
+        .lock()
+        .segments
+        .get(&shmid)
+        .map(|segment| segment.size)
+}
+
+fn compat_shm_mark_removed(shmid: i32) -> Result<(), LinuxError> {
+    let mut registry = compat_shm_table().lock();
+    let segment = registry
+        .segments
+        .get_mut(&shmid)
+        .ok_or(LinuxError::EINVAL)?;
+    segment.marked_removed = true;
+    if segment.attachments == 0
+        && let Some(segment) = registry.segments.remove(&shmid)
+    {
+        compat_shm_free_segment(segment);
+    }
+    Ok(())
+}
+
+fn compat_shm_clone_attachments(attachments: &BTreeMap<usize, i32>) -> Result<(), LinuxError> {
+    let mut registry = compat_shm_table().lock();
+    for shmid in attachments.values() {
+        let segment = registry.segments.get_mut(shmid).ok_or(LinuxError::EINVAL)?;
+        segment.attachments = segment
+            .attachments
+            .checked_add(1)
+            .ok_or(LinuxError::EINVAL)?;
+    }
+    Ok(())
 }
 
 #[crate_interface::impl_interface]
@@ -499,6 +737,8 @@ pub fn run_user_program_in(cwd: &str, argv: &[&str]) -> Result<i32, String> {
         clear_child_tid: AtomicUsize::new(0),
         pending_signal: AtomicI32::new(0),
         signal_mask: AtomicU64::new(0),
+        signal_wait: WaitQueue::new(),
+        sigsuspend_active: AtomicBool::new(false),
         futex_wait: AtomicUsize::new(0),
         robust_list_head: AtomicUsize::new(0),
         robust_list_len: AtomicUsize::new(0),
@@ -540,7 +780,7 @@ fn user_thread_entry(process: Arc<UserProcess>, context: UspaceContext, child_ti
 fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
     let mut aspace = axmm::new_user_aspace(VirtAddr::from(USER_ASPACE_BASE), USER_ASPACE_SIZE)
         .map_err(|err| format!("failed to create user address space: {err}"))?;
-    let image = load_program_image(&mut aspace, cwd, argv)?;
+    let image = load_program_image(&mut aspace, cwd, argv, &[])?;
 
     let process = Arc::new(UserProcess {
         aspace: Mutex::new(aspace),
@@ -549,14 +789,19 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         cwd: Mutex::new(cwd.into()),
         exec_root: Mutex::new(image.exec_root.clone()),
         mount_table: Mutex::new(crate::linux_fs::MountTable::new()),
+        shm_attachments: Mutex::new(BTreeMap::new()),
         children: Mutex::new(Vec::new()),
         rlimits: Mutex::new(BTreeMap::new()),
         signal_actions: Mutex::new(BTreeMap::new()),
+        itimer_real_deadline_us: AtomicU64::new(0),
+        itimer_real_interval_us: AtomicU64::new(0),
+        child_exit_seq: AtomicUsize::new(0),
         pid: AtomicI32::new(0),
         ppid: 1,
         live_threads: AtomicUsize::new(1),
         exit_group_code: AtomicI32::new(NO_EXIT_GROUP_CODE),
         exit_code: AtomicI32::new(0),
+        parent_exit_signal: 0,
         exit_wait: WaitQueue::new(),
     });
 
@@ -570,6 +815,7 @@ fn load_program_image(
     aspace: &mut AddrSpace,
     cwd: &str,
     argv: &[&str],
+    envp: &[&str],
 ) -> Result<LoadedImage, String> {
     let prepared = prepare_program(cwd, argv, 0)?;
     let elf = ElfFile::new(&prepared.image).map_err(|err| format!("invalid ELF: {err}"))?;
@@ -633,6 +879,7 @@ fn load_program_image(
         stack_base,
         stack_top,
         &argv_refs,
+        envp,
         prepared.path.as_str(),
         main.entry,
         interp_base,
@@ -911,6 +1158,7 @@ fn build_initial_stack(
     stack_base: usize,
     stack_top: usize,
     argv: &[&str],
+    envp: &[&str],
     execfn: &str,
     entry: usize,
     interp_base: usize,
@@ -936,6 +1184,15 @@ fn build_initial_stack(
         arg_ptrs.push(ptr);
     }
     arg_ptrs.reverse();
+
+    let mut env_ptrs = Vec::with_capacity(envp.len());
+    for env in envp.iter().rev() {
+        let mut bytes = env.as_bytes().to_vec();
+        bytes.push(0);
+        let ptr = push_stack_bytes(aspace, stack_base, &mut sp, &bytes, 1)?;
+        env_ptrs.push(ptr);
+    }
+    env_ptrs.reverse();
 
     let aux = [
         AuxEntry {
@@ -1020,10 +1277,11 @@ fn build_initial_stack(
         },
     ];
 
-    let mut words = Vec::with_capacity(1 + arg_ptrs.len() + 1 + 1 + aux.len() * 2);
+    let mut words = Vec::with_capacity(1 + arg_ptrs.len() + 1 + env_ptrs.len() + 1 + aux.len() * 2);
     words.push(argv.len());
     words.extend(arg_ptrs.iter().copied());
     words.push(0);
+    words.extend(env_ptrs.iter().copied());
     words.push(0);
     for item in aux {
         words.push(item.key);
@@ -1229,11 +1487,13 @@ fn exec_program(
     process: &UserProcess,
     cwd: &str,
     argv: &[String],
+    envp: &[String],
 ) -> Result<(usize, usize, usize), String> {
     let argv_refs = argv.iter().map(String::as_str).collect::<Vec<_>>();
+    let envp_refs = envp.iter().map(String::as_str).collect::<Vec<_>>();
     let image = {
         let mut aspace = process.aspace.lock();
-        load_program_image(&mut aspace, cwd, &argv_refs)?
+        load_program_image(&mut aspace, cwd, &argv_refs, &envp_refs)?
     };
     *process.brk.lock() = image.brk;
     process.set_exec_root(image.exec_root);
@@ -1278,8 +1538,10 @@ impl UserProcess {
     }
 
     fn teardown(&self) {
+        compat_itimer_real_disarm(self);
+        self.detach_all_compat_shm();
         self.aspace.lock().clear();
-        *self.fds.lock() = FdTable::new();
+        self.fds.lock().close_all();
         self.mount_table.lock().clear();
     }
 
@@ -1302,7 +1564,47 @@ impl UserProcess {
     fn note_thread_exit(&self, code: i32) {
         self.exit_code.store(code, Ordering::Release);
         if self.live_threads.fetch_sub(1, Ordering::AcqRel) == 1 {
+            compat_itimer_real_disarm(self);
+            self.detach_all_compat_shm();
+            self.fds.lock().close_all();
             self.exit_wait.notify_all(false);
+            self.notify_parent_exit_signal();
+        }
+    }
+
+    fn notify_parent_exit_signal(&self) {
+        if self.parent_exit_signal == 0 {
+            return;
+        }
+        if let Some(parent) = user_thread_entry_by_tid(self.ppid) {
+            if self.parent_exit_signal == SIGCHLD_NUM as i32 {
+                parent
+                    .process
+                    .child_exit_seq
+                    .fetch_add(1, Ordering::Release);
+                if let Some(ext) = task_ext(&parent.task) {
+                    if ext.sigsuspend_active.load(Ordering::Acquire)
+                        && !signal_is_blocked(ext, SIGCHLD_NUM as i32)
+                    {
+                        ext.pending_signal
+                            .store(SIGCHLD_NUM as i32, Ordering::Release);
+                    }
+                    ext.signal_wait.notify_all(true);
+                }
+            } else {
+                let _ = deliver_user_signal(&parent, self.parent_exit_signal);
+            }
+        }
+    }
+
+    fn detach_all_compat_shm(&self) {
+        let attachments = core::mem::take(&mut *self.shm_attachments.lock());
+        for (addr, shmid) in attachments {
+            let size = compat_shm_segment_size(shmid).unwrap_or(0);
+            if size != 0 {
+                let _ = self.aspace.lock().unmap(VirtAddr::from(addr), size);
+            }
+            compat_shm_detach(shmid);
         }
     }
 
@@ -1339,7 +1641,7 @@ impl UserProcess {
         self.rlimits.lock().insert(resource, limit);
     }
 
-    fn fork(&self) -> Result<Arc<UserProcess>, LinuxError> {
+    fn fork(&self, parent_exit_signal: i32) -> Result<Arc<UserProcess>, LinuxError> {
         let mut aspace = axmm::new_user_aspace(VirtAddr::from(USER_ASPACE_BASE), USER_ASPACE_SIZE)
             .map_err(LinuxError::from)?;
         {
@@ -1348,6 +1650,8 @@ impl UserProcess {
                 .clone_user_mappings_from(&parent_aspace)
                 .map_err(LinuxError::from)?;
         }
+        let shm_attachments = self.shm_attachments.lock().clone();
+        compat_shm_clone_attachments(&shm_attachments)?;
 
         Ok(Arc::new(UserProcess {
             aspace: Mutex::new(aspace),
@@ -1356,14 +1660,19 @@ impl UserProcess {
             cwd: Mutex::new(self.cwd()),
             exec_root: Mutex::new(self.exec_root()),
             mount_table: Mutex::new(self.mount_table.lock().clone()),
+            shm_attachments: Mutex::new(shm_attachments),
             children: Mutex::new(Vec::new()),
             rlimits: Mutex::new(self.rlimits.lock().clone()),
             signal_actions: Mutex::new(self.signal_actions.lock().clone()),
+            itimer_real_deadline_us: AtomicU64::new(0),
+            itimer_real_interval_us: AtomicU64::new(0),
+            child_exit_seq: AtomicUsize::new(0),
             pid: AtomicI32::new(0),
             ppid: axtask::current().id().as_u64() as i32,
             live_threads: AtomicUsize::new(1),
             exit_group_code: AtomicI32::new(NO_EXIT_GROUP_CODE),
             exit_code: AtomicI32::new(0),
+            parent_exit_signal,
             exit_wait: WaitQueue::new(),
         }))
     }
@@ -1372,6 +1681,13 @@ impl UserProcess {
         let pid = task.id().as_u64() as i32;
         self.children.lock().push(ChildTask { pid, task, process });
         pid
+    }
+
+    fn has_exited_child(&self) -> bool {
+        self.children
+            .lock()
+            .iter()
+            .any(|child| child.process.live_threads.load(Ordering::Acquire) == 0)
     }
 
     fn wait_child(&self, pid: i32, nohang: bool) -> Result<Option<(i32, i32)>, LinuxError> {
@@ -1480,6 +1796,7 @@ fn deliver_user_signal(entry: &UserThreadEntry, sig: i32) -> Result<(), LinuxErr
     }
     let ext = task_ext(&entry.task).ok_or(LinuxError::ESRCH)?;
     ext.pending_signal.store(sig, Ordering::Release);
+    ext.signal_wait.notify_all(true);
     if sig == SIGCANCEL_NUM {
         user_trace!(
             "sigdbg: deliver tid={} blocked={} futex_wait={:#x}",
@@ -1574,6 +1891,11 @@ fn signal_is_blocked(ext: &UserTaskExt, sig: i32) -> bool {
     bit != 0 && ext.signal_mask.load(Ordering::Acquire) & bit != 0
 }
 
+fn has_unblocked_pending_signal(ext: &UserTaskExt) -> bool {
+    let sig = ext.pending_signal.load(Ordering::Acquire);
+    sig != 0 && !signal_is_blocked(ext, sig)
+}
+
 fn current_sigcancel_pending() -> bool {
     current_task_ext().is_some_and(|ext| {
         ext.pending_signal.load(Ordering::Acquire) == SIGCANCEL_NUM
@@ -1591,13 +1913,14 @@ fn user_return_hook(tf: &mut TrapFrame) {
     let Some(ext) = current_task_ext() else {
         return;
     };
+    compat_itimer_real_poll(ext);
     if ext.signal_frame.load(Ordering::Acquire) == 0 {
         if let Some(restored) = ext.pending_sigreturn.lock().take() {
             *tf = restored;
             return;
         }
     }
-    #[cfg(target_arch = "riscv64")]
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     if ext.signal_frame.load(Ordering::Acquire) == 0 {
         let sig = ext.pending_signal.load(Ordering::Acquire);
         if sig != 0 && !signal_is_blocked(ext, sig) {
@@ -1717,7 +2040,18 @@ fn make_riscv_siginfo(sig: i32, code: i32, tid: i32) -> RiscvSignalInfo {
     info
 }
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(target_arch = "loongarch64")]
+fn make_loongarch_siginfo(sig: i32, code: i32, tid: i32) -> LoongArchSignalInfo {
+    let mut info = LoongArchSignalInfo { bytes: [0; 128] };
+    info.bytes[0..4].copy_from_slice(&sig.to_ne_bytes());
+    info.bytes[4..8].copy_from_slice(&0i32.to_ne_bytes());
+    info.bytes[8..12].copy_from_slice(&code.to_ne_bytes());
+    info.bytes[16..20].copy_from_slice(&tid.to_ne_bytes());
+    info.bytes[20..24].copy_from_slice(&0u32.to_ne_bytes());
+    info
+}
+
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
 fn ensure_signal_frame_pages(
     process: &UserProcess,
     start: usize,
@@ -1823,6 +2157,61 @@ fn inject_pending_signal(
     Ok(())
 }
 
+#[cfg(target_arch = "loongarch64")]
+fn inject_pending_signal(
+    tf: &mut TrapFrame,
+    ext: &UserTaskExt,
+    sig: i32,
+) -> Result<(), LinuxError> {
+    let action = ext
+        .process
+        .signal_actions
+        .lock()
+        .get(&(sig as usize))
+        .copied()
+        .unwrap_or_else(|| unsafe { core::mem::zeroed() });
+    let handler = action
+        .sa_handler_kernel
+        .map(|func| func as usize)
+        .unwrap_or(0);
+    if handler <= 1 {
+        ext.pending_signal.store(0, Ordering::Release);
+        return Ok(());
+    }
+
+    let current_mask = ext.signal_mask.load(Ordering::Acquire);
+    let frame_size = size_of::<LoongArchSignalFrame>();
+    let frame_addr = align_down(tf.regs.sp.saturating_sub(frame_size), 16);
+    ensure_signal_frame_pages(ext.process.as_ref(), frame_addr, frame_size)?;
+
+    let frame = LoongArchSignalFrame {
+        saved_mask: current_mask,
+        info: make_loongarch_siginfo(sig, SI_TKILL_CODE, current_tid()),
+        ucontext: [0; LOONGARCH_SIGNAL_UCONTEXT_BYTES],
+        trampoline: LOONGARCH_SIGTRAMP_CODE,
+    };
+    if write_user_value(ext.process.as_ref(), frame_addr, &frame) != 0 {
+        return Err(LinuxError::EFAULT);
+    }
+
+    *ext.pending_sigreturn.lock() = Some(*tf);
+    ext.signal_frame.store(frame_addr, Ordering::Release);
+    ext.pending_signal.store(0, Ordering::Release);
+    let mut next_mask = current_mask | action.sa_mask.sig[0];
+    if action.sa_flags & SA_NODEFER_FLAG == 0 {
+        next_mask |= signal_mask_bit(sig);
+    }
+    ext.signal_mask.store(next_mask, Ordering::Release);
+
+    tf.regs.sp = frame_addr;
+    tf.regs.ra = frame_addr + offset_of!(LoongArchSignalFrame, trampoline);
+    tf.regs.a0 = sig as usize;
+    tf.regs.a1 = frame_addr + offset_of!(LoongArchSignalFrame, info);
+    tf.regs.a2 = frame_addr + offset_of!(LoongArchSignalFrame, ucontext);
+    tf.era = handler;
+    Ok(())
+}
+
 #[register_trap_handler(PAGE_FAULT)]
 fn user_page_fault(vaddr: VirtAddr, flags: PageFaultFlags, _from_user: bool) -> bool {
     let Some(process) = current_process() else {
@@ -1892,8 +2281,13 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         general::__NR_read => sys_read(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_pread64 => sys_pread64(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3()),
         general::__NR_write => sys_write(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_pwrite64 => {
+            sys_pwrite64(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3())
+        }
         general::__NR_writev => sys_writev(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_readv => sys_readv(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_preadv => sys_preadv(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3()),
+        general::__NR_pwritev => sys_pwritev(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3()),
         general::__NR_getcwd => sys_getcwd(&process, tf.arg0(), tf.arg1()),
         general::__NR_chdir => sys_chdir(&process, tf.arg0()),
         general::__NR_openat => sys_openat(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3()),
@@ -1939,6 +2333,8 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         ),
         general::__NR_getdents64 => sys_getdents64(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_lseek => sys_lseek(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_fsync => sys_fsync(&process, tf.arg0()),
+        general::__NR_fdatasync => sys_fdatasync(&process, tf.arg0()),
         general::__NR_dup => sys_dup(&process, tf.arg0()),
         general::__NR_dup3 => sys_dup3(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_fcntl => sys_fcntl(&process, tf.arg0(), tf.arg1(), tf.arg2()),
@@ -1990,6 +2386,10 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         ),
         general::__NR_mprotect => sys_mprotect(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_munmap => sys_munmap(&process, tf, tf.arg0(), tf.arg1()),
+        general::__NR_shmget => sys_shmget(tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_shmctl => sys_shmctl(tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_shmat => sys_shmat(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_shmdt => sys_shmdt(&process, tf.arg0()),
         general::__NR_mbind => sys_mbind(
             &process,
             tf.arg0(),
@@ -2039,6 +2439,7 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
             tf.arg1() as i32,
             tf.arg2() as i32,
         ),
+        SYS_RT_SIGSUSPEND => sys_rt_sigsuspend(&process, tf.arg0(), tf.arg1()),
         general::__NR_rt_sigtimedwait => {
             sys_rt_sigtimedwait(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3())
         }
@@ -2085,17 +2486,26 @@ fn sys_read(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize
 }
 
 fn sys_pread64(process: &UserProcess, fd: usize, buf: usize, count: usize, offset: usize) -> isize {
+    let offset = match explicit_file_offset(offset) {
+        Ok(offset) => offset,
+        Err(err) => return neg_errno(err),
+    };
     with_writable_slice(process, buf, count, |dst| {
         let table = process.fds.lock();
         let FdEntry::File(desc) = table.entry(fd as i32)? else {
             return Err(LinuxError::EBADF);
         };
+        let desc = Arc::clone(desc);
+        drop(table);
+
         let mut filled = 0usize;
+        let mut current_offset = offset;
         while filled < dst.len() {
-            let read = desc.pread_file(&mut dst[filled..], offset as u64 + filled as u64)?;
+            let read = desc.pread_file(&mut dst[filled..], current_offset)?;
             if read == 0 {
                 break;
             }
+            current_offset = crate::linux_fs::advance_explicit_offset(current_offset, read)?;
             filled += read;
         }
         Ok(filled)
@@ -2105,6 +2515,39 @@ fn sys_pread64(process: &UserProcess, fd: usize, buf: usize, count: usize, offse
 fn sys_write(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize {
     with_readable_slice(process, buf, count, |src| {
         process.fds.lock().write(fd as i32, src)
+    })
+}
+
+fn sys_pwrite64(
+    process: &UserProcess,
+    fd: usize,
+    buf: usize,
+    count: usize,
+    offset: usize,
+) -> isize {
+    let offset = match explicit_file_offset(offset) {
+        Ok(offset) => offset,
+        Err(err) => return neg_errno(err),
+    };
+    with_readable_slice(process, buf, count, |src| {
+        let table = process.fds.lock();
+        let FdEntry::File(desc) = table.entry(fd as i32)? else {
+            return Err(LinuxError::EBADF);
+        };
+        let desc = Arc::clone(desc);
+        drop(table);
+
+        let mut written = 0usize;
+        let mut current_offset = offset;
+        while written < src.len() {
+            let n = desc.pwrite_file(&src[written..], current_offset)?;
+            if n == 0 {
+                break;
+            }
+            current_offset = crate::linux_fs::advance_explicit_offset(current_offset, n)?;
+            written += n;
+        }
+        Ok(written)
     })
 }
 
@@ -2282,17 +2725,52 @@ fn sys_pselect6(
     }
 }
 
-fn sys_writev(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isize {
-    if iovcnt > 1024 {
-        return neg_errno(LinuxError::EINVAL);
+fn explicit_file_offset(offset: usize) -> Result<u64, LinuxError> {
+    if offset > i64::MAX as usize {
+        return Err(LinuxError::EINVAL);
     }
-    let Some(iov_bytes) = user_bytes(process, iov, iovcnt * size_of::<general::iovec>(), false)
-    else {
-        return neg_errno(LinuxError::EFAULT);
+    Ok(offset as u64)
+}
+
+fn checked_io_total(total: usize, delta: usize) -> Result<usize, LinuxError> {
+    total
+        .checked_add(delta)
+        .filter(|value| *value <= isize::MAX as usize)
+        .ok_or(LinuxError::EINVAL)
+}
+
+fn read_iovec_entries(
+    process: &UserProcess,
+    iov: usize,
+    iovcnt: usize,
+) -> Result<Vec<general::iovec>, LinuxError> {
+    if iovcnt > IOV_MAX {
+        return Err(LinuxError::EINVAL);
+    }
+    let bytes_len = iovcnt
+        .checked_mul(size_of::<general::iovec>())
+        .ok_or(LinuxError::EINVAL)?;
+    let Some(iov_bytes) = user_bytes(process, iov, bytes_len, false) else {
+        return Err(LinuxError::EFAULT);
     };
-    let mut written = 0isize;
+    let mut entries = Vec::with_capacity(iovcnt);
     for chunk in iov_bytes.chunks_exact(size_of::<general::iovec>()) {
-        let entry = unsafe { ptr::read_unaligned(chunk.as_ptr() as *const general::iovec) };
+        entries.push(unsafe { ptr::read_unaligned(chunk.as_ptr() as *const general::iovec) });
+    }
+    Ok(entries)
+}
+
+fn sys_writev(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isize {
+    if let Err(err) = process.fds.lock().entry(fd as i32).map(|_| ()) {
+        return neg_errno(err);
+    };
+
+    let entries = match read_iovec_entries(process, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(err) => return neg_errno(err),
+    };
+    let mut written = 0usize;
+    for entry in entries {
         let len = entry.iov_len as usize;
         if len == 0 {
             continue;
@@ -2304,25 +2782,28 @@ fn sys_writev(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> is
             Ok(v) => v,
             Err(err) => return neg_errno(err),
         };
-        written += n as isize;
+        written = match checked_io_total(written, n) {
+            Ok(total) => total,
+            Err(err) => return neg_errno(err),
+        };
         if n < len {
             break;
         }
     }
-    written
+    written as isize
 }
 
 fn sys_readv(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isize {
-    if iovcnt > 1024 {
-        return neg_errno(LinuxError::EINVAL);
-    }
-    let Some(iov_bytes) = user_bytes(process, iov, iovcnt * size_of::<general::iovec>(), false)
-    else {
-        return neg_errno(LinuxError::EFAULT);
+    if let Err(err) = process.fds.lock().entry(fd as i32).map(|_| ()) {
+        return neg_errno(err);
     };
-    let mut total = 0isize;
-    for chunk in iov_bytes.chunks_exact(size_of::<general::iovec>()) {
-        let entry = unsafe { ptr::read_unaligned(chunk.as_ptr() as *const general::iovec) };
+
+    let entries = match read_iovec_entries(process, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(err) => return neg_errno(err),
+    };
+    let mut total = 0usize;
+    for entry in entries {
         let len = entry.iov_len as usize;
         if len == 0 {
             continue;
@@ -2334,12 +2815,113 @@ fn sys_readv(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isi
             Ok(v) => v,
             Err(err) => return neg_errno(err),
         };
-        total += n as isize;
+        total = match checked_io_total(total, n) {
+            Ok(total) => total,
+            Err(err) => return neg_errno(err),
+        };
         if n < len {
             break;
         }
     }
-    total
+    total as isize
+}
+
+fn sys_preadv(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize, offset: usize) -> isize {
+    let mut current_offset = match explicit_file_offset(offset) {
+        Ok(offset) => offset,
+        Err(err) => return neg_errno(err),
+    };
+    let desc = {
+        let table = process.fds.lock();
+        match table.entry(fd as i32) {
+            Ok(FdEntry::File(desc)) => Arc::clone(desc),
+            Ok(_) => return neg_errno(LinuxError::EBADF),
+            Err(err) => return neg_errno(err),
+        }
+    };
+    let entries = match read_iovec_entries(process, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(err) => return neg_errno(err),
+    };
+
+    let mut total = 0usize;
+    for entry in entries {
+        let len = entry.iov_len as usize;
+        if len == 0 {
+            continue;
+        }
+        let Some(dst) = user_bytes_mut(process, entry.iov_base as usize, len, true) else {
+            return neg_errno(LinuxError::EFAULT);
+        };
+        let n = match desc.pread_file(dst, current_offset) {
+            Ok(v) => v,
+            Err(err) => return neg_errno(err),
+        };
+        total = match checked_io_total(total, n) {
+            Ok(total) => total,
+            Err(err) => return neg_errno(err),
+        };
+        current_offset = match crate::linux_fs::advance_explicit_offset(current_offset, n) {
+            Ok(offset) => offset,
+            Err(err) => return neg_errno(err),
+        };
+        if n < len {
+            break;
+        }
+    }
+    total as isize
+}
+
+fn sys_pwritev(
+    process: &UserProcess,
+    fd: usize,
+    iov: usize,
+    iovcnt: usize,
+    offset: usize,
+) -> isize {
+    let mut current_offset = match explicit_file_offset(offset) {
+        Ok(offset) => offset,
+        Err(err) => return neg_errno(err),
+    };
+    let desc = {
+        let table = process.fds.lock();
+        match table.entry(fd as i32) {
+            Ok(FdEntry::File(desc)) => Arc::clone(desc),
+            Ok(_) => return neg_errno(LinuxError::EBADF),
+            Err(err) => return neg_errno(err),
+        }
+    };
+    let entries = match read_iovec_entries(process, iov, iovcnt) {
+        Ok(entries) => entries,
+        Err(err) => return neg_errno(err),
+    };
+
+    let mut total = 0usize;
+    for entry in entries {
+        let len = entry.iov_len as usize;
+        if len == 0 {
+            continue;
+        }
+        let Some(src) = user_bytes(process, entry.iov_base as usize, len, false) else {
+            return neg_errno(LinuxError::EFAULT);
+        };
+        let n = match desc.pwrite_file(src, current_offset) {
+            Ok(v) => v,
+            Err(err) => return neg_errno(err),
+        };
+        total = match checked_io_total(total, n) {
+            Ok(total) => total,
+            Err(err) => return neg_errno(err),
+        };
+        current_offset = match crate::linux_fs::advance_explicit_offset(current_offset, n) {
+            Ok(offset) => offset,
+            Err(err) => return neg_errno(err),
+        };
+        if n < len {
+            break;
+        }
+    }
+    total as isize
 }
 
 fn sys_getcwd(process: &UserProcess, buf: usize, size: usize) -> isize {
@@ -2383,7 +2965,7 @@ fn sys_execve(
     _tf: &TrapFrame,
     pathname: usize,
     argv: usize,
-    _envp: usize,
+    envp: usize,
 ) -> isize {
     let path = match read_cstr(process, pathname) {
         Ok(path) => path,
@@ -2393,8 +2975,12 @@ fn sys_execve(
         Ok(argv) => argv,
         Err(err) => return neg_errno(err),
     };
+    let envp = match read_execve_envp(process, envp) {
+        Ok(envp) => envp,
+        Err(err) => return neg_errno(err),
+    };
     let cwd = process.cwd();
-    let (entry, stack_ptr, argc) = match exec_program(process, cwd.as_str(), &argv) {
+    let (entry, stack_ptr, argc) = match exec_program(process, cwd.as_str(), &argv, &envp) {
         Ok(image) => image,
         Err(_) => return neg_errno(LinuxError::ENOEXEC),
     };
@@ -2452,7 +3038,7 @@ fn sys_clone(
             return neg_errno(LinuxError::EFAULT);
         }
 
-        let child_process = match process.fork() {
+        let child_process = match process.fork(exit_signal as i32) {
             Ok(process) => process,
             Err(err) => return neg_errno(err),
         };
@@ -2495,6 +3081,8 @@ fn sys_clone(
             clear_child_tid: AtomicUsize::new(child_clear_tid),
             pending_signal: AtomicI32::new(0),
             signal_mask: AtomicU64::new(inherited_signal_mask),
+            signal_wait: WaitQueue::new(),
+            sigsuspend_active: AtomicBool::new(false),
             futex_wait: AtomicUsize::new(0),
             robust_list_head: AtomicUsize::new(0),
             robust_list_len: AtomicUsize::new(0),
@@ -2572,6 +3160,8 @@ fn sys_clone(
         clear_child_tid: AtomicUsize::new(child_clear_tid),
         pending_signal: AtomicI32::new(0),
         signal_mask: AtomicU64::new(inherited_signal_mask),
+        signal_wait: WaitQueue::new(),
+        sigsuspend_active: AtomicBool::new(false),
         futex_wait: AtomicUsize::new(0),
         robust_list_head: AtomicUsize::new(0),
         robust_list_len: AtomicUsize::new(0),
@@ -2784,6 +3374,17 @@ fn sys_ftruncate(process: &UserProcess, fd: usize, length: usize) -> isize {
         Ok(()) => 0,
         Err(err) => neg_errno(err),
     }
+}
+
+fn sys_fsync(process: &UserProcess, fd: usize) -> isize {
+    match process.fds.lock().sync(fd as i32) {
+        Ok(()) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
+fn sys_fdatasync(process: &UserProcess, fd: usize) -> isize {
+    sys_fsync(process, fd)
 }
 
 fn sys_utimensat(
@@ -3050,19 +3651,113 @@ fn sys_gettimeofday(process: &UserProcess, tv: usize, tz: usize) -> isize {
     0
 }
 
+fn timeval_to_duration(tv: general::timeval) -> Result<core::time::Duration, LinuxError> {
+    if tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1_000_000 {
+        return Err(LinuxError::EINVAL);
+    }
+    Ok(core::time::Duration::new(
+        tv.tv_sec as u64,
+        (tv.tv_usec as u32) * 1_000,
+    ))
+}
+
+fn duration_to_timeval(duration: core::time::Duration) -> general::timeval {
+    general::timeval {
+        tv_sec: duration.as_secs() as _,
+        tv_usec: duration.subsec_micros() as _,
+    }
+}
+
+fn duration_to_micros(duration: core::time::Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
+}
+
+fn compat_itimer_real_remaining(process: &UserProcess) -> general::itimerval {
+    let deadline_us = process.itimer_real_deadline_us.load(Ordering::Acquire);
+    let interval_us = process.itimer_real_interval_us.load(Ordering::Acquire);
+    let remaining = deadline_us
+        .checked_sub(duration_to_micros(axhal::time::wall_time()))
+        .map(core::time::Duration::from_micros)
+        .unwrap_or_default();
+    general::itimerval {
+        it_interval: duration_to_timeval(core::time::Duration::from_micros(interval_us)),
+        it_value: duration_to_timeval(remaining),
+    }
+}
+
+fn compat_itimer_real_disarm(process: &UserProcess) {
+    process.itimer_real_deadline_us.store(0, Ordering::Release);
+    process.itimer_real_interval_us.store(0, Ordering::Release);
+}
+
+fn compat_itimer_real_arm(
+    process: &UserProcess,
+    initial: core::time::Duration,
+    interval: core::time::Duration,
+) {
+    // compat(unixbench-fstime): provide the narrow ITIMER_REAL/SIGALRM path
+    // used by alarm(2)-driven benchmark loops.
+    // delete-when: timer/signal subsystem owns POSIX interval timers.
+    process.itimer_real_deadline_us.store(
+        duration_to_micros(axhal::time::wall_time()).saturating_add(duration_to_micros(initial)),
+        Ordering::Release,
+    );
+    process
+        .itimer_real_interval_us
+        .store(duration_to_micros(interval), Ordering::Release);
+}
+
+fn compat_itimer_real_poll(ext: &UserTaskExt) {
+    let process = ext.process.as_ref();
+    let deadline_us = process.itimer_real_deadline_us.load(Ordering::Acquire);
+    if deadline_us == 0 {
+        return;
+    }
+    let now_us = duration_to_micros(axhal::time::wall_time());
+    if now_us < deadline_us {
+        return;
+    }
+
+    let interval_us = process.itimer_real_interval_us.load(Ordering::Acquire);
+    if interval_us == 0 {
+        process.itimer_real_deadline_us.store(0, Ordering::Release);
+        process.itimer_real_interval_us.store(0, Ordering::Release);
+    } else {
+        process
+            .itimer_real_deadline_us
+            .store(now_us.saturating_add(interval_us), Ordering::Release);
+    }
+    ext.pending_signal
+        .store(general::SIGALRM as i32, Ordering::Release);
+}
+
 fn sys_setitimer(process: &UserProcess, which: i32, new_value: usize, old_value: usize) -> isize {
     if which != general::ITIMER_REAL as i32 {
         return neg_errno(LinuxError::EINVAL);
     }
-    if new_value != 0 && read_user_value::<general::itimerval>(process, new_value).is_err() {
-        return neg_errno(LinuxError::EFAULT);
-    }
     if old_value != 0 {
-        let value: general::itimerval = unsafe { core::mem::zeroed() };
+        let value = compat_itimer_real_remaining(process);
         let ret = write_user_value(process, old_value, &value);
         if ret != 0 {
             return ret;
         }
+    }
+    let value = match read_user_value::<general::itimerval>(process, new_value) {
+        Ok(value) => value,
+        Err(err) => return neg_errno(err),
+    };
+    let initial = match timeval_to_duration(value.it_value) {
+        Ok(duration) => duration,
+        Err(err) => return neg_errno(err),
+    };
+    let interval = match timeval_to_duration(value.it_interval) {
+        Ok(duration) => duration,
+        Err(err) => return neg_errno(err),
+    };
+    if initial.is_zero() {
+        compat_itimer_real_disarm(process);
+    } else {
+        compat_itimer_real_arm(process, initial, interval);
     }
     0
 }
@@ -3489,6 +4184,87 @@ fn sys_munmap(process: &UserProcess, tf: &TrapFrame, addr: usize, len: usize) ->
     }
 }
 
+fn sys_shmget(key: usize, size: usize, flags: usize) -> isize {
+    let flags = flags as u32;
+    let allowed_flags = IPC_CREAT | IPC_EXCL | 0o777;
+    if flags & !allowed_flags != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    if key != IPC_PRIVATE {
+        return neg_errno(LinuxError::EOPNOTSUPP);
+    }
+    match compat_shm_table().lock().allocate_private(size) {
+        Ok(id) => id as isize,
+        Err(err) => neg_errno(err),
+    }
+}
+
+fn sys_shmat(process: &UserProcess, shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
+    let shmid = shmid as i32;
+    let shmflg = shmflg as u32;
+    if shmflg & !(SHM_RDONLY | SHM_RND | SHM_REMAP) != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    if shmaddr != 0 || shmflg != 0 {
+        return neg_errno(LinuxError::EOPNOTSUPP);
+    }
+    let (phys_start, size) = match compat_shm_prepare_attach(shmid) {
+        Ok(segment) => segment,
+        Err(err) => return neg_errno(err),
+    };
+    let target = {
+        let mut brk = process.brk.lock();
+        let start = align_up(brk.next_mmap, PAGE_SIZE_4K);
+        brk.next_mmap = start + size + PAGE_SIZE_4K;
+        if start < USER_MMAP_BASE || start + size >= USER_STACK_TOP - USER_STACK_SIZE {
+            compat_shm_detach(shmid);
+            return neg_errno(LinuxError::ENOMEM);
+        }
+        start
+    };
+    let map_flags = MappingFlags::USER | MappingFlags::READ | MappingFlags::WRITE;
+    if let Err(err) =
+        process
+            .aspace
+            .lock()
+            .map_linear(VirtAddr::from(target), phys_start.into(), size, map_flags)
+    {
+        compat_shm_detach(shmid);
+        return neg_errno(LinuxError::from(err));
+    }
+    process.shm_attachments.lock().insert(target, shmid);
+    target as isize
+}
+
+fn sys_shmdt(process: &UserProcess, shmaddr: usize) -> isize {
+    let shmid = {
+        let mut attachments = process.shm_attachments.lock();
+        let Some(shmid) = attachments.remove(&shmaddr) else {
+            return neg_errno(LinuxError::EINVAL);
+        };
+        shmid
+    };
+    let Some(size) = compat_shm_segment_size(shmid) else {
+        return neg_errno(LinuxError::EINVAL);
+    };
+    if let Err(err) = process.aspace.lock().unmap(VirtAddr::from(shmaddr), size) {
+        process.shm_attachments.lock().insert(shmaddr, shmid);
+        return neg_errno(LinuxError::from(err));
+    }
+    compat_shm_detach(shmid);
+    0
+}
+
+fn sys_shmctl(shmid: usize, cmd: usize, _buf: usize) -> isize {
+    if cmd != IPC_RMID {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    match compat_shm_mark_removed(shmid as i32) {
+        Ok(()) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
 fn sys_mprotect(_process: &UserProcess, _addr: usize, _len: usize, _prot: usize) -> isize {
     if _len == 0 {
         return neg_errno(LinuxError::EINVAL);
@@ -3735,7 +4511,28 @@ fn sys_rt_sigreturn(process: &UserProcess) -> isize {
         *ext.pending_sigreturn.lock() = Some(restored);
         0
     }
-    #[cfg(not(target_arch = "riscv64"))]
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let Some(ext) = current_task_ext() else {
+            return neg_errno(LinuxError::EINVAL);
+        };
+        let frame_addr = ext.signal_frame.load(Ordering::Acquire);
+        if frame_addr == 0 {
+            return neg_errno(LinuxError::EINVAL);
+        }
+        let frame = match read_user_value::<LoongArchSignalFrame>(process, frame_addr) {
+            Ok(frame) => frame,
+            Err(err) => return neg_errno(err),
+        };
+        let Some(restored) = ext.pending_sigreturn.lock().take() else {
+            return neg_errno(LinuxError::EINVAL);
+        };
+        ext.signal_mask.store(frame.saved_mask, Ordering::Release);
+        ext.signal_frame.store(0, Ordering::Release);
+        *ext.pending_sigreturn.lock() = Some(restored);
+        0
+    }
+    #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
     {
         let _ = process;
         neg_errno(LinuxError::ENOSYS)
@@ -3788,6 +4585,46 @@ fn sys_rt_sigprocmask(
         ext.signal_mask.store(next_mask, Ordering::Release);
     }
     0
+}
+
+fn sys_rt_sigsuspend(process: &UserProcess, mask: usize, sigsetsize: usize) -> isize {
+    let Some(ext) = current_task_ext() else {
+        return neg_errno(LinuxError::EINVAL);
+    };
+    if mask == 0 {
+        return neg_errno(LinuxError::EFAULT);
+    }
+    if sigsetsize != 0 && sigsetsize < KERNEL_SIGSET_BYTES {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let Some(src) = user_bytes(process, mask, KERNEL_SIGSET_BYTES, false) else {
+        return neg_errno(LinuxError::EFAULT);
+    };
+    let mut set_bytes = [0u8; KERNEL_SIGSET_BYTES];
+    set_bytes.copy_from_slice(src);
+    let child_exit_seq = process.child_exit_seq.load(Ordering::Acquire);
+    let old_mask = ext
+        .signal_mask
+        .swap(u64::from_ne_bytes(set_bytes), Ordering::AcqRel);
+    ext.sigsuspend_active.store(true, Ordering::Release);
+
+    ext.signal_wait.wait_until(|| {
+        has_unblocked_pending_signal(ext)
+            || (!signal_is_blocked(ext, SIGCHLD_NUM as i32)
+                && (process.has_exited_child()
+                    || process.child_exit_seq.load(Ordering::Acquire) != child_exit_seq))
+    });
+    if ext.pending_signal.load(Ordering::Acquire) == 0
+        && !signal_is_blocked(ext, SIGCHLD_NUM as i32)
+        && (process.has_exited_child()
+            || process.child_exit_seq.load(Ordering::Acquire) != child_exit_seq)
+    {
+        ext.pending_signal
+            .store(SIGCHLD_NUM as i32, Ordering::Release);
+    }
+    ext.sigsuspend_active.store(false, Ordering::Release);
+    ext.signal_mask.store(old_mask, Ordering::Release);
+    neg_errno(LinuxError::EINTR)
 }
 
 fn sys_rt_sigtimedwait(
@@ -4079,6 +4916,24 @@ fn read_execve_argv(
         argv.push(default_argv0.into());
     }
     Ok(argv)
+}
+
+fn read_execve_envp(process: &UserProcess, envp_ptr: usize) -> Result<Vec<String>, LinuxError> {
+    const MAX_ENVC: usize = 256;
+
+    if envp_ptr == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut envp = Vec::new();
+    for idx in 0..MAX_ENVC {
+        let item_ptr = read_user_word(process, envp_ptr + idx * size_of::<usize>())?;
+        if item_ptr == 0 {
+            break;
+        }
+        envp.push(read_cstr(process, item_ptr)?);
+    }
+    Ok(envp)
 }
 
 fn current_cwd() -> String {
@@ -4608,6 +5463,10 @@ impl FdTable {
         Ok(())
     }
 
+    fn close_all(&mut self) {
+        self.entries.clear();
+    }
+
     fn close_cloexec(&mut self) {
         for slot in &mut self.entries {
             if slot.as_ref().is_some_and(|slot| slot.fd_flags.cloexec()) {
@@ -4636,6 +5495,14 @@ impl FdTable {
         }
     }
 
+    fn sync(&mut self, fd: i32) -> Result<(), LinuxError> {
+        match self.entry(fd)? {
+            FdEntry::File(desc) => desc.sync_file(),
+            FdEntry::DevNull => Ok(()),
+            _ => Err(LinuxError::EINVAL),
+        }
+    }
+
     fn file_status_flags(&self, fd: i32) -> Result<u32, LinuxError> {
         match self.entry(fd)? {
             FdEntry::File(desc) | FdEntry::Directory(desc) => Ok(desc.status_flags.lock().raw()),
@@ -4656,18 +5523,20 @@ impl FdTable {
                 desc.status_flags.lock().set_raw(flags);
                 Ok(())
             }
-            FdEntry::Pipe(_) | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr | FdEntry::DevNull => Ok(()),
+            FdEntry::Pipe(_)
+            | FdEntry::Stdin
+            | FdEntry::Stdout
+            | FdEntry::Stderr
+            | FdEntry::DevNull => Ok(()),
         }
     }
 
     fn fcntl(&mut self, fd: i32, cmd: u32, arg: usize) -> Result<i32, LinuxError> {
         let _ = self.slot(fd)?;
         match cmd {
-            general::F_DUPFD => self.dup_min_with_flags(
-                fd,
-                arg as i32,
-                crate::linux_fs::FdFlags::empty(),
-            ),
+            general::F_DUPFD => {
+                self.dup_min_with_flags(fd, arg as i32, crate::linux_fs::FdFlags::empty())
+            }
             general::F_DUPFD_CLOEXEC => {
                 let mut fd_flags = crate::linux_fs::FdFlags::empty();
                 fd_flags.set_cloexec(true);

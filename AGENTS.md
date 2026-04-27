@@ -91,6 +91,22 @@ RISC-V64 and LoongArch64. Use the workspace-root test wrappers, stop only QEMU
 after the relevant `basic` section if needed, and parse saved logs with
 `testsuits-for-oskernel/basic/user/src/oscomp/test_runner.py`.
 
+## Design/Behavior Change Logging Rule
+
+Any design decision or behavior-affecting code change must be recorded in
+`doc/logs` (Chinese preferred) before or immediately after implementation.
+
+Each log entry must include:
+
+- Date/time
+- Scope and objective
+- Files changed and call-paths/entry points affected
+- Decision rationale and tradeoff notes
+- Validation commands/results (including RV/LA and workload slice when applicable)
+- Open risks and next action
+
+Do not use commit messages as the only record.
+
 ## Coding Style & Naming Conventions
 
 Follow standard Rust formatting through `cargo fmt`. Keep names consistent: Rust crates use `ax*` prefixes, modules are snake_case, and Make options are uppercase (`ARCH`, `A`, `FEATURES`, `APP_FEATURES`). Prefer `no_std`-friendly code in kernel and library crates. Keep unsafe code narrow and document non-obvious invariants.

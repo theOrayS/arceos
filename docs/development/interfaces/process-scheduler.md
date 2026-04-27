@@ -73,8 +73,9 @@ Required semantics:
   raw task ids.
 - `clone` decides whether memory, fd table, cwd/fs state, and signal handlers
   are shared or copied.
-- `execve` closes `FD_CLOEXEC` fds and replaces memory atomically from the
-  caller's point of view.
+- `execve` builds the new initial stack with `argv`, `envp`, and auxv, closes
+  `FD_CLOEXEC` fds, and replaces memory atomically from the caller's point of
+  view.
 
 ## Minimum Clone Boundary
 
@@ -106,13 +107,29 @@ Rejected modes:
 
 ## Exit And Wait
 
-- exit transitions `Running -> Zombie`, releases lifecycle locks, wakes
-  waiters, handles `clear_child_tid`, then releases task-local resources.
+- exit transitions `Running -> Zombie`, closes process fd slots, releases
+  lifecycle locks, wakes waiters, handles `clear_child_tid`, then releases
+  task-local resources.
 - wait observes `Running -> Zombie -> Reaped`.
 - only one waiter can reap a child.
 - `WNOHANG` with no exited child returns 0.
 - unsupported wait options return `EINVAL`.
 - no matching child returns `ECHILD`.
+
+## Current Signal Subset
+
+- `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, and `rt_sigsuspend` exist
+  as a benchmark-oriented subset, not a complete POSIX signal model.
+- `ITIMER_REAL` is implemented through `compat_itimer_real_*`: the user-return
+  hook polls the process deadline and posts `SIGALRM` to the current user
+  thread.
+- RISC-V and LoongArch64 both have signal-frame injection paths for the current
+  shell workload. The LoongArch64 frame is intentionally minimal: it saves the
+  old signal mask, enters the user handler with `(sig, siginfo, ucontext)`, and
+  returns through an on-stack `rt_sigreturn` trampoline.
+- Child exit wakeups are narrow: `SIGCHLD` is made pending only for a parent
+  thread actively blocked in `rt_sigsuspend` with `SIGCHLD` unmasked. Normal
+  reaping remains owned by `wait4`.
 
 ## Scheduler And Time Interaction
 

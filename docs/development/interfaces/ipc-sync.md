@@ -35,6 +35,8 @@ Also read:
 - A syscall may look up an `Arc` to the backend object, release high-level
   locks, then block on the backend.
 - `pipe2` creates read and write endpoints that share buffer state.
+- Empty pipe reads and full pipe writes block on pipe-local wait queues rather
+  than busy-yielding inside the syscall path.
 - closing the last write endpoint wakes readers; closing the last read endpoint
   makes writers fail with `EPIPE` when signal behavior exists.
 - `select/poll/epoll` readiness must consult backend readiness, not just fd

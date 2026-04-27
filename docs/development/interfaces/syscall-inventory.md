@@ -48,23 +48,23 @@ Status values:
 | `fchdir` | 50 | none | Missing | busybox, LTP | n/a | syscall/fd/path | Add once directory fd model is stable. |
 | `openat` | 56 | `sys_openat` | Real-partial | basic, busybox, iozone, lmbench, LTP | medium | syscall/fd/path/fs | Complete flags, mode, path resolver, OFD model. |
 | `close` | 57 | `sys_close` | Real-partial | all | medium | syscall/fd | Slot removal only; backend lifetime via OFD `Arc`. |
-| `pipe2` | 59 | `sys_pipe2` | Real-partial | basic, UnixBench, lmbench, nptl | medium | syscall/fd/ipc | Add flags, blocking semantics, close wakeups. |
+| `pipe2` | 59 | `sys_pipe2` | Real-partial | basic, UnixBench, lmbench, nptl | medium | syscall/fd/ipc | Blocks empty reads/full writes on pipe wait queues and wakes on close; add flags, `O_NONBLOCK`, and full poll semantics. |
 | `getdents64` | 61 | `sys_getdents64` | Real-partial | basic, busybox `find`, LTP | medium | syscall/fd/fs | Store directory offset in OFD. |
 | `lseek` | 62 | `sys_lseek` | Real-partial | busybox, iozone, lmbench | medium | syscall/fd/fs | Use shared OFD offset; reject nonseekable fds. |
 | `read` | 63 | `sys_read` | Real-partial | all | medium | syscall/fd | Validate fd before user buffer; use OFD offset. |
 | `write` | 64 | `sys_write` | Real-partial | all | medium | syscall/fd | Add `O_APPEND`, short writes, pipe close errors. |
-| `readv` | 65 | `sys_readv` | Partial | busybox, iozone, nptl | low | syscall/fd | Match partial iovec and fault ordering. |
-| `writev` | 66 | `sys_writev` | Partial | busybox, iozone, nptl | low | syscall/fd | Same as `readv`. |
-| `pread64` | 67 | `sys_pread64` | Partial | iozone, lmbench | medium | syscall/fd/fs | Explicit offset must not alter OFD offset. |
-| `pwrite64` | 68 | none | Missing | iozone, UnixBench | n/a | syscall/fd/fs | Add offset write backend. |
-| `preadv` | 69 | none | Missing | iozone | n/a | syscall/fd/fs | Add after scalar pread/pwrite semantics. |
-| `pwritev` | 70 | none | Missing | iozone | n/a | syscall/fd/fs | Add after scalar pread/pwrite semantics. |
+| `readv` | 65 | `sys_readv` | Partial | busybox, iozone, nptl | low | syscall/fd | Uses shared iovec loader; continue refining full partial-iovec errno matrix. |
+| `writev` | 66 | `sys_writev` | Partial | busybox, iozone, nptl | low | syscall/fd | Uses shared iovec loader; continue refining full partial-iovec errno matrix. |
+| `pread64` | 67 | `sys_pread64` | Real-partial | iozone, lmbench | medium | syscall/fd/fs | Uses explicit-offset backend read without altering shared OFD offset. |
+| `pwrite64` | 68 | `sys_pwrite64` | Real-partial | iozone, UnixBench | medium | syscall/fd/fs | Uses explicit-offset backend write without altering shared OFD offset. |
+| `preadv` | 69 | `sys_preadv` | Real-partial | iozone | medium | syscall/fd/fs | Vector read uses explicit offset and shared iovec loader; `preadv2` flags remain separate future work. |
+| `pwritev` | 70 | `sys_pwritev` | Real-partial | iozone | medium | syscall/fd/fs | Vector write uses explicit offset and shared iovec loader; `pwritev2` flags remain separate future work. |
 | `sendfile` | 71 | none | Missing | busybox/coreutils possible | n/a | syscall/fd/fs | Defer; return `ENOSYS` until needed. |
 | `pselect6` | 72 | `sys_pselect6` | Partial | busybox, lmbench select | low | syscall/fd/signal | Finish readiness and signal mask semantics. |
 | `readlinkat` | 78 | none | Missing | busybox, LTP symlink | n/a | path/fs | Defer symlink support; return consistent errno. |
 | `sync` | 81 | none | Missing | busybox, LTP | n/a | fs | Add global flush or explicit `ENOSYS`. |
-| `fsync` | 82 | none | Missing | iozone, UnixBench, LTP | n/a | syscall/fd/fs | Wire to backend `flush`. |
-| `fdatasync` | 83 | none | Missing | iozone, LTP | n/a | syscall/fd/fs | Same as `fsync`, data-only if supported. |
+| `fsync` | 82 | `sys_fsync` | Compat/partial | iozone, UnixBench, LTP | low | syscall/fd/fs | Calls backend `flush`; `compat_sync_unsupported_flush` treats unsupported synchronous-write backends as already clean. |
+| `fdatasync` | 83 | `sys_fdatasync` | Compat/partial | iozone, LTP | low | syscall/fd/fs | Same as `fsync` until backends distinguish data-only sync. |
 | `utimensat` | 88 | `sys_utimensat` | Compat/partial | busybox, LTP | low | fs/path | Add timestamp metadata or bounded errors. |
 | `exit` | 93 | `sys_exit` | Real-partial | all process tests | medium | task/syscall | Separate thread exit and process exit. |
 | `exit_group` | 94 | `sys_exit_group` | Real-partial | libc/nptl | medium | task/syscall | Finish thread-group teardown. |
@@ -74,6 +74,7 @@ Status values:
 | `set_robust_list` | 99 | `sys_set_robust_list` | Partial | nptl | low | task/futex | Implement robust-list exit handling. |
 | `get_robust_list` | 100 | `sys_get_robust_list` | Partial | nptl, LTP | low | task/futex | Validate pid/tid model. |
 | `nanosleep` | 101 | `sys_nanosleep` | Real-partial | basic sleep, busybox | medium | task/time | Add signal interruption behavior. |
+| `setitimer` | 103 | `sys_setitimer` | Compat/partial | UnixBench `fstime`, LTP timers | low | time/signal | `compat_itimer_real_*` supports `ITIMER_REAL` deadline polling on user return and SIGALRM delivery; RISC-V and LoongArch64 have current benchmark signal-frame paths. |
 | `clock_gettime` | 113 | `sys_clock_gettime` | Real-partial | busybox, cyclictest | medium | time | Ensure clock ids and precision. |
 | `clock_nanosleep` | 115 | `sys_clock_nanosleep` | Partial | cyclictest | low | task/time | Add absolute sleeps and interruption. |
 | `sched_setparam` | 118 | `sys_sched_setparam` | Partial | cyclictest, LTP sched | low | task/sched | Map to scheduler or reject unsupported policy. |
@@ -84,20 +85,21 @@ Status values:
 | `sched_getaffinity` | 123 | `sys_sched_getaffinity` | Partial | LTP sched | low | task/sched | Same. |
 | `sched_yield` | 124 | `sys_sched_yield` | Real-partial | basic yield, UnixBench | medium | task | Keep simple; add signal interactions later. |
 | `kill/tkill/tgkill` | 129/130/131 | `sys_kill/sys_tkill/sys_tgkill` | Partial | nptl, lmbench sig, LTP | low | task/signal | Finish pid/tid lookup and delivery. |
+| `rt_sigsuspend` | 133 | `sys_rt_sigsuspend` | Partial | busybox shell, UnixBench `multi.sh` | low | signal/task | Swaps the signal mask and sleeps on the task signal wait queue; child-exit `SIGCHLD` wakeup is limited to active sigsuspend waits. |
 | `rt_sigaction` | 134 | `sys_rt_sigaction` | Partial | nptl, busybox | low | signal | Complete flags, restorer, masks. |
 | `rt_sigprocmask` | 135 | `sys_rt_sigprocmask` | Partial | nptl | low | signal | Finish thread-local masks. |
 | `rt_sigtimedwait` | 137 | `sys_rt_sigtimedwait` | Partial | LTP signal | low | signal | Define pending signal queue. |
-| `rt_sigreturn` | 139 | `sys_rt_sigreturn` | Partial | signal tests | low | signal | Verify arch frame layout. |
+| `rt_sigreturn` | 139 | `sys_rt_sigreturn` | Partial | signal tests, UnixBench timers | low | signal | Restores the saved trap frame for RISC-V and LoongArch64 benchmark signal frames; full Linux frame layout remains future work. |
 | `times` | 153 | `sys_times` | Partial | basic, UnixBench | medium | time/task | Fill process CPU times. |
 | `getrusage` | 165 | `sys_getrusage` | Partial | wait4, UnixBench | low | task/time | Add child/self resource accounting. |
 | `gettimeofday` | 169 | `sys_gettimeofday` | Real-partial | busybox, lmbench | medium | time | Confirm timezone behavior. |
 | `getpid/getppid/gettid` | 172/173/178 | inline | Partial | basic, all process tests | medium | task/process | Separate pid/tgid/tid. |
-| `shmget/shmctl/shmat/shmdt` | 194-197 | none | Missing | LTP mm/ipc | n/a | mm/ipc | Add shared-memory object model or return `ENOSYS`. |
+| `shmget/shmctl/shmat/shmdt` | 194-197 | `sys_shmget/sys_shmctl/sys_shmat/sys_shmdt` | Compat/partial | iozone, LTP mm/ipc | low | mm/ipc | `compat_shm_*` supports private anonymous segments, attach, detach, and `IPC_RMID`; keyed shm and explicit attach flags are rejected. |
 | `brk` | 214 | `sys_brk` | Partial | basic, libcbench | medium | mm/syscall | Move heap into VMA model. |
 | `munmap` | 215 | `sys_munmap` | Partial | basic, libcbench, LTP | medium | mm/syscall | Use VMA splitting/merging. |
 | `mremap` | 216 | none | Missing | LTP mm | n/a | mm | Add after VMA model. |
 | `clone` | 220 | `sys_clone` | Partial | basic, nptl, UnixBench, lmbench | low | task/mm/fd | Freeze supported flags; reject rest deterministically. |
-| `execve` | 221 | `sys_execve` | Real-partial | basic, busybox shell, UnixBench | medium | task/loader/fd | Closes `FD_CLOEXEC` slots after successful image load; atomic replacement remains incomplete. |
+| `execve` | 221 | `sys_execve` | Real-partial | basic, busybox shell, UnixBench | medium | task/loader/fd | Builds `argv/envp/auxv` initial stack and closes `FD_CLOEXEC` slots after successful image load; atomic replacement remains incomplete. |
 | `mmap` | 222 | `sys_mmap` | Partial | basic, libcbench, iozone, lmbench | low | mm/fs/fd | Replace eager file read with VMA file mapping. |
 | `mprotect` | 226 | `sys_mprotect` | Partial | libc, nptl, LTP | low | mm | Use VMA permissions and splitting. |
 | `msync` | 227 | none | Missing | mmap IO, LTP | n/a | mm/fs | Add after file-backed mapping. |
