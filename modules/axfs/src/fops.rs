@@ -1,8 +1,10 @@
 //! Low-level filesystem operations.
 
+use alloc::sync::Arc;
 use axerrno::{AxError, AxResult, ax_err, ax_err_type};
 use axfs_vfs::{VfsError, VfsNodeRef};
 use axio::SeekFrom;
+use axsync::Mutex;
 use cap_access::{Cap, WithCap};
 use core::fmt;
 
@@ -22,37 +24,38 @@ pub type FilePerm = axfs_vfs::VfsNodePerm;
 
 /// An opened file object, with open permissions and a cursor.
 pub struct File {
-    node: WithCap<VfsNodeRef>,
-    is_append: bool,
-    offset: u64,
+    state: Arc<Mutex<FileState>>,
 }
 
 /// An opened directory object, with open permissions and a cursor for
 /// [`read_dir`](Directory::read_dir).
 pub struct Directory {
+    state: Arc<Mutex<DirectoryState>>,
+}
+
+struct FileState {
+    node: WithCap<VfsNodeRef>,
+    is_append: bool,
+    offset: u64,
+}
+
+struct DirectoryState {
     node: WithCap<VfsNodeRef>,
     entry_idx: usize,
 }
 
 impl Clone for File {
     fn clone(&self) -> Self {
-        let node = unsafe { self.node.access_unchecked() }.clone();
-        node.open().expect("failed to reopen cloned file node");
         Self {
-            node: WithCap::new(node, self.node.cap()),
-            is_append: self.is_append,
-            offset: self.offset,
+            state: self.state.clone(),
         }
     }
 }
 
 impl Clone for Directory {
     fn clone(&self) -> Self {
-        let node = unsafe { self.node.access_unchecked() }.clone();
-        node.open().expect("failed to reopen cloned directory node");
         Self {
-            node: WithCap::new(node, self.node.cap()),
-            entry_idx: self.entry_idx,
+            state: self.state.clone(),
         }
     }
 }
@@ -141,10 +144,6 @@ impl OpenOptions {
 }
 
 impl File {
-    fn access_node(&self, cap: Cap) -> AxResult<&VfsNodeRef> {
-        self.node.access_or_err(cap, AxError::PermissionDenied)
-    }
-
     fn _open_at(dir: Option<&VfsNodeRef>, path: &str, opts: &OpenOptions) -> AxResult<Self> {
         debug!("open file: {} {:?}", path, opts);
         if !opts.is_valid() {
@@ -186,9 +185,11 @@ impl File {
             node.truncate(0)?;
         }
         Ok(Self {
-            node: WithCap::new(node, access_cap),
-            is_append: opts.append,
-            offset: 0,
+            state: Arc::new(Mutex::new(FileState {
+                node: WithCap::new(node, access_cap),
+                is_append: opts.append,
+                offset: 0,
+            })),
         })
     }
 
@@ -200,7 +201,7 @@ impl File {
 
     /// Truncates the file to the specified size.
     pub fn truncate(&self, size: u64) -> AxResult {
-        self.access_node(Cap::WRITE)?.truncate(size)?;
+        self.state.lock().access_node(Cap::WRITE)?.truncate(size)?;
         Ok(())
     }
 
@@ -209,9 +210,13 @@ impl File {
     ///
     /// After the read, the cursor will be advanced by the number of bytes read.
     pub fn read(&mut self, buf: &mut [u8]) -> AxResult<usize> {
-        let node = self.access_node(Cap::READ)?;
-        let read_len = node.read_at(self.offset, buf)?;
-        self.offset += read_len as u64;
+        let mut state = self.state.lock();
+        let offset = state.offset;
+        let read_len = {
+            let node = state.access_node(Cap::READ)?;
+            node.read_at(offset, buf)?
+        };
+        state.offset = offset + read_len as u64;
         Ok(read_len)
     }
 
@@ -219,7 +224,8 @@ impl File {
     ///
     /// It does not update the file cursor.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> AxResult<usize> {
-        let node = self.access_node(Cap::READ)?;
+        let state = self.state.lock();
+        let node = state.access_node(Cap::READ)?;
         let read_len = node.read_at(offset, buf)?;
         Ok(read_len)
     }
@@ -230,14 +236,18 @@ impl File {
     /// After the write, the cursor will be advanced by the number of bytes
     /// written.
     pub fn write(&mut self, buf: &[u8]) -> AxResult<usize> {
-        let offset = if self.is_append {
-            self.get_attr()?.size()
+        let mut state = self.state.lock();
+        let offset = if state.is_append {
+            let node = state.access_node(Cap::empty())?;
+            node.get_attr()?.size()
         } else {
-            self.offset
+            state.offset
         };
-        let node = self.access_node(Cap::WRITE)?;
-        let write_len = node.write_at(offset, buf)?;
-        self.offset = offset + write_len as u64;
+        let write_len = {
+            let node = state.access_node(Cap::WRITE)?;
+            node.write_at(offset, buf)?
+        };
+        state.offset = offset + write_len as u64;
         Ok(write_len)
     }
 
@@ -246,42 +256,48 @@ impl File {
     ///
     /// It does not update the file cursor.
     pub fn write_at(&self, offset: u64, buf: &[u8]) -> AxResult<usize> {
-        let node = self.access_node(Cap::WRITE)?;
+        let state = self.state.lock();
+        let node = state.access_node(Cap::WRITE)?;
         let write_len = node.write_at(offset, buf)?;
         Ok(write_len)
     }
 
     /// Flushes the file, writes all buffered data to the underlying device.
     pub fn flush(&self) -> AxResult {
-        self.access_node(Cap::WRITE)?.fsync()?;
-        Ok(())
+        match self.state.lock().access_node(Cap::WRITE)?.fsync() {
+            Ok(()) => Ok(()),
+            Err(err) => match err {
+                AxError::InvalidInput | AxError::Unsupported => Ok(()),
+                _ => Err(err),
+            },
+        }
     }
 
     /// Sets the cursor of the file to the specified offset. Returns the new
     /// position after the seek.
     pub fn seek(&mut self, pos: SeekFrom) -> AxResult<u64> {
-        let size = self.get_attr()?.size();
+        let mut state = self.state.lock();
+        let size = {
+            let node = state.access_node(Cap::empty())?;
+            node.get_attr()?.size()
+        };
         let new_offset = match pos {
             SeekFrom::Start(pos) => Some(pos),
-            SeekFrom::Current(off) => self.offset.checked_add_signed(off),
+            SeekFrom::Current(off) => state.offset.checked_add_signed(off),
             SeekFrom::End(off) => size.checked_add_signed(off),
         }
         .ok_or_else(|| ax_err_type!(InvalidInput))?;
-        self.offset = new_offset;
+        state.offset = new_offset;
         Ok(new_offset)
     }
 
     /// Gets the file attributes.
     pub fn get_attr(&self) -> AxResult<FileAttr> {
-        self.access_node(Cap::empty())?.get_attr()
+        self.state.lock().access_node(Cap::empty())?.get_attr()
     }
 }
 
 impl Directory {
-    fn access_node(&self, cap: Cap) -> AxResult<&VfsNodeRef> {
-        self.node.access_or_err(cap, AxError::PermissionDenied)
-    }
-
     fn _open_dir_at(dir: Option<&VfsNodeRef>, path: &str, opts: &OpenOptions) -> AxResult<Self> {
         debug!("open dir: {}", path);
         if !opts.read {
@@ -303,16 +319,18 @@ impl Directory {
 
         node.open()?;
         Ok(Self {
-            node: WithCap::new(node, access_cap),
-            entry_idx: 0,
+            state: Arc::new(Mutex::new(DirectoryState {
+                node: WithCap::new(node, access_cap),
+                entry_idx: 0,
+            })),
         })
     }
 
-    fn access_at(&self, path: &str) -> AxResult<Option<&VfsNodeRef>> {
+    fn access_at(&self, path: &str) -> AxResult<Option<VfsNodeRef>> {
         if path.starts_with('/') {
             Ok(None)
         } else {
-            Ok(Some(self.access_node(Cap::EXECUTE)?))
+            Ok(Some(self.state.lock().access_node(Cap::EXECUTE)?.clone()))
         }
     }
 
@@ -325,33 +343,39 @@ impl Directory {
     /// Opens a directory at the path relative to this directory. Returns a
     /// [`Directory`] object.
     pub fn open_dir_at(&self, path: &str, opts: &OpenOptions) -> AxResult<Self> {
-        Self::_open_dir_at(self.access_at(path)?, path, opts)
+        let dir = self.access_at(path)?;
+        Self::_open_dir_at(dir.as_ref(), path, opts)
     }
 
     /// Opens a file at the path relative to this directory. Returns a [`File`]
     /// object.
     pub fn open_file_at(&self, path: &str, opts: &OpenOptions) -> AxResult<File> {
-        File::_open_at(self.access_at(path)?, path, opts)
+        let dir = self.access_at(path)?;
+        File::_open_at(dir.as_ref(), path, opts)
     }
 
     /// Creates an empty file at the path relative to this directory.
     pub fn create_file(&self, path: &str) -> AxResult<VfsNodeRef> {
-        crate::root::create_file(self.access_at(path)?, path)
+        let dir = self.access_at(path)?;
+        crate::root::create_file(dir.as_ref(), path)
     }
 
     /// Creates an empty directory at the path relative to this directory.
     pub fn create_dir(&self, path: &str) -> AxResult {
-        crate::root::create_dir(self.access_at(path)?, path)
+        let dir = self.access_at(path)?;
+        crate::root::create_dir(dir.as_ref(), path)
     }
 
     /// Removes a file at the path relative to this directory.
     pub fn remove_file(&self, path: &str) -> AxResult {
-        crate::root::remove_file(self.access_at(path)?, path)
+        let dir = self.access_at(path)?;
+        crate::root::remove_file(dir.as_ref(), path)
     }
 
     /// Removes a directory at the path relative to this directory.
     pub fn remove_dir(&self, path: &str) -> AxResult {
-        crate::root::remove_dir(self.access_at(path)?, path)
+        let dir = self.access_at(path)?;
+        crate::root::remove_dir(dir.as_ref(), path)
     }
 
     /// Reads directory entries starts from the current position into the
@@ -360,10 +384,13 @@ impl Directory {
     /// After the read, the cursor will be advanced by the number of entries
     /// read.
     pub fn read_dir(&mut self, dirents: &mut [DirEntry]) -> AxResult<usize> {
-        let n = self
-            .access_node(Cap::READ)?
-            .read_dir(self.entry_idx, dirents)?;
-        self.entry_idx += n;
+        let mut state = self.state.lock();
+        let start_idx = state.entry_idx;
+        let n = {
+            let node = state.access_node(Cap::READ)?;
+            node.read_dir(start_idx, dirents)?
+        };
+        state.entry_idx = start_idx + n;
         Ok(n)
     }
 
@@ -376,13 +403,25 @@ impl Directory {
     }
 }
 
-impl Drop for File {
+impl FileState {
+    fn access_node(&self, cap: Cap) -> AxResult<&VfsNodeRef> {
+        self.node.access_or_err(cap, AxError::PermissionDenied)
+    }
+}
+
+impl DirectoryState {
+    fn access_node(&self, cap: Cap) -> AxResult<&VfsNodeRef> {
+        self.node.access_or_err(cap, AxError::PermissionDenied)
+    }
+}
+
+impl Drop for FileState {
     fn drop(&mut self) {
         unsafe { self.node.access_unchecked().release().ok() };
     }
 }
 
-impl Drop for Directory {
+impl Drop for DirectoryState {
     fn drop(&mut self) {
         unsafe { self.node.access_unchecked().release().ok() };
     }

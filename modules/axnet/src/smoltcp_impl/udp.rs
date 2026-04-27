@@ -1,3 +1,4 @@
+use core::cell::UnsafeCell;
 use core::net::SocketAddr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,11 +16,13 @@ use super::{SOCKET_SET, SocketSetWrapper};
 
 /// A UDP socket that provides POSIX-like APIs.
 pub struct UdpSocket {
-    handle: SocketHandle,
+    handle: UnsafeCell<SocketHandle>,
     local_addr: RwLock<Option<IpEndpoint>>,
     peer_addr: RwLock<Option<IpEndpoint>>,
     nonblock: AtomicBool,
 }
+
+unsafe impl Sync for UdpSocket {}
 
 impl UdpSocket {
     /// Creates a new UDP socket.
@@ -28,7 +31,7 @@ impl UdpSocket {
         let socket = SocketSetWrapper::new_udp_socket();
         let handle = SOCKET_SET.add(socket);
         Self {
-            handle,
+            handle: UnsafeCell::new(handle),
             local_addr: RwLock::new(None),
             peer_addr: RwLock::new(None),
             nonblock: AtomicBool::new(false),
@@ -88,7 +91,7 @@ impl UdpSocket {
             addr: (!local_endpoint.addr.is_unspecified()).then_some(local_endpoint.addr),
             port: local_endpoint.port,
         };
-        SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
+        SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle(), |socket| {
             socket.bind(endpoint).or_else(|e| match e {
                 BindError::InvalidState => ax_err!(AlreadyExists, "socket bind() failed"),
                 BindError::Unaddressable => ax_err!(InvalidInput, "socket bind() failed"),
@@ -96,7 +99,14 @@ impl UdpSocket {
         })?;
 
         *self_local_addr = Some(local_endpoint);
-        debug!("UDP socket {}: bound on {}", self.handle, endpoint);
+        debug!("UDP socket {}: bound on {}", self.handle(), endpoint);
+        Ok(())
+    }
+
+    fn ensure_bound(&self) -> AxResult {
+        if self.local_addr.read().is_none() {
+            self.bind(SocketAddr::from(UNSPECIFIED_ENDPOINT))?;
+        }
         Ok(())
     }
 
@@ -106,6 +116,7 @@ impl UdpSocket {
         if remote_addr.port() == 0 || remote_addr.ip().is_unspecified() {
             return ax_err!(InvalidInput, "socket send_to() failed: invalid address");
         }
+        self.ensure_bound()?;
         self.send_impl(buf, IpEndpoint::from(remote_addr))
     }
 
@@ -137,12 +148,28 @@ impl UdpSocket {
     pub fn connect(&self, addr: SocketAddr) -> AxResult {
         let mut self_peer_addr = self.peer_addr.write();
 
-        if self.local_addr.read().is_none() {
-            self.bind(SocketAddr::from(UNSPECIFIED_ENDPOINT))?;
-        }
+        self.ensure_bound()?;
 
+        let local_endpoint = self.local_addr.read().ok_or(AxError::NotConnected)?;
+        let endpoint = IpListenEndpoint {
+            addr: (!local_endpoint.addr.is_unspecified()).then_some(local_endpoint.addr),
+            port: local_endpoint.port,
+        };
+        let old_handle = self.handle();
+        let new_handle = SOCKET_SET.add(SocketSetWrapper::new_udp_socket());
+        if let Err(err) = SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(new_handle, |socket| {
+            socket.bind(endpoint).or_else(|e| match e {
+                BindError::InvalidState => ax_err!(AlreadyExists, "socket bind() failed"),
+                BindError::Unaddressable => ax_err!(InvalidInput, "socket bind() failed"),
+            })
+        }) {
+            SOCKET_SET.remove(new_handle);
+            return Err(err);
+        }
+        unsafe { self.handle.get().write(new_handle) };
+        SOCKET_SET.remove(old_handle);
         *self_peer_addr = Some(IpEndpoint::from(addr));
-        debug!("UDP socket {}: connected to {}", self.handle, addr);
+        debug!("UDP socket {}: connected to {}", self.handle(), addr);
         Ok(())
     }
 
@@ -173,8 +200,8 @@ impl UdpSocket {
 
     /// Close the socket.
     pub fn shutdown(&self) -> AxResult {
-        SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
-            debug!("UDP socket {}: shutting down", self.handle);
+        SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle(), |socket| {
+            debug!("UDP socket {}: shutting down", self.handle());
             socket.close();
         });
         SOCKET_SET.poll_interfaces();
@@ -183,13 +210,14 @@ impl UdpSocket {
 
     /// Whether the socket is readable or writable.
     pub fn poll(&self) -> AxResult<PollState> {
+        SOCKET_SET.poll_interfaces();
         if self.local_addr.read().is_none() {
             return Ok(PollState {
                 readable: false,
                 writable: false,
             });
         }
-        SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
+        SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle(), |socket| {
             Ok(PollState {
                 readable: socket.can_recv(),
                 writable: socket.can_send(),
@@ -200,6 +228,11 @@ impl UdpSocket {
 
 /// Private methods
 impl UdpSocket {
+    #[inline]
+    fn handle(&self) -> SocketHandle {
+        unsafe { self.handle.get().read() }
+    }
+
     fn remote_endpoint(&self) -> AxResult<IpEndpoint> {
         match self.peer_addr.try_read() {
             Some(addr) => addr.ok_or(AxError::NotConnected),
@@ -213,7 +246,7 @@ impl UdpSocket {
         }
 
         self.block_on(|| {
-            SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
+            SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle(), |socket| {
                 if socket.can_send() {
                     socket
                         .send_slice(buf, remote_endpoint)
@@ -241,7 +274,7 @@ impl UdpSocket {
         }
 
         self.block_on(|| {
-            SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
+            SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle(), |socket| {
                 if socket.can_recv() {
                     // data available
                     op(socket)
@@ -275,7 +308,7 @@ impl UdpSocket {
 impl Drop for UdpSocket {
     fn drop(&mut self) {
         self.shutdown().ok();
-        SOCKET_SET.remove(self.handle);
+        SOCKET_SET.remove(unsafe { self.handle.get().read() });
     }
 }
 

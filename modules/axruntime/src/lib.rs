@@ -21,6 +21,8 @@
 
 #[macro_use]
 extern crate axlog;
+#[cfg(all(feature = "fs", feature = "alloc"))]
+extern crate alloc;
 
 #[cfg(all(target_os = "none", not(test)))]
 mod lang_items;
@@ -85,6 +87,11 @@ impl axlog::LogIf for LogIfImpl {
 }
 
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(all(feature = "fs", feature = "alloc"))]
+use alloc::format;
+#[cfg(all(feature = "fs", feature = "alloc"))]
+use alloc::string::String;
 
 /// Number of CPUs that have completed initialization.
 static INITED_CPUS: AtomicUsize = AtomicUsize::new(0);
@@ -165,7 +172,10 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         let all_devices = axdriver::init_drivers();
 
         #[cfg(feature = "fs")]
-        axfs::init_filesystems(all_devices.block);
+        {
+            axfs::init_filesystems(all_devices.block);
+            init_virtual_fs_nodes();
+        }
 
         #[cfg(feature = "net")]
         axnet::init_network(all_devices.net);
@@ -236,6 +246,72 @@ fn init_allocator() {
                 .expect("add heap memory region failed");
         }
     }
+}
+
+#[cfg(all(feature = "fs", feature = "alloc"))]
+fn init_virtual_fs_nodes() {
+    let files = [
+        ("/proc/mounts", proc_mounts_contents()),
+        ("/proc/meminfo", proc_meminfo_contents()),
+        ("/proc/uptime", proc_uptime_contents()),
+        ("/proc/loadavg", proc_loadavg_contents()),
+    ];
+    for (path, contents) in files {
+        if let Err(err) = axfs::api::write(path, contents.as_bytes()) {
+            debug!("skip initializing {path}: {err:?}");
+        }
+    }
+}
+
+#[cfg(all(feature = "fs", feature = "alloc"))]
+fn proc_mounts_contents() -> String {
+    let mut out = String::new();
+    for mount in axfs::api::mounted_filesystems() {
+        out.push_str(&format!(
+            "{} {} {} {} 0 0\n",
+            mount.source, mount.target, mount.fs_type, mount.options
+        ));
+    }
+    out
+}
+
+#[cfg(all(feature = "fs", feature = "alloc"))]
+fn proc_meminfo_contents() -> String {
+    const KB: u64 = 1024;
+    let total_kb = axhal::mem::total_ram_size() as u64 / KB;
+    #[cfg(feature = "alloc")]
+    let free_kb = (axalloc::global_allocator().available_pages() as u64 * 4096) / KB;
+    #[cfg(not(feature = "alloc"))]
+    let free_kb = total_kb;
+    let available_kb = free_kb;
+    let buffers_kb = 0;
+    let cached_kb = 0;
+    format!(
+        "\
+MemTotal:       {total_kb:>8} kB\n\
+MemFree:        {free_kb:>8} kB\n\
+MemAvailable:   {available_kb:>8} kB\n\
+Buffers:        {buffers_kb:>8} kB\n\
+Cached:         {cached_kb:>8} kB\n\
+SwapCached:            0 kB\n\
+Active:                0 kB\n\
+Inactive:              0 kB\n\
+Shmem:                 0 kB\n\
+SReclaimable:          0 kB\n\
+SwapTotal:             0 kB\n\
+SwapFree:              0 kB\n"
+    )
+}
+
+#[cfg(all(feature = "fs", feature = "alloc"))]
+fn proc_uptime_contents() -> String {
+    let uptime = axhal::time::monotonic_time().as_secs_f64();
+    format!("{uptime:.2} {uptime:.2}\n")
+}
+
+#[cfg(all(feature = "fs", feature = "alloc"))]
+fn proc_loadavg_contents() -> String {
+    "0.00 0.00 0.00 1/1 1\n".into()
 }
 
 #[cfg(feature = "irq")]

@@ -3,6 +3,7 @@ mod stdio;
 pub mod io;
 pub mod resources;
 pub mod sys;
+pub mod system;
 pub mod task;
 pub mod time;
 
@@ -10,7 +11,7 @@ pub mod time;
 pub mod fd_ops;
 #[cfg(feature = "fs")]
 pub mod fs;
-#[cfg(any(feature = "select", feature = "epoll"))]
+#[cfg(any(feature = "select", feature = "epoll", feature = "uspace"))]
 pub mod io_mpx;
 #[cfg(feature = "net")]
 pub mod net;

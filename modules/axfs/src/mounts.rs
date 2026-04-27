@@ -1,19 +1,25 @@
 use alloc::sync::Arc;
-use axfs_vfs::{VfsNodeType, VfsOps, VfsResult};
+use axfs_vfs::{VfsNodeAttr, VfsNodeOps, VfsNodePerm, VfsNodeType, VfsOps, VfsResult};
 
 use crate::fs;
 
 #[cfg(feature = "devfs")]
 pub(crate) fn devfs() -> Arc<fs::devfs::DeviceFileSystem> {
     let null = fs::devfs::NullDev;
+    let rtc = RtcDev;
     let zero = fs::devfs::ZeroDev;
     let urandom = fs::devfs::UrandomDev::default();
     let bar = fs::devfs::ZeroDev;
     let devfs = fs::devfs::DeviceFileSystem::new();
     let foo_dir = devfs.mkdir("foo");
+    let misc_dir = devfs.mkdir("misc");
+    devfs.mkdir("shm");
     devfs.add("null", Arc::new(null));
+    devfs.add("rtc", Arc::new(rtc));
+    devfs.add("rtc0", Arc::new(RtcDev));
     devfs.add("zero", Arc::new(zero));
     devfs.add("urandom", Arc::new(urandom));
+    misc_dir.add("rtc", Arc::new(RtcDev));
     foo_dir.add("bar", Arc::new(bar));
     Arc::new(devfs)
 }
@@ -45,6 +51,10 @@ pub(crate) fn procfs() -> VfsResult<Arc<fs::ramfs::RamFileSystem>> {
     // Create /proc/self/stat
     proc_root.create("self", VfsNodeType::Dir)?;
     proc_root.create("self/stat", VfsNodeType::File)?;
+    proc_root.create("mounts", VfsNodeType::File)?;
+    proc_root.create("meminfo", VfsNodeType::File)?;
+    proc_root.create("uptime", VfsNodeType::File)?;
+    proc_root.create("loadavg", VfsNodeType::File)?;
 
     Ok(Arc::new(procfs))
 }
@@ -79,4 +89,31 @@ pub(crate) fn sysfs() -> VfsResult<Arc<fs::ramfs::RamFileSystem>> {
     file_cc.write_at(0, b"tsc\n")?;
 
     Ok(Arc::new(sysfs))
+}
+
+struct RtcDev;
+
+impl VfsNodeOps for RtcDev {
+    fn get_attr(&self) -> VfsResult<VfsNodeAttr> {
+        Ok(VfsNodeAttr::new(
+            VfsNodePerm::from_bits_truncate(0o660),
+            VfsNodeType::CharDevice,
+            0,
+            0,
+        ))
+    }
+
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> VfsResult<usize> {
+        Ok(0)
+    }
+
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> VfsResult<usize> {
+        Ok(buf.len())
+    }
+
+    fn truncate(&self, _size: u64) -> VfsResult {
+        Ok(())
+    }
+
+    axfs_vfs::impl_vfs_non_dir_default! {}
 }

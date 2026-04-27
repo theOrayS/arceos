@@ -9,51 +9,15 @@ authors = ["Yuekai Jia <equation618@gmail.com>"]
 [features]
 use-ramfs = ["axstd/myfs", "dep:axfs_vfs", "dep:axfs_ramfs", "dep:crate_interface"]
 uspace = [
+    "dep:arceos_posix_api",
     "axstd/fp-simd",
-    "dep:axerrno",
-    "dep:axalloc",
-    "dep:axfs",
-    "dep:axhal",
-    "dep:axio",
-    "dep:axmm",
-    "dep:axns",
-    "dep:axsync",
-    "dep:axtask",
-    "dep:crate_interface",
-    "dep:kspin",
-    "dep:lazyinit",
-    "dep:linkme",
-    "dep:linux-raw-sys",
-    "dep:memory_addr",
-    "dep:xmas-elf",
 ]
 auto-run-tests = []
 default = []
 
 [dependencies]
-arceos_posix_api = { workspace = true, optional = true, features = ["alloc", "multitask", "fd", "fs", "uspace"] }
-axerrno = { version = "0.1", optional = true }
-axalloc = { workspace = true, optional = true }
-axfs = { workspace = true, optional = true }
+arceos_posix_api = { workspace = true, optional = true, features = ["alloc", "multitask", "fd", "fs", "net", "uspace"] }
 axfs_vfs = { version = "0.1", optional = true }
-axhal = { workspace = true, optional = true, features = ["uspace"] }
-axio = { version = "0.2", optional = true }
-axmm = { workspace = true, optional = true }
-axns = { workspace = true, optional = true, features = ["thread-local"] }
 axfs_ramfs = { version = "0.1", optional = true }
-axsync = { workspace = true, optional = true }
-axtask = { workspace = true, optional = true }
 crate_interface = { version = "0.3", optional = true }
 axstd = { workspace = true, features = ["alloc", "fs"], optional = true }
-kspin = { version = "0.2", optional = true }
-lazyinit = { version = "0.2", optional = true }
-linkme = { version = "0.3.35", optional = true }
-linux-raw-sys = { version = "0.12.1", default-features = false, features = ["auxvec", "general", "ioctl", "no_std", "system"], optional = true }
-memory_addr = { version = "0.4", optional = true }
-xmas-elf = { version = "0.10", optional = true }
-
-[target.'cfg(target_arch = "riscv64")'.dependencies]
-riscv = "0.16"
-
-[target.'cfg(target_arch = "loongarch64")'.dependencies]
-loongArch64 = "0.2.4"

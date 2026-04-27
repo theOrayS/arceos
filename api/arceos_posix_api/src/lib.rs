@@ -19,6 +19,9 @@ mod utils;
 
 mod imp;
 
+#[cfg(feature = "uspace")]
+pub mod uspace;
+
 /// Platform-specific constants and parameters.
 pub mod config {
     pub use axconfig::*;

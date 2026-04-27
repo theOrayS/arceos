@@ -51,7 +51,7 @@ UIMAGE ?= n
 
 # Kernel build options
 KERNEL_APP ?= examples/shell
-KERNEL_FEATURES ?= alloc,paging,irq,multitask,fs,net
+KERNEL_FEATURES ?= alloc,paging,irq,multitask,fs,net,sched-rr
 KERNEL_APP_FEATURES ?= auto-run-tests,uspace
 KERNEL_RV_APP_FEATURES ?= $(KERNEL_APP_FEATURES)
 KERNEL_LA_APP_FEATURES ?= $(KERNEL_APP_FEATURES)
@@ -80,7 +80,7 @@ LA_AUX_DISK ?= $(CURDIR)/disk-la.img
 RV_MEM ?= 1G
 LA_MEM ?= 2G
 RV_NETDEV_ARGS ?= user,id=net
-LA_NETDEV_ARGS ?= user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=udp::5555-:5555
+LA_NETDEV_ARGS ?= user,id=net0
 DOCKER_IMAGE ?= orays-arceos-dev
 
 # App options

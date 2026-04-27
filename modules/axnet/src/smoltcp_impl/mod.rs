@@ -5,7 +5,9 @@ mod listen_table;
 mod tcp;
 mod udp;
 
+use alloc::collections::VecDeque;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::ops::DerefMut;
 
@@ -14,8 +16,8 @@ use axdriver_net::{DevError, NetBufPtr};
 use axhal::time::{NANOS_PER_MICROS, wall_time_nanos};
 use axsync::Mutex;
 use lazyinit::LazyInit;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
+use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{self, AnySocket};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
@@ -49,10 +51,14 @@ const TCP_TX_BUF_LEN: usize = 64 * 1024;
 const UDP_RX_BUF_LEN: usize = 64 * 1024;
 const UDP_TX_BUF_LEN: usize = 64 * 1024;
 const LISTEN_QUEUE_SIZE: usize = 512;
+const LOOPBACK_PREFIX: u8 = 8;
+const LOOPBACK_ADDR: [u8; 4] = [127, 0, 0, 1];
+const LOOPBACK_ETHER_ADDR: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
 
 static LISTEN_TABLE: LazyInit<ListenTable> = LazyInit::new();
 static SOCKET_SET: LazyInit<SocketSetWrapper> = LazyInit::new();
 static ETH0: LazyInit<InterfaceWrapper> = LazyInit::new();
+static LOOPBACK: LazyInit<LoopbackInterfaceWrapper> = LazyInit::new();
 
 struct SocketSetWrapper<'a>(Mutex<SocketSet<'a>>);
 
@@ -64,6 +70,16 @@ struct InterfaceWrapper {
     name: &'static str,
     ether_addr: EthernetAddress,
     dev: Mutex<DeviceWrapper>,
+    iface: Mutex<Interface>,
+}
+
+struct LoopbackDevice {
+    queue: VecDeque<Vec<u8>>,
+}
+
+struct LoopbackInterfaceWrapper {
+    name: &'static str,
+    dev: Mutex<LoopbackDevice>,
     iface: Mutex<Interface>,
 }
 
@@ -120,7 +136,12 @@ impl<'a> SocketSetWrapper<'a> {
     }
 
     pub fn poll_interfaces(&self) {
-        ETH0.poll(&self.0);
+        if let Some(loopback) = LOOPBACK.get() {
+            loopback.poll(&self.0);
+        }
+        if let Some(eth0) = ETH0.get() {
+            eth0.poll(&self.0);
+        }
     }
 
     pub fn remove(&self, handle: SocketHandle) {
@@ -177,6 +198,123 @@ impl InterfaceWrapper {
         let mut sockets = sockets.lock();
         let timestamp = Self::current_time();
         iface.poll(timestamp, dev.deref_mut(), &mut sockets);
+    }
+}
+
+impl LoopbackDevice {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+        }
+    }
+}
+
+impl Device for LoopbackDevice {
+    type RxToken<'a>
+        = LoopbackRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = LoopbackTxToken<'a>
+    where
+        Self: 'a;
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        self.queue.pop_front().map(move |buffer| {
+            let rx = LoopbackRxToken { buffer };
+            let tx = LoopbackTxToken {
+                queue: &mut self.queue,
+            };
+            (rx, tx)
+        })
+    }
+
+    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        Some(LoopbackTxToken {
+            queue: &mut self.queue,
+        })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.max_transmission_unit = 65535;
+        caps.medium = Medium::Ethernet;
+        caps.checksum = ChecksumCapabilities::ignored();
+        caps
+    }
+}
+
+struct LoopbackRxToken {
+    buffer: Vec<u8>,
+}
+
+impl RxToken for LoopbackRxToken {
+    fn preprocess(&self, sockets: &mut SocketSet<'_>) {
+        snoop_tcp_packet(&self.buffer, sockets).ok();
+    }
+
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.buffer)
+    }
+}
+
+struct LoopbackTxToken<'a> {
+    queue: &'a mut VecDeque<Vec<u8>>,
+}
+
+impl TxToken for LoopbackTxToken<'_> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buffer = vec![0; len];
+        let result = f(&mut buffer);
+        self.queue.push_back(buffer);
+        result
+    }
+}
+
+impl LoopbackInterfaceWrapper {
+    fn new(name: &'static str) -> Self {
+        let mut dev = LoopbackDevice::new();
+        let config = Config::new(HardwareAddress::Ethernet(LOOPBACK_ETHER_ADDR));
+        let iface = Mutex::new(Interface::new(
+            config,
+            &mut dev,
+            InterfaceWrapper::current_time(),
+        ));
+        Self {
+            name,
+            dev: Mutex::new(dev),
+            iface,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        self.name
+    }
+
+    pub fn setup_ip_addr(&self, ip: IpAddress, prefix_len: u8) {
+        let mut iface = self.iface.lock();
+        iface.update_ip_addrs(|ip_addrs| {
+            ip_addrs.push(IpCidr::new(ip, prefix_len)).unwrap();
+        });
+    }
+
+    pub fn poll(&self, sockets: &Mutex<SocketSet>) {
+        let mut dev = self.dev.lock();
+        let mut iface = self.iface.lock();
+        let mut sockets = sockets.lock();
+        for _ in 0..16 {
+            let timestamp = InterfaceWrapper::current_time();
+            let result = iface.poll(timestamp, dev.deref_mut(), &mut sockets);
+            if result == PollResult::None && dev.queue.is_empty() {
+                break;
+            }
+        }
     }
 }
 
@@ -318,6 +456,15 @@ pub fn bench_receive() {
 }
 
 pub(crate) fn init(net_dev: AxNetDevice) {
+    let loopback_ip = IpAddress::v4(
+        LOOPBACK_ADDR[0],
+        LOOPBACK_ADDR[1],
+        LOOPBACK_ADDR[2],
+        LOOPBACK_ADDR[3],
+    );
+    let loopback = LoopbackInterfaceWrapper::new("lo");
+    loopback.setup_ip_addr(loopback_ip, LOOPBACK_PREFIX);
+
     let ether_addr = EthernetAddress(net_dev.mac_address().0);
     let eth0 = InterfaceWrapper::new("eth0", net_dev, ether_addr);
 
@@ -326,10 +473,14 @@ pub(crate) fn init(net_dev: AxNetDevice) {
     eth0.setup_ip_addr(ip, IP_PREFIX);
     eth0.setup_gateway(gateway);
 
+    LOOPBACK.init_once(loopback);
     ETH0.init_once(eth0);
     SOCKET_SET.init_once(SocketSetWrapper::new());
     LISTEN_TABLE.init_once(ListenTable::new());
 
+    info!("created net interface {:?}:", LOOPBACK.name());
+    info!("  ether:    {}", LOOPBACK_ETHER_ADDR);
+    info!("  ip:       {}/{}", loopback_ip, LOOPBACK_PREFIX);
     info!("created net interface {:?}:", ETH0.name());
     info!("  ether:    {}", ETH0.ethernet_address());
     info!("  ip:       {}/{}", ip, IP_PREFIX);

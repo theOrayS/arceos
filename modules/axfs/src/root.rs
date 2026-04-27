@@ -2,9 +2,11 @@
 //!
 //! TODO: it doesn't work very well if the mount points have containment relationships.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use axerrno::{AxError, AxResult, ax_err};
-use axfs_vfs::{VfsDirEntry, VfsNodeAttr, VfsNodeOps, VfsNodeRef, VfsNodeType, VfsOps, VfsResult};
+use axfs_vfs::{
+    VfsDirEntry, VfsError, VfsNodeAttr, VfsNodeOps, VfsNodeRef, VfsNodeType, VfsOps, VfsResult,
+};
 use axns::{ResArc, def_resource};
 use axsync::Mutex;
 use core::array;
@@ -32,6 +34,26 @@ struct RootDirectory {
 }
 
 static ROOT_DIR: LazyInit<Arc<RootDirectory>> = LazyInit::new();
+static MOUNT_INFOS: LazyInit<Vec<MountInfo>> = LazyInit::new();
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MountFsKind {
+    Fat,
+    Ext4,
+    DevFs,
+    RamFs,
+    ProcFs,
+    SysFs,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MountInfo {
+    pub source: &'static str,
+    pub target: &'static str,
+    pub fs_type: &'static str,
+    pub options: &'static str,
+    pub kind: MountFsKind,
+}
 
 impl MountPoint {
     pub fn new(path: &'static str, fs: Arc<dyn VfsOps>) -> Self {
@@ -171,21 +193,15 @@ impl RootDirectory {
         }
     }
 
-    fn lookup_mounted_fs<F, T>(&self, path: &str, f: F) -> AxResult<T>
-    where
-        F: FnOnce(Arc<dyn VfsOps>, &str) -> AxResult<T>,
-    {
-        debug!("lookup at root: {}", path);
+    fn mounted_fs_and_rest<'a>(&self, path: &'a str) -> (Arc<dyn VfsOps>, &'a str) {
         let path = path.trim_matches('/');
         if let Some(rest) = path.strip_prefix("./") {
-            return self.lookup_mounted_fs(rest, f);
+            return self.mounted_fs_and_rest(rest);
         }
 
         let mut idx = 0;
         let mut max_len = 0;
 
-        // Find the filesystem that has the longest mounted path match
-        // TODO: more efficient, e.g. trie
         for (i, mp) in self.mounts.iter().enumerate() {
             if let Some(matched_len) = Self::mount_match_len(path, mp.path) {
                 if matched_len > max_len {
@@ -196,11 +212,130 @@ impl RootDirectory {
         }
 
         if max_len == 0 {
-            f(self.main_fs.clone(), path) // not matched any mount point
+            (self.main_fs.clone(), path)
         } else {
-            f(self.mounts[idx].fs.clone(), &path[max_len..]) // matched at `idx`
+            (
+                self.mounts[idx].fs.clone(),
+                path[max_len..].trim_start_matches('/'),
+            )
         }
     }
+
+    fn lookup_mounted_fs<F, T>(&self, path: &str, f: F) -> AxResult<T>
+    where
+        F: FnOnce(Arc<dyn VfsOps>, &str) -> AxResult<T>,
+    {
+        debug!("lookup at root: {}", path);
+        let (fs, rest_path) = self.mounted_fs_and_rest(path);
+        f(fs, rest_path)
+    }
+}
+
+fn root_mount_info(kind: RootFileSystemKind) -> MountInfo {
+    match kind {
+        RootFileSystemKind::Ext4 => MountInfo {
+            source: "/dev/root",
+            target: "/",
+            fs_type: "ext4",
+            options: "ro,relatime",
+            kind: MountFsKind::Ext4,
+        },
+        RootFileSystemKind::Fat | RootFileSystemKind::Unknown => MountInfo {
+            source: "/dev/root",
+            target: "/",
+            fs_type: "vfat",
+            options: "rw,relatime",
+            kind: MountFsKind::Fat,
+        },
+    }
+}
+
+fn build_mount_infos(root_kind: RootFileSystemKind) -> Vec<MountInfo> {
+    let mut infos = vec![root_mount_info(root_kind)];
+
+    #[cfg(feature = "devfs")]
+    infos.push(MountInfo {
+        source: "devfs",
+        target: "/dev",
+        fs_type: "devfs",
+        options: "rw,nosuid,relatime",
+        kind: MountFsKind::DevFs,
+    });
+
+    #[cfg(feature = "ramfs")]
+    infos.push(MountInfo {
+        source: "tmpfs",
+        target: "/dev/shm",
+        fs_type: "tmpfs",
+        options: "rw,nosuid,nodev",
+        kind: MountFsKind::RamFs,
+    });
+
+    #[cfg(feature = "ramfs")]
+    infos.push(MountInfo {
+        source: "tmpfs",
+        target: "/tmp",
+        fs_type: "tmpfs",
+        options: "rw,nosuid,nodev",
+        kind: MountFsKind::RamFs,
+    });
+
+    #[cfg(feature = "ramfs")]
+    infos.push(MountInfo {
+        source: "tmpfs",
+        target: "/var",
+        fs_type: "tmpfs",
+        options: "rw,nosuid,nodev",
+        kind: MountFsKind::RamFs,
+    });
+
+    #[cfg(feature = "procfs")]
+    infos.push(MountInfo {
+        source: "proc",
+        target: "/proc",
+        fs_type: "proc",
+        options: "rw,nosuid,nodev,noexec,relatime",
+        kind: MountFsKind::ProcFs,
+    });
+
+    #[cfg(feature = "sysfs")]
+    infos.push(MountInfo {
+        source: "sysfs",
+        target: "/sys",
+        fs_type: "sysfs",
+        options: "rw,nosuid,nodev,noexec,relatime",
+        kind: MountFsKind::SysFs,
+    });
+
+    infos
+}
+
+fn mount_matches_path(path: &str, mount_path: &str) -> bool {
+    if mount_path == "/" {
+        return path.starts_with('/');
+    }
+    path == mount_path
+        || path
+            .strip_prefix(mount_path)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+pub fn mounted_filesystems() -> Vec<MountInfo> {
+    MOUNT_INFOS.get().cloned().unwrap_or_default()
+}
+
+pub fn mount_info_for_path(path: &str) -> Option<MountInfo> {
+    let normalized = if path.starts_with('/') {
+        axfs_vfs::path::canonicalize(path)
+    } else {
+        absolute_path(path).ok()?
+    };
+    let mounts = MOUNT_INFOS.get()?;
+    mounts
+        .iter()
+        .copied()
+        .filter(|info| mount_matches_path(normalized.as_str(), info.target))
+        .max_by_key(|info| info.target.len())
 }
 
 impl VfsNodeOps for RootDirectory {
@@ -235,13 +370,27 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
+        let (src_fs, src_rest) = self.mounted_fs_and_rest(src_path);
+        let (dst_fs, dst_rest) = self.mounted_fs_and_rest(dst_path);
+        if src_rest.is_empty() || dst_rest.is_empty() {
+            return ax_err!(PermissionDenied);
+        }
+        if !Arc::ptr_eq(&src_fs, &dst_fs) {
+            return ax_err!(Unsupported);
+        }
+        match src_fs.root_dir().rename(src_rest, dst_rest) {
+            Ok(()) => Ok(()),
+            Err(VfsError::Unsupported) => {
+                let src_node = src_fs.root_dir().lookup(src_rest)?;
+                let attr = src_node.get_attr()?;
+                if !attr.is_dir() {
+                    return Err(VfsError::Unsupported);
+                }
+                src_fs.root_dir().create(dst_rest, VfsNodeType::Dir)?;
+                src_fs.root_dir().remove(src_rest)
             }
-        })
+            Err(err) => Err(err),
+        }
     }
 
     fn read_dir(&self, start_idx: usize, dirents: &mut [VfsDirEntry]) -> VfsResult<usize> {
@@ -335,12 +484,19 @@ pub(crate) fn init_rootfs(mut disk: crate::dev::Disk) {
         RootFileSystemKind::Fat | RootFileSystemKind::Unknown => init_fat_mainfs(disk),
     };
 
+    MOUNT_INFOS.init_once(build_mount_infos(detected_rootfs));
+
     let mut root_dir = RootDirectory::new(main_fs);
 
     #[cfg(feature = "devfs")]
     root_dir
         .mount("/dev", mounts::devfs())
         .expect("failed to mount devfs at /dev");
+
+    #[cfg(feature = "ramfs")]
+    root_dir
+        .mount("/dev/shm", mounts::ramfs())
+        .expect("failed to mount ramfs at /dev/shm");
 
     #[cfg(feature = "ramfs")]
     root_dir
