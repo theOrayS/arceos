@@ -43,13 +43,15 @@ const DNS_SEVER: &str = "8.8.8.8";
 const IP_PREFIX: u8 = 24;
 
 const STANDARD_MTU: usize = 1500;
+const ETHERNET_FRAME_MTU: usize = STANDARD_MTU + 14;
 
 const RANDOM_SEED: u64 = 0xA2CE_05A2_CE05_A2CE;
 
-const TCP_RX_BUF_LEN: usize = 64 * 1024;
-const TCP_TX_BUF_LEN: usize = 64 * 1024;
-const UDP_RX_BUF_LEN: usize = 64 * 1024;
-const UDP_TX_BUF_LEN: usize = 64 * 1024;
+const TCP_RX_BUF_LEN: usize = 32 * 1024;
+const TCP_TX_BUF_LEN: usize = 32 * 1024;
+const UDP_PACKET_METADATA_LEN: usize = 512;
+const UDP_RX_BUF_LEN: usize = 512 * 1024;
+const UDP_TX_BUF_LEN: usize = 512 * 1024;
 const LISTEN_QUEUE_SIZE: usize = 512;
 const LOOPBACK_PREFIX: u8 = 8;
 const LOOPBACK_ADDR: [u8; 4] = [127, 0, 0, 1];
@@ -96,11 +98,11 @@ impl<'a> SocketSetWrapper<'a> {
 
     pub fn new_udp_socket() -> socket::udp::Socket<'a> {
         let udp_rx_buffer = socket::udp::PacketBuffer::new(
-            vec![socket::udp::PacketMetadata::EMPTY; 8],
+            vec![socket::udp::PacketMetadata::EMPTY; UDP_PACKET_METADATA_LEN],
             vec![0; UDP_RX_BUF_LEN],
         );
         let udp_tx_buffer = socket::udp::PacketBuffer::new(
-            vec![socket::udp::PacketMetadata::EMPTY; 8],
+            vec![socket::udp::PacketMetadata::EMPTY; UDP_PACKET_METADATA_LEN],
             vec![0; UDP_TX_BUF_LEN],
         );
         socket::udp::Socket::new(udp_rx_buffer, udp_tx_buffer)
@@ -237,7 +239,7 @@ impl Device for LoopbackDevice {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 65535;
+        caps.max_transmission_unit = ETHERNET_FRAME_MTU;
         caps.medium = Medium::Ethernet;
         caps.checksum = ChecksumCapabilities::ignored();
         caps

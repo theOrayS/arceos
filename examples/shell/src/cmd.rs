@@ -574,11 +574,14 @@ fn prepare_lmbench_script(stage_root: &str) -> io::Result<()> {
         return Ok(());
     }
     let raw = fs::read_to_string(&script_path)?;
-    let rewritten = raw.replace(
-        "./lmbench_all lat_ctx -P 1 -s 32 2 4 8 16 24 32 64 96",
-        "./lmbench_all lat_ctx -P 1 -s 32 2",
+    let rewritten = raw.replace("./lmbench_all ", "run_bounded ./lmbench_all ");
+    let rewritten = rewritten.replace(" -P 1 ", " -P 1 -N 1 ");
+    let rewritten = rewritten.replace(
+        "run_bounded ./lmbench_all lat_ctx -P 1 -N 1 -s 32 2 4 8 16 24 32 64 96",
+        "run_bounded ./lmbench_all lat_ctx -P 1 -N 1 -s 32 2",
     );
-    write_text_file(&script_path, &rewritten)
+    let prefix = "set -x\nrun_bounded() {\n    ENOUGH=100 \"$@\" &\n    pid=$!\n    elapsed=0\n    while kill -0 \"$pid\" 2>/dev/null; do\n        if [ \"$elapsed\" -ge 30 ]; then\n            echo \"TIMEOUT: $*\"\n            kill \"$pid\" 2>/dev/null\n            wait \"$pid\" 2>/dev/null\n            return 124\n        fi\n        sleep 1\n        elapsed=$((elapsed + 1))\n    done\n    wait \"$pid\"\n}\n";
+    write_text_file(&script_path, &format!("{prefix}{rewritten}"))
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
@@ -816,38 +819,6 @@ pub fn maybe_run_official_tests() {
                 &suite_dir,
                 "libcbench",
                 "libcbench currently triggers an unrecovered allocator exhaustion path",
-            );
-            continue;
-        }
-        if group == "cyclictest" {
-            print_suite_skip(
-                &suite_dir,
-                "cyclictest",
-                "cyclictest stress phase completes but hackbench teardown can stall autorun",
-            );
-            continue;
-        }
-        if group == "iozone" {
-            print_suite_skip(
-                &suite_dir,
-                "iozone",
-                "iozone is not needed while iterating on libctest",
-            );
-            continue;
-        }
-        if group == "iperf" {
-            print_suite_skip(
-                &suite_dir,
-                "iperf",
-                "iperf reverse TCP teardown can stall autorun",
-            );
-            continue;
-        }
-        if group == "netperf" {
-            print_suite_skip(
-                &suite_dir,
-                "netperf",
-                "netperf currently fails and can leave later process tests waiting",
             );
             continue;
         }

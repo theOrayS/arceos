@@ -112,6 +112,9 @@ impl AddrSpace {
                     return ax_err!(BadState, "failed to materialize child page");
                 }
                 let (dst_paddr, _, _) = self.pt.query(vaddr).map_err(|_| AxError::BadState)?;
+                if src_paddr == dst_paddr {
+                    continue;
+                }
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         phys_to_virt(src_paddr).as_ptr(),

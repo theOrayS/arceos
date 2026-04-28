@@ -107,7 +107,6 @@ pub mod context {
 }
 
 pub use axcpu::asm;
-pub use axplat::init::{init_early, init_later};
 
 #[cfg(feature = "smp")]
 pub use axplat::init::{init_early_secondary, init_later_secondary};

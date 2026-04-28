@@ -1,6 +1,6 @@
 use core::cell::UnsafeCell;
 use core::net::SocketAddr;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use axerrno::{AxError, AxResult, ax_err, ax_err_type};
 use axio::PollState;
@@ -13,6 +13,8 @@ use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
 
 use super::addr::UNSPECIFIED_ENDPOINT;
 use super::{SOCKET_SET, SocketSetWrapper};
+
+static UDP_SEND_FAIRNESS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// A UDP socket that provides POSIX-like APIs.
 pub struct UdpSocket {
@@ -245,7 +247,7 @@ impl UdpSocket {
             return ax_err!(NotConnected, "socket send() failed");
         }
 
-        self.block_on(|| {
+        let sent = self.block_on(|| {
             SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle(), |socket| {
                 if socket.can_send() {
                     socket
@@ -262,7 +264,12 @@ impl UdpSocket {
                     Err(AxError::WouldBlock)
                 }
             })
-        })
+        })?;
+        SOCKET_SET.poll_interfaces();
+        if UDP_SEND_FAIRNESS_COUNTER.fetch_add(1, Ordering::Relaxed) & 0x1 == 0 {
+            axtask::yield_now();
+        }
+        Ok(sent)
     }
 
     fn recv_impl<F, T>(&self, mut op: F) -> AxResult<T>

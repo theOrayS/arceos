@@ -160,6 +160,7 @@ struct UserTaskExt {
     pending_signal: AtomicI32,
     signal_mask: AtomicU64,
     signal_wait: WaitQueue,
+    pipe_wait: Mutex<Option<PipeWaitTarget>>,
     futex_wait: AtomicUsize,
     futex_token: Mutex<Option<FutexWaitToken>>,
     robust_list_head: AtomicUsize,
@@ -179,6 +180,7 @@ struct UserProcess {
     brk: Mutex<BrkState>,
     fds: Mutex<FdTable>,
     shared_attaches: Mutex<BTreeMap<usize, SharedMemAttach>>,
+    compat_mounts: Mutex<Vec<String>>,
     cwd: Mutex<String>,
     exec_root: Mutex<String>,
     exec_path: Mutex<String>,
@@ -236,6 +238,7 @@ enum FdEntry {
     Stdout,
     Stderr,
     DevNull,
+    DevZero,
     File(FileEntry),
     Directory(DirectoryEntry),
     Pipe(PipeEndpoint),
@@ -448,6 +451,12 @@ struct PipeState {
     writers: AtomicUsize,
     read_wait: WaitQueue,
     write_wait: WaitQueue,
+}
+
+#[derive(Clone)]
+struct PipeWaitTarget {
+    state: Arc<PipeState>,
+    readable: bool,
 }
 
 struct PipeEndpoint {
@@ -869,12 +878,16 @@ impl PipeEndpoint {
                 if current_unblocked_pending_signal().is_some() {
                     return Err(LinuxError::EINTR);
                 }
+                set_current_pipe_wait(self.state.clone(), true);
                 self.state
                     .read_wait
                     .wait_timeout_until(Duration::from_millis(10), || {
                         let ring = self.state.buffer.lock();
-                        ring.available_read() > 0 || self.peer_closed()
+                        ring.available_read() > 0
+                            || self.peer_closed()
+                            || current_exit_or_signal_pending()
                     });
+                clear_current_pipe_wait();
                 continue;
             }
             for _ in 0..available {
@@ -938,12 +951,16 @@ impl PipeEndpoint {
                         Err(LinuxError::EINTR)
                     };
                 }
+                set_current_pipe_wait(self.state.clone(), false);
                 self.state
                     .write_wait
                     .wait_timeout_until(Duration::from_millis(10), || {
                         let ring = self.state.buffer.lock();
-                        ring.available_write() > 0 || self.peer_closed()
+                        ring.available_write() > 0
+                            || self.peer_closed()
+                            || current_exit_or_signal_pending()
                     });
+                clear_current_pipe_wait();
                 continue;
             }
             for _ in 0..available {
@@ -1111,6 +1128,7 @@ pub fn run_user_program_in(cwd: &str, argv: &[&str]) -> Result<i32, String> {
         pending_signal: AtomicI32::new(0),
         signal_mask: AtomicU64::new(0),
         signal_wait: WaitQueue::new(),
+        pipe_wait: Mutex::new(None),
         futex_wait: AtomicUsize::new(0),
         futex_token: Mutex::new(None),
         robust_list_head: AtomicUsize::new(0),
@@ -1160,6 +1178,7 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         brk: Mutex::new(image.brk),
         fds: Mutex::new(FdTable::new()),
         shared_attaches: Mutex::new(BTreeMap::new()),
+        compat_mounts: Mutex::new(Vec::new()),
         cwd: Mutex::new(cwd.into()),
         exec_root: Mutex::new(image.exec_root.clone()),
         exec_path: Mutex::new(image.exec_path.clone()),
@@ -2029,6 +2048,7 @@ impl UserProcess {
             brk: Mutex::new(*self.brk.lock()),
             fds: Mutex::new(self.fds.lock().fork_copy()?),
             shared_attaches: Mutex::new(shared_attaches),
+            compat_mounts: Mutex::new(self.compat_mounts.lock().clone()),
             cwd: Mutex::new(self.cwd()),
             exec_root: Mutex::new(self.exec_root()),
             exec_path: Mutex::new(self.exec_path()),
@@ -2396,6 +2416,14 @@ fn deliver_user_signal(entry: &UserThreadEntry, sig: i32) -> Result<(), LinuxErr
     let ext = task_ext(&entry.task).ok_or(LinuxError::ESRCH)?;
     ext.pending_signal.store(sig, Ordering::Release);
     ext.signal_wait.notify_all(true);
+    if let Some(pipe_wait) = ext.pipe_wait.lock().clone() {
+        let wait_queue = if pipe_wait.readable {
+            &pipe_wait.state.read_wait
+        } else {
+            &pipe_wait.state.write_wait
+        };
+        let _ = wait_queue.notify_task(true, &entry.task);
+    }
     if !signal_is_blocked(ext, sig) {
         let futex_wait = ext.futex_wait.load(Ordering::Acquire);
         if futex_wait != 0 {
@@ -2406,6 +2434,27 @@ fn deliver_user_signal(entry: &UserThreadEntry, sig: i32) -> Result<(), LinuxErr
         }
     }
     Ok(())
+}
+
+fn set_current_pipe_wait(state: Arc<PipeState>, readable: bool) {
+    if let Some(ext) = current_task_ext() {
+        *ext.pipe_wait.lock() = Some(PipeWaitTarget { state, readable });
+    }
+}
+
+fn clear_current_pipe_wait() {
+    if let Some(ext) = current_task_ext() {
+        *ext.pipe_wait.lock() = None;
+    }
+}
+
+fn current_exit_or_signal_pending() -> bool {
+    if let Some(ext) = current_task_ext()
+        && ext.process.pending_exit_group().is_some()
+    {
+        return true;
+    }
+    current_unblocked_pending_signal().is_some()
 }
 
 fn futex_state(uaddr: usize, bitset: u32) -> Arc<FutexState> {
@@ -2577,6 +2626,35 @@ fn take_pending_signal_in_set(ext: &UserTaskExt, set_mask: u64) -> Option<i32> {
 
 fn default_signal_is_ignored(sig: i32) -> bool {
     matches!(sig, 17 | 18 | 23 | 28)
+}
+
+enum SignalDisposition {
+    Ignore,
+    Terminate,
+    Handler,
+}
+
+fn signal_disposition(process: &UserProcess, sig: i32) -> SignalDisposition {
+    if sig == general::SIGKILL as i32 {
+        return SignalDisposition::Terminate;
+    }
+    let action = process
+        .signal_actions
+        .lock()
+        .get(&(sig as usize))
+        .copied()
+        .unwrap_or_else(|| unsafe { core::mem::zeroed() });
+    let handler = action
+        .sa_handler_kernel
+        .map(|func| func as usize)
+        .unwrap_or(0);
+    if handler == 1 || default_signal_is_ignored(sig) {
+        SignalDisposition::Ignore
+    } else if handler == 0 {
+        SignalDisposition::Terminate
+    } else {
+        SignalDisposition::Handler
+    }
 }
 
 fn handle_signal_without_user_handler(ext: &UserTaskExt, sig: i32, handler: usize) -> bool {
@@ -3057,10 +3135,20 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         general::__NR_openat => sys_openat(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3()),
         general::__NR_mkdirat => sys_mkdirat(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_unlinkat => sys_unlinkat(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_mount => sys_mount(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+        ),
+        general::__NR_umount2 => sys_umount2(&process, tf.arg0(), tf.arg1()),
         general::__NR_pipe2 => sys_pipe2(&process, tf.arg0(), tf.arg1()),
         general::__NR_ftruncate => sys_ftruncate(&process, tf.arg0(), tf.arg1()),
         general::__NR_fsync => sys_fsync(&process, tf.arg0()),
         general::__NR_fdatasync => sys_fdatasync(&process, tf.arg0()),
+        general::__NR_sync => sys_sync(&process),
         #[cfg(feature = "net")]
         general::__NR_socket => sys_socket(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         #[cfg(feature = "net")]
@@ -3293,8 +3381,12 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
             tf.arg2(),
             tf.arg3(),
         ),
-        general::__NR_getpid => process.pid() as isize,
-        general::__NR_getppid => process.ppid() as isize,
+        general::__NR_getpid => {
+            process.pid() as isize
+        }
+        general::__NR_getppid => {
+            process.ppid() as isize
+        }
         general::__NR_clone => {
             let (tls, ctid) = clone_tls_ctid_args(tf);
             sys_clone(&process, tf, tf.arg0(), tf.arg1(), tf.arg2(), tls, ctid)
@@ -3615,6 +3707,7 @@ impl Drop for SocketNonblockingGuard {
 
 #[cfg(feature = "net")]
 fn socket_wait_interruptible(process: &UserProcess) -> Result<(), LinuxError> {
+    axnet::poll_interfaces();
     if let Some(code) = process.pending_exit_group() {
         terminate_current_thread(process, code);
     }
@@ -4361,7 +4454,12 @@ fn poll_ready_events(
             revents: 0,
         })
         .collect::<Vec<_>>();
-    let ready = poll_events(&mut events, timeout, |fd| process.fds.lock().poll_state(fd))?;
+    let ready = poll_events(
+        &mut events,
+        timeout,
+        |fd| process.fds.lock().poll_state(fd),
+        current_exit_or_signal_pending,
+    )?;
     for (pollfd, event) in pollfds.iter_mut().zip(events.iter()) {
         pollfd.revents = event.revents;
     }
@@ -4398,6 +4496,10 @@ fn sys_pselect6(
         Err(err) => return neg_errno(err),
     };
     loop {
+        if current_exit_or_signal_pending() {
+            return neg_errno(LinuxError::EINTR);
+        }
+
         #[cfg(feature = "net")]
         axnet::poll_interfaces();
         let mut ready_read = [0usize; FD_SET_WORDS];
@@ -4438,7 +4540,15 @@ fn sys_pselect6(
             }
             return ready as isize;
         }
-        if deadline.is_some_and(|ddl| axhal::time::wall_time() >= ddl) {
+        if let Some(ddl) = deadline {
+            let now = axhal::time::wall_time();
+            if now < ddl {
+                axtask::sleep(cmp::min(
+                    ddl - now,
+                    Duration::from_millis(1),
+                ));
+                continue;
+            }
             axtask::yield_now();
             let ret = write_fd_set(process, readfds, &[0; FD_SET_WORDS]);
             if ret != 0 {
@@ -4711,6 +4821,7 @@ fn sys_clone(
             pending_signal: AtomicI32::new(0),
             signal_mask: AtomicU64::new(inherited_signal_mask),
             signal_wait: WaitQueue::new(),
+            pipe_wait: Mutex::new(None),
             futex_wait: AtomicUsize::new(0),
             futex_token: Mutex::new(None),
             robust_list_head: AtomicUsize::new(0),
@@ -4793,6 +4904,7 @@ fn sys_clone(
         pending_signal: AtomicI32::new(0),
         signal_mask: AtomicU64::new(inherited_signal_mask),
         signal_wait: WaitQueue::new(),
+        pipe_wait: Mutex::new(None),
         futex_wait: AtomicUsize::new(0),
         futex_token: Mutex::new(None),
         robust_list_head: AtomicUsize::new(0),
@@ -4924,6 +5036,98 @@ fn sys_faccessat(
     }
 }
 
+fn sys_mount(
+    process: &UserProcess,
+    source: usize,
+    target: usize,
+    fstype: usize,
+    flags: usize,
+    data: usize,
+) -> isize {
+    if flags != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    if data != 0 {
+        return neg_errno(LinuxError::EOPNOTSUPP);
+    }
+    let source = match read_cstr(process, source) {
+        Ok(source) => source,
+        Err(err) => return neg_errno(err),
+    };
+    let target = match read_cstr(process, target) {
+        Ok(target) => target,
+        Err(err) => return neg_errno(err),
+    };
+    let fstype = match read_cstr(process, fstype) {
+        Ok(fstype) => fstype,
+        Err(err) => return neg_errno(err),
+    };
+    match compat_basic_mount(process, source.as_str(), target.as_str(), fstype.as_str()) {
+        Ok(()) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
+fn sys_umount2(process: &UserProcess, target: usize, flags: usize) -> isize {
+    if flags != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let target = match read_cstr(process, target) {
+        Ok(target) => target,
+        Err(err) => return neg_errno(err),
+    };
+    match compat_basic_umount(process, target.as_str()) {
+        Ok(()) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
+fn compat_basic_mount(
+    process: &UserProcess,
+    source: &str,
+    target: &str,
+    fstype: &str,
+) -> Result<(), LinuxError> {
+    // compat(basic-fsfd): basic calls mount("/dev/vda2", "./mnt", "vfat", 0, NULL).
+    // delete-when: axfs exposes a real runtime mount API and filesystem factory.
+    if source.is_empty() || target.is_empty() || fstype.is_empty() {
+        return Err(LinuxError::EINVAL);
+    }
+    if fstype != "vfat" {
+        return Err(LinuxError::EOPNOTSUPP);
+    }
+    if !source.starts_with("/dev/") {
+        return Err(LinuxError::ENOENT);
+    }
+    let normalized_target =
+        resolve_host_path(process.cwd(), target).map_err(|_| LinuxError::EINVAL)?;
+    let mut mounts = process.compat_mounts.lock();
+    if mounts.iter().any(|mounted| mounted == &normalized_target) {
+        return Err(LinuxError::EBUSY);
+    }
+    mounts.push(normalized_target);
+    Ok(())
+}
+
+fn compat_basic_umount(process: &UserProcess, target: &str) -> Result<(), LinuxError> {
+    // compat(basic-fsfd): remove only targets recorded by compat_basic_mount.
+    // delete-when: axfs exposes a real runtime unmount API.
+    if target.is_empty() {
+        return Err(LinuxError::EINVAL);
+    }
+    let normalized_target =
+        resolve_host_path(process.cwd(), target).map_err(|_| LinuxError::EINVAL)?;
+    let mut mounts = process.compat_mounts.lock();
+    let Some(idx) = mounts
+        .iter()
+        .position(|mounted| mounted == &normalized_target)
+    else {
+        return Err(LinuxError::EINVAL);
+    };
+    mounts.swap_remove(idx);
+    Ok(())
+}
+
 fn sys_readlinkat(
     process: &UserProcess,
     dirfd: usize,
@@ -4980,6 +5184,11 @@ fn sys_fsync(process: &UserProcess, fd: usize) -> isize {
 
 fn sys_fdatasync(process: &UserProcess, fd: usize) -> isize {
     sys_fsync(process, fd)
+}
+
+fn sys_sync(process: &UserProcess) -> isize {
+    let _ = process;
+    0
 }
 
 fn sys_utimensat(
@@ -5608,12 +5817,62 @@ fn is_rtc_device_path(path: &str) -> bool {
     matches!(path, "/dev/rtc" | "/dev/rtc0" | "/dev/misc/rtc")
 }
 
+fn write_remaining_sleep(process: &UserProcess, rem: usize, remaining: Duration) -> isize {
+    if rem == 0 {
+        return 0;
+    }
+    let ts = general::timespec {
+        tv_sec: remaining.as_secs() as _,
+        tv_nsec: remaining.subsec_nanos() as _,
+    };
+    write_user_value(process, rem, &ts)
+}
+
+fn user_sleep_until_wall(deadline: Duration) -> Result<(), LinuxError> {
+    loop {
+        if current_exit_or_signal_pending() {
+            return Err(LinuxError::EINTR);
+        }
+        let now = axhal::time::wall_time();
+        if now >= deadline {
+            return Ok(());
+        }
+        axtask::yield_now();
+    }
+}
+
+fn user_sleep_clock_until(clockid: u32, deadline: Duration) -> Result<(), LinuxError> {
+    loop {
+        if current_exit_or_signal_pending() {
+            return Err(LinuxError::EINTR);
+        }
+        let now = imp_time::clock_now_duration(clockid)?;
+        if now >= deadline {
+            return Ok(());
+        }
+        axtask::yield_now();
+    }
+}
+
 fn sys_nanosleep(process: &UserProcess, req: usize, rem: usize) -> isize {
     let req = match read_user_value::<general::timespec>(process, req) {
         Ok(req) => req,
         Err(err) => return neg_errno(err),
     };
-    if let Err(err) = imp_time::nanosleep(req) {
+    let duration = match imp_time::timespec_to_duration(req) {
+        Ok(duration) => duration,
+        Err(err) => return neg_errno(err),
+    };
+    let deadline = axhal::time::wall_time() + duration;
+    if let Err(err) = user_sleep_until_wall(deadline) {
+        if err == LinuxError::EINTR {
+            if let Some(remaining) = deadline.checked_sub(axhal::time::wall_time()) {
+                let ret = write_remaining_sleep(process, rem, remaining);
+                if ret != 0 {
+                    return ret;
+                }
+            }
+        }
         return neg_errno(err);
     }
     if rem != 0 {
@@ -5640,7 +5899,36 @@ fn sys_clock_nanosleep(
         Ok(req) => req,
         Err(err) => return neg_errno(err),
     };
-    if let Err(err) = imp_time::clock_nanosleep(clockid as u32, flags as u32, req) {
+    let clockid = clockid as u32;
+    let flags = flags as u32;
+    if flags & !general::TIMER_ABSTIME != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let duration = match imp_time::timespec_to_duration(req) {
+        Ok(duration) => duration,
+        Err(err) => return neg_errno(err),
+    };
+    let sleep_result = if flags & general::TIMER_ABSTIME != 0 {
+        user_sleep_clock_until(clockid, duration)
+    } else {
+        user_sleep_until_wall(axhal::time::wall_time() + duration)
+    };
+    if let Err(err) = sleep_result {
+        if err == LinuxError::EINTR {
+            let remaining = if flags & general::TIMER_ABSTIME != 0 {
+                imp_time::clock_now_duration(clockid)
+                    .ok()
+                    .and_then(|now| duration.checked_sub(now))
+            } else {
+                Some(duration)
+            };
+            if let Some(remaining) = remaining {
+                let ret = write_remaining_sleep(process, rem, remaining);
+                if ret != 0 {
+                    return ret;
+                }
+            }
+        }
         return neg_errno(err);
     }
     if rem != 0 {
@@ -6079,9 +6367,16 @@ fn sys_futex(
                 bitset
             };
             let timeout = if cmd == general::FUTEX_WAIT {
-                match read_futex_relative_timeout(process, timeout) {
-                    Ok(timeout) => timeout,
-                    Err(err) => return neg_errno(err),
+                if op & general::FUTEX_CLOCK_REALTIME != 0 {
+                    match read_futex_absolute_timeout(process, timeout, true) {
+                        Ok(timeout) => timeout,
+                        Err(err) => return neg_errno(err),
+                    }
+                } else {
+                    match read_futex_relative_timeout(process, timeout) {
+                        Ok(timeout) => timeout,
+                        Err(err) => return neg_errno(err),
+                    }
                 }
             } else {
                 match read_futex_absolute_timeout(
@@ -6115,19 +6410,25 @@ fn sys_futex(
                 let dur = match timeout {
                     FutexTimeout::Relative(dur) | FutexTimeout::Absolute(dur) => dur,
                 };
-                if state.queue.wait_timeout_until(dur, wait_cond) {
-                    if let Some(ext) = current_task_ext() {
-                        clear_futex_wait_token(ext);
+                let deadline = axhal::time::wall_time() + dur;
+                loop {
+                    if wait_cond() {
+                        if let Some(ext) = current_task_ext() {
+                            clear_futex_wait_token(ext);
+                        }
+                        if current_unblocked_pending_signal().is_some() {
+                            return neg_errno(LinuxError::EINTR);
+                        }
+                        return 0;
                     }
-                    return neg_errno(LinuxError::ETIMEDOUT);
+                    if axhal::time::wall_time() >= deadline {
+                        if let Some(ext) = current_task_ext() {
+                            clear_futex_wait_token(ext);
+                        }
+                        return neg_errno(LinuxError::ETIMEDOUT);
+                    }
+                    axtask::yield_now();
                 }
-                if let Some(ext) = current_task_ext() {
-                    clear_futex_wait_token(ext);
-                }
-                if current_unblocked_pending_signal().is_some() {
-                    return neg_errno(LinuxError::EINTR);
-                }
-                return 0;
             }
             state.queue.wait_until(wait_cond);
             if let Some(ext) = current_task_ext() {
@@ -6239,6 +6540,7 @@ fn sys_rt_sigaction(
         process.signal_actions.lock().insert(signum, new_action);
     }
 
+    axtask::yield_now();
     0
 }
 
@@ -6422,18 +6724,21 @@ fn sys_kill(process: &UserProcess, pid: i32, sig: i32) -> isize {
         if sig == 0 {
             return 0;
         }
-        if sig == general::SIGKILL as i32 {
-            entries[0].process.request_exit_group(128 + sig);
-            for entry in &entries {
-                if let Err(err) = deliver_user_signal(entry, sig) {
-                    return neg_errno(err);
+        match signal_disposition(entries[0].process.as_ref(), sig) {
+            SignalDisposition::Ignore => 0,
+            SignalDisposition::Terminate => {
+                entries[0].process.request_exit_group(128 + sig);
+                for entry in &entries {
+                    if let Err(err) = deliver_user_signal(entry, sig) {
+                        return neg_errno(err);
+                    }
                 }
+                0
             }
-            return 0;
+            SignalDisposition::Handler => deliver_user_signal(&entries[0], sig)
+                .map(|()| 0)
+                .unwrap_or_else(neg_errno),
         }
-        deliver_user_signal(&entries[0], sig)
-            .map(|()| 0)
-            .unwrap_or_else(neg_errno)
     };
     if pid == current_tid() {
         if sig == 0 {
@@ -6442,9 +6747,21 @@ fn sys_kill(process: &UserProcess, pid: i32, sig: i32) -> isize {
         let Some(entry) = user_thread_entry_by_tid(pid) else {
             return neg_errno(LinuxError::ESRCH);
         };
-        return deliver_user_signal(&entry, sig)
-            .map(|()| 0)
-            .unwrap_or_else(neg_errno);
+        return match signal_disposition(entry.process.as_ref(), sig) {
+            SignalDisposition::Ignore => 0,
+            SignalDisposition::Terminate => {
+                entry.process.request_exit_group(128 + sig);
+                for entry in user_thread_entries_by_pid(entry.process.pid()) {
+                    if let Err(err) = deliver_user_signal(&entry, sig) {
+                        return neg_errno(err);
+                    }
+                }
+                0
+            }
+            SignalDisposition::Handler => deliver_user_signal(&entry, sig)
+                .map(|()| 0)
+                .unwrap_or_else(neg_errno),
+        };
     }
     if pid == 0 || pid == process.pid() {
         return deliver_process_signal(process.pid());
@@ -6475,8 +6792,21 @@ fn sys_tkill(process: &UserProcess, tid: i32, sig: i32) -> isize {
             current_tid()
         );
     }
-    if let Err(err) = deliver_user_signal(&entry, sig) {
-        return neg_errno(err);
+    match signal_disposition(entry.process.as_ref(), sig) {
+        SignalDisposition::Ignore => {}
+        SignalDisposition::Terminate => {
+            entry.process.request_exit_group(128 + sig);
+            for entry in user_thread_entries_by_pid(entry.process.pid()) {
+                if let Err(err) = deliver_user_signal(&entry, sig) {
+                    return neg_errno(err);
+                }
+            }
+        }
+        SignalDisposition::Handler => {
+            if let Err(err) = deliver_user_signal(&entry, sig) {
+                return neg_errno(err);
+            }
+        }
     }
     0
 }
@@ -6499,8 +6829,21 @@ fn sys_tgkill(process: &UserProcess, tgid: i32, tid: i32, sig: i32) -> isize {
             tgid,
         );
     }
-    if let Err(err) = deliver_user_signal(&entry, sig) {
-        return neg_errno(err);
+    match signal_disposition(entry.process.as_ref(), sig) {
+        SignalDisposition::Ignore => {}
+        SignalDisposition::Terminate => {
+            entry.process.request_exit_group(128 + sig);
+            for entry in user_thread_entries_by_pid(entry.process.pid()) {
+                if let Err(err) = deliver_user_signal(&entry, sig) {
+                    return neg_errno(err);
+                }
+            }
+        }
+        SignalDisposition::Handler => {
+            if let Err(err) = deliver_user_signal(&entry, sig) {
+                return neg_errno(err);
+            }
+        }
     }
     0
 }
@@ -7322,6 +7665,7 @@ impl FdEntry {
             Self::Stdout => Ok(Self::Stdout),
             Self::Stderr => Ok(Self::Stderr),
             Self::DevNull => Ok(Self::DevNull),
+            Self::DevZero => Ok(Self::DevZero),
             Self::File(file) => Ok(Self::File(file.clone())),
             Self::Directory(dir) => Ok(Self::Directory(dir.clone())),
             Self::Pipe(pipe) => Ok(Self::Pipe(pipe.clone())),
@@ -7372,7 +7716,7 @@ impl FdTable {
                 readable: false,
                 writable: true,
             }),
-            FdEntry::DevNull | FdEntry::File(_) => Ok(PollState {
+            FdEntry::DevNull | FdEntry::DevZero | FdEntry::File(_) => Ok(PollState {
                 readable: true,
                 writable: true,
             }),
@@ -7401,6 +7745,11 @@ impl FdTable {
         match self.entry_mut(fd)? {
             FdEntry::Stdin => Ok(0),
             FdEntry::DevNull => Ok(0),
+            FdEntry::DevZero => {
+                dst.fill(0);
+                axtask::yield_now();
+                Ok(dst.len())
+            }
             FdEntry::File(file) => file.file.read(dst).map_err(LinuxError::from),
             FdEntry::Directory(_) => Err(LinuxError::EISDIR),
             FdEntry::Pipe(pipe) => pipe.read(dst),
@@ -7416,7 +7765,10 @@ impl FdTable {
                 axhal::console::write_bytes(src);
                 Ok(src.len())
             }
-            FdEntry::DevNull => Ok(src.len()),
+            FdEntry::DevNull | FdEntry::DevZero => {
+                axtask::yield_now();
+                Ok(src.len())
+            }
             FdEntry::File(file) => file.file.write(src).map_err(LinuxError::from),
             FdEntry::Pipe(pipe) => pipe.write(src),
             #[cfg(feature = "net")]
@@ -7522,6 +7874,7 @@ impl FdTable {
             FdEntry::Stdin => Ok(stdio_stat(true)),
             FdEntry::Stdout | FdEntry::Stderr => Ok(stdio_stat(false)),
             FdEntry::DevNull => Ok(stdio_stat(false)),
+            FdEntry::DevZero => Ok(stdio_stat(true)),
             FdEntry::File(file) => {
                 let mut st = file_attr_to_stat(
                     &file.file.get_attr().map_err(LinuxError::from)?,
@@ -7539,7 +7892,11 @@ impl FdTable {
 
     fn statfs(&mut self, fd: i32) -> Result<general::statfs, LinuxError> {
         match self.entry_mut(fd)? {
-            FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr | FdEntry::DevNull => {
+            FdEntry::Stdin
+            | FdEntry::Stdout
+            | FdEntry::Stderr
+            | FdEntry::DevNull
+            | FdEntry::DevZero => {
                 Ok(to_linux_statfs(statfs_for_path("/dev")?))
             }
             FdEntry::File(file) => Ok(to_linux_statfs(statfs_for_path(file.path.as_str())?)),
@@ -7564,6 +7921,8 @@ impl FdTable {
             Ok(FdEntry::Directory(dir)) => {
                 Ok(file_attr_to_stat(&dir.attr, Some(dir.path.as_str())))
             }
+            Ok(FdEntry::DevNull) => Ok(stdio_stat(false)),
+            Ok(FdEntry::DevZero) => Ok(stdio_stat(true)),
             Ok(_) => Err(LinuxError::EINVAL),
             Err(err) => Err(err),
         }
@@ -7573,6 +7932,7 @@ impl FdTable {
         let path = match self.entry(fd)? {
             FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => Some("/dev/console".into()),
             FdEntry::DevNull => Some("/dev/null".into()),
+            FdEntry::DevZero => Some("/dev/zero".into()),
             FdEntry::File(file) => Some(file.path.clone()),
             FdEntry::Directory(dir) => Some(dir.path.clone()),
             FdEntry::Pipe(_) => None,
@@ -7586,6 +7946,7 @@ impl FdTable {
         match self.entry_mut(fd)? {
             FdEntry::File(file) => file.file.truncate(size).map_err(LinuxError::from),
             FdEntry::DevNull => Ok(()),
+            FdEntry::DevZero => Ok(()),
             _ => Err(LinuxError::EINVAL),
         }
     }
@@ -7594,7 +7955,11 @@ impl FdTable {
         match self.entry_mut(fd)? {
             FdEntry::File(file) => file.file.flush().map_err(LinuxError::from),
             FdEntry::Directory(_) => Ok(()),
-            FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr | FdEntry::DevNull => Ok(()),
+            FdEntry::Stdin
+            | FdEntry::Stdout
+            | FdEntry::Stderr
+            | FdEntry::DevNull
+            | FdEntry::DevZero => Ok(()),
             FdEntry::Pipe(_) => Err(LinuxError::EINVAL),
             #[cfg(feature = "net")]
             FdEntry::Socket(_) => Err(LinuxError::EINVAL),
@@ -7694,6 +8059,7 @@ impl FdTable {
         match self.entry_mut(fd)? {
             FdEntry::File(file) => file.file.seek(pos).map_err(LinuxError::from),
             FdEntry::DevNull => Ok(0),
+            FdEntry::DevZero => Ok(0),
             FdEntry::Directory(_) => Err(LinuxError::EISDIR),
             FdEntry::Pipe(_) => Err(LinuxError::ESPIPE),
             #[cfg(feature = "net")]
@@ -7970,8 +8336,17 @@ fn open_fd_candidates(
             }
             continue;
         }
+        match path.as_str() {
+            "/dev/null" => return Ok(FdEntry::DevNull),
+            "/dev/zero" => return Ok(FdEntry::DevZero),
+            _ => {}
+        }
         match File::open(path.as_str(), opts) {
             Ok(file) => {
+                let attr = file.get_attr().map_err(LinuxError::from)?;
+                if attr.is_dir() {
+                    return open_dir_entry(path.as_str());
+                }
                 return Ok(FdEntry::File(FileEntry {
                     file,
                     path: path.clone(),
@@ -8091,6 +8466,7 @@ fn fd_link_target(table: &FdTable, fd: i32) -> Option<String> {
     match entry {
         FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => Some("/dev/console".into()),
         FdEntry::DevNull => Some("/dev/null".into()),
+        FdEntry::DevZero => Some("/dev/zero".into()),
         FdEntry::File(file) => Some(file.path.clone()),
         FdEntry::Directory(dir) => Some(dir.path.clone()),
         FdEntry::Pipe(_) => Some(format!("pipe:[{}]", fd)),

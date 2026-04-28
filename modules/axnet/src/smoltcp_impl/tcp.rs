@@ -24,6 +24,14 @@ const STATE_BUSY: u8 = 1;
 const STATE_CONNECTING: u8 = 2;
 const STATE_CONNECTED: u8 = 3;
 const STATE_LISTENING: u8 = 4;
+const TCP_STACK_DRIVE_ROUNDS: usize = 4;
+
+fn drive_tcp_stack() {
+    for _ in 0..TCP_STACK_DRIVE_ROUNDS {
+        SOCKET_SET.poll_interfaces();
+        axtask::yield_now();
+    }
+}
 
 /// A TCP socket that provides POSIX-like APIs.
 ///
@@ -272,7 +280,7 @@ impl TcpSocket {
 
         // SAFETY: `self.handle` should be initialized in a connected socket.
         let handle = unsafe { self.handle.get().read().unwrap() };
-        self.block_on(|| {
+        let len = self.block_on(|| {
             SOCKET_SET.with_socket_mut::<tcp::Socket, _, _>(handle, |socket| {
                 if !socket.is_active() {
                     // not open
@@ -292,7 +300,9 @@ impl TcpSocket {
                     Err(AxError::WouldBlock)
                 }
             })
-        })
+        })?;
+        drive_tcp_stack();
+        Ok(len)
     }
 
     /// Transmits data in the given buffer.
@@ -305,7 +315,7 @@ impl TcpSocket {
 
         // SAFETY: `self.handle` should be initialized in a connected socket.
         let handle = unsafe { self.handle.get().read().unwrap() };
-        self.block_on(|| {
+        let len = self.block_on(|| {
             SOCKET_SET.with_socket_mut::<tcp::Socket, _, _>(handle, |socket| {
                 if !socket.is_active() || !socket.may_send() {
                     // closed by remote
@@ -322,7 +332,9 @@ impl TcpSocket {
                     Err(AxError::WouldBlock)
                 }
             })
-        })
+        })?;
+        drive_tcp_stack();
+        Ok(len)
     }
 
     /// Whether the socket is readable or writable.
@@ -515,13 +527,14 @@ impl TcpSocket {
         F: FnMut() -> AxResult<T>,
     {
         if self.is_nonblocking() {
+            SOCKET_SET.poll_interfaces();
             f()
         } else {
             loop {
                 SOCKET_SET.poll_interfaces();
                 match f() {
                     Ok(t) => return Ok(t),
-                    Err(AxError::WouldBlock) => axtask::yield_now(),
+                    Err(AxError::WouldBlock) => drive_tcp_stack(),
                     Err(e) => return Err(e),
                 }
             }

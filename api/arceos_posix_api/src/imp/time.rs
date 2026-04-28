@@ -169,41 +169,6 @@ pub(crate) fn gettimeofday_values() -> (general::timeval, general::timezone) {
 }
 
 #[cfg(feature = "uspace")]
-pub(crate) fn sleep_duration(duration: Duration) {
-    #[cfg(feature = "multitask")]
-    axtask::sleep(duration);
-    #[cfg(not(feature = "multitask"))]
-    axhal::time::busy_wait(duration);
-}
-
-#[cfg(feature = "uspace")]
-pub(crate) fn nanosleep(req: general::timespec) -> Result<(), LinuxError> {
-    sleep_duration(timespec_to_duration(req)?);
-    Ok(())
-}
-
-#[cfg(feature = "uspace")]
-pub(crate) fn clock_nanosleep(
-    clockid: u32,
-    flags: u32,
-    req: general::timespec,
-) -> Result<(), LinuxError> {
-    let deadline = timespec_to_duration(req)?;
-    if flags & !general::TIMER_ABSTIME != 0 {
-        return Err(LinuxError::EINVAL);
-    }
-    if flags & general::TIMER_ABSTIME != 0 {
-        let now = clock_now_duration(clockid)?;
-        if let Some(delta) = deadline.checked_sub(now) {
-            sleep_duration(delta);
-        }
-        return Ok(());
-    }
-    sleep_duration(deadline);
-    Ok(())
-}
-
-#[cfg(feature = "uspace")]
 fn real_timer_states() -> &'static Mutex<BTreeMap<i32, RealTimerState>> {
     static REAL_TIMERS: LazyInit<Mutex<BTreeMap<i32, RealTimerState>>> = LazyInit::new();
     REAL_TIMERS.call_once(|| Mutex::new(BTreeMap::new()));

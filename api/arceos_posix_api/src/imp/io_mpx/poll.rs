@@ -1,4 +1,4 @@
-use core::time::Duration;
+use core::{cmp, time::Duration};
 
 use axerrno::LinuxError;
 use axhal::time::wall_time;
@@ -18,16 +18,22 @@ pub(crate) struct PollEvent {
     pub revents: i16,
 }
 
-pub(crate) fn poll_events<F>(
+pub(crate) fn poll_events<F, I>(
     events: &mut [PollEvent],
     timeout: Option<Duration>,
     mut poll_state: F,
+    mut should_interrupt: I,
 ) -> Result<usize, LinuxError>
 where
     F: FnMut(i32) -> Result<PollState, LinuxError>,
+    I: FnMut() -> bool,
 {
     let deadline = timeout.map(|timeout| wall_time() + timeout);
     loop {
+        if should_interrupt() {
+            return Err(LinuxError::EINTR);
+        }
+
         #[cfg(feature = "net")]
         axnet::poll_interfaces();
 
@@ -57,9 +63,17 @@ where
         if ready > 0 {
             return Ok(ready);
         }
-        if deadline.is_some_and(|deadline| wall_time() >= deadline) {
-            return Ok(0);
+        if let Some(deadline) = deadline {
+            let now = wall_time();
+            if now >= deadline {
+                return Ok(0);
+            }
+            axtask::sleep(cmp::min(
+                deadline - now,
+                Duration::from_millis(1),
+            ));
+        } else {
+            crate::imp::task::sys_sched_yield();
         }
-        crate::imp::task::sys_sched_yield();
     }
 }
