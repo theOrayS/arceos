@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -88,6 +89,9 @@ const SHM_RDONLY_FLAG: i32 = 0o10000;
 const SHM_RND_FLAG: i32 = 0o20000;
 const SHM_REMAP_FLAG: i32 = 0o40000;
 const SHM_DEST_FLAG: u32 = 0o1000;
+const COMPAT_MS_ASYNC_FLAG: usize = 0x1;
+const COMPAT_MS_INVALIDATE_FLAG: usize = 0x2;
+const COMPAT_MS_SYNC_FLAG: usize = 0x4;
 #[cfg(feature = "net")]
 const SOL_SOCKET_LEVEL: i32 = 1;
 #[cfg(feature = "net")]
@@ -96,6 +100,8 @@ const SO_REUSEADDR_OPT: i32 = 2;
 const SO_TYPE_OPT: i32 = 3;
 #[cfg(feature = "net")]
 const SO_ERROR_OPT: i32 = 4;
+#[cfg(feature = "net")]
+const SO_DONTROUTE_OPT: i32 = 5;
 #[cfg(feature = "net")]
 const SO_BROADCAST_OPT: i32 = 6;
 #[cfg(feature = "net")]
@@ -110,6 +116,10 @@ const SO_REUSEPORT_OPT: i32 = 15;
 const SO_RCVTIMEO_OPT: i32 = 20;
 #[cfg(feature = "net")]
 const SO_SNDTIMEO_OPT: i32 = 21;
+#[cfg(feature = "net")]
+const IPPROTO_IP_LEVEL: i32 = ctypes::IPPROTO_IP as i32;
+#[cfg(feature = "net")]
+const IP_RECVERR_OPT: i32 = 11;
 #[cfg(feature = "net")]
 const TCP_NODELAY_OPT: i32 = 1;
 #[cfg(feature = "net")]
@@ -154,6 +164,10 @@ macro_rules! user_trace {
     ($($arg:tt)*) => {};
 }
 
+fn trace_process_lifecycle() -> bool {
+    option_env!("ARCEOS_TRACE_PROCESS").is_some()
+}
+
 struct UserTaskExt {
     process: Arc<UserProcess>,
     clear_child_tid: AtomicUsize,
@@ -188,7 +202,7 @@ struct UserProcess {
     rlimits: Mutex<BTreeMap<u32, UserRlimit>>,
     signal_actions: Mutex<BTreeMap<usize, general::kernel_sigaction>>,
     pid: AtomicI32,
-    ppid: i32,
+    ppid: AtomicI32,
     live_threads: AtomicUsize,
     exit_group_code: AtomicI32,
     exit_code: AtomicI32,
@@ -361,10 +375,24 @@ impl UserSocket {
         }
     }
 
-    fn shutdown(&self) -> Result<(), LinuxError> {
+    fn shutdown(&self, how: usize) -> Result<(), LinuxError> {
+        const SHUT_RD: usize = 0;
+        const SHUT_WR: usize = 1;
+        const SHUT_RDWR: usize = 2;
+
+        if how > SHUT_RDWR {
+            return Err(LinuxError::EINVAL);
+        }
         match self {
             Self::Udp(socket) => socket.lock().shutdown().map_err(LinuxError::from),
-            Self::Tcp(socket) => socket.lock().shutdown().map_err(LinuxError::from),
+            Self::Tcp(socket) if how == SHUT_WR => socket
+                .lock()
+                .shutdown_write()
+                .map_err(LinuxError::from),
+            Self::Tcp(socket) if how == SHUT_RD || how == SHUT_RDWR => {
+                socket.lock().shutdown().map_err(LinuxError::from)
+            }
+            Self::Tcp(_) => Err(LinuxError::EINVAL),
             Self::LocalStream(socket) => socket.shutdown(),
         }
     }
@@ -436,10 +464,10 @@ enum RingBufferStatus {
     Normal,
 }
 
-const PIPE_BUF_SIZE: usize = 4096;
+const PIPE_BUF_SIZE: usize = 64 * 1024;
 
 struct PipeRingBuffer {
-    data: [u8; PIPE_BUF_SIZE],
+    data: Box<[u8]>,
     head: usize,
     tail: usize,
     status: RingBufferStatus,
@@ -763,9 +791,9 @@ struct UserSchedParam {
 const NO_EXIT_GROUP_CODE: i32 = i32::MIN;
 
 impl PipeRingBuffer {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            data: [0; PIPE_BUF_SIZE],
+            data: vec![0; PIPE_BUF_SIZE].into_boxed_slice(),
             head: 0,
             tail: 0,
             status: RingBufferStatus::Empty,
@@ -1186,7 +1214,7 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         rlimits: Mutex::new(BTreeMap::new()),
         signal_actions: Mutex::new(BTreeMap::new()),
         pid: AtomicI32::new(0),
-        ppid: 1,
+        ppid: AtomicI32::new(1),
         live_threads: AtomicUsize::new(1),
         exit_group_code: AtomicI32::new(NO_EXIT_GROUP_CODE),
         exit_code: AtomicI32::new(0),
@@ -1939,7 +1967,78 @@ impl UserProcess {
     }
 
     fn ppid(&self) -> i32 {
-        self.ppid
+        self.ppid.load(Ordering::Acquire)
+    }
+
+    fn set_ppid(&self, ppid: i32) {
+        self.ppid.store(ppid, Ordering::Release);
+    }
+
+    fn reparent_children(&self) {
+        let mut orphans = {
+            let mut children = self.children.lock();
+            if children.is_empty() {
+                return;
+            }
+            core::mem::take(&mut *children)
+        };
+
+        let adopter = {
+            let table = user_thread_table().lock();
+            let parent_pid = self.ppid();
+            table
+                .values()
+                .find(|entry| entry.process.pid() == parent_pid)
+                .map(|entry| entry.process.clone())
+                .or_else(|| {
+                    table
+                        .values()
+                        .find(|entry| entry.process.pid() == 1)
+                        .map(|entry| entry.process.clone())
+                })
+        };
+
+        let Some(adopter) = adopter else {
+            if trace_process_lifecycle() {
+                info!(
+                    "process-trace: reparent deferred pid={} path={} children={}",
+                    self.pid(),
+                    self.exec_path(),
+                    orphans.len(),
+                );
+            }
+            *self.children.lock() = orphans;
+            return;
+        };
+        if adopter.pid() == self.pid() {
+            if trace_process_lifecycle() {
+                info!(
+                    "process-trace: reparent skipped self pid={} path={} children={}",
+                    self.pid(),
+                    self.exec_path(),
+                    orphans.len(),
+                );
+            }
+            *self.children.lock() = orphans;
+            return;
+        }
+
+        let adopter_pid = adopter.pid();
+        if trace_process_lifecycle() {
+            info!(
+                "process-trace: reparent parent_pid={} parent_path={} adopter_pid={} adopter_path={} children={}",
+                self.pid(),
+                self.exec_path(),
+                adopter_pid,
+                adopter.exec_path(),
+                orphans.len(),
+            );
+        }
+        for child in &orphans {
+            child.process.set_ppid(adopter_pid);
+        }
+        adopter.children.lock().extend(orphans.drain(..));
+        adopter.exit_wait.notify_all(false);
     }
 
     fn pid(&self) -> i32 {
@@ -1967,19 +2066,42 @@ impl UserProcess {
 
     fn note_thread_exit(&self, code: i32) {
         self.exit_code.store(code, Ordering::Release);
-        if self.live_threads.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let live_before = self.live_threads.fetch_sub(1, Ordering::AcqRel);
+        if live_before == 1 {
+            if trace_process_lifecycle() {
+                info!(
+                    "process-trace: exit pid={} ppid={} path={} code={} children={}",
+                    self.pid(),
+                    self.ppid(),
+                    self.exec_path(),
+                    code,
+                    self.children.lock().len(),
+                );
+            }
             self.complete_vfork();
             self.fds.lock().close_all();
             imp_time::clear_process_interval_timer(self.pid());
             crate::imp::fs::clear_process_umask(self.pid());
+            self.reparent_children();
             if self.ppid() > 0 {
                 let parent = user_thread_table()
                     .lock()
                     .values()
                     .find(|entry| entry.process.pid() == self.ppid())
                     .cloned();
-                if let Some(entry) = parent {
-                    let _ = deliver_user_signal(&entry, SIGCHLD_NUM as i32);
+                if let Some(entry) = parent
+                {
+                    entry.process.exit_wait.notify_all(false);
+                    let sigchld_handler = entry
+                        .process
+                        .signal_actions
+                        .lock()
+                        .get(&(SIGCHLD_NUM as usize))
+                        .and_then(|action| action.sa_handler_kernel.map(|func| func as usize))
+                        .unwrap_or(0);
+                    if sigchld_handler != 1 {
+                        let _ = deliver_user_signal(&entry, SIGCHLD_NUM as i32);
+                    }
                 }
             }
             self.exit_wait.notify_all(false);
@@ -2056,7 +2178,7 @@ impl UserProcess {
             rlimits: Mutex::new(self.rlimits.lock().clone()),
             signal_actions: Mutex::new(self.signal_actions.lock().clone()),
             pid: AtomicI32::new(0),
-            ppid: axtask::current().id().as_u64() as i32,
+            ppid: AtomicI32::new(axtask::current().id().as_u64() as i32),
             live_threads: AtomicUsize::new(1),
             exit_group_code: AtomicI32::new(NO_EXIT_GROUP_CODE),
             exit_code: AtomicI32::new(0),
@@ -2067,6 +2189,15 @@ impl UserProcess {
 
     fn add_child(&self, _task: AxTaskRef, process: Arc<UserProcess>) -> i32 {
         let pid = process.pid();
+        if trace_process_lifecycle() {
+            info!(
+                "process-trace: add_child parent_pid={} parent_path={} child_pid={} child_path={}",
+                self.pid(),
+                self.exec_path(),
+                pid,
+                process.exec_path(),
+            );
+        }
         self.children.lock().push(ChildTask { pid, process });
         pid
     }
@@ -2078,6 +2209,14 @@ impl UserProcess {
         fn reap_child(child: ChildTask) -> Result<(i32, i32), LinuxError> {
             let status = child.process.exit_code.load(Ordering::Acquire);
             let child_pid = child.pid;
+            if trace_process_lifecycle() {
+                info!(
+                    "process-trace: reap child_pid={} child_path={} status={}",
+                    child_pid,
+                    child.process.exec_path(),
+                    status,
+                );
+            }
             child.process.teardown();
             drop(child);
             axtask::yield_now();
@@ -2135,13 +2274,13 @@ impl UserProcess {
                 return Ok(None);
             }
             if let Some(ext) = current_task_ext() {
-                if let Some(code) = ext.process.pending_exit_group() {
-                    terminate_current_thread(ext.process.as_ref(), code);
-                }
-                if current_unblocked_pending_signal().is_some() {
+                if current_exit_or_signal_pending() {
+                    if let Some(code) = ext.process.pending_exit_group() {
+                        terminate_current_thread(ext.process.as_ref(), code);
+                    }
                     return Err(LinuxError::EINTR);
                 }
-                ext.signal_wait.wait_timeout(Duration::from_millis(10));
+                self.exit_wait.wait_timeout(Duration::from_millis(10));
             } else {
                 if current_unblocked_pending_signal().is_some() {
                     return Err(LinuxError::EINTR);
@@ -2449,12 +2588,24 @@ fn clear_current_pipe_wait() {
 }
 
 fn current_exit_or_signal_pending() -> bool {
+    imp_time::poll_real_timers();
     if let Some(ext) = current_task_ext()
         && ext.process.pending_exit_group().is_some()
     {
         return true;
     }
     current_unblocked_pending_signal().is_some()
+}
+
+#[cfg(feature = "net")]
+fn trace_netperf_process(process: &UserProcess) -> bool {
+    option_env!("ARCEOS_TRACE_NETPERF").is_some()
+        && trace_netperf_path(process.exec_path().as_str())
+}
+
+#[cfg(feature = "net")]
+fn trace_netperf_path(path: &str) -> bool {
+    path.contains("netperf") || path.contains("netserver")
 }
 
 fn futex_state(uaddr: usize, bitset: u32) -> Arc<FutexState> {
@@ -2672,7 +2823,21 @@ fn handle_signal_without_user_handler(ext: &UserTaskExt, sig: i32, handler: usiz
 fn current_unblocked_pending_signal() -> Option<i32> {
     current_task_ext().and_then(|ext| {
         let sig = ext.pending_signal.load(Ordering::Acquire);
-        (sig > 0 && !signal_is_blocked(ext, sig)).then_some(sig)
+        if sig <= 0 || signal_is_blocked(ext, sig) {
+            return None;
+        }
+        match signal_disposition(ext.process.as_ref(), sig) {
+            SignalDisposition::Ignore => {
+                let _ = ext.pending_signal.compare_exchange(
+                    sig,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                None
+            }
+            SignalDisposition::Terminate | SignalDisposition::Handler => Some(sig),
+        }
     })
 }
 
@@ -2686,6 +2851,10 @@ fn user_return_hook(tf: &mut TrapFrame) {
     let Some(ext) = current_task_ext() else {
         return;
     };
+    imp_time::poll_real_timers();
+    if let Some(code) = ext.process.pending_exit_group() {
+        terminate_current_thread(ext.process.as_ref(), code);
+    }
     if ext.signal_frame.load(Ordering::Acquire) == 0 {
         if let Some(restored) = ext.pending_sigreturn.lock().take() {
             *tf = restored;
@@ -2696,6 +2865,15 @@ fn user_return_hook(tf: &mut TrapFrame) {
     if ext.signal_frame.load(Ordering::Acquire) == 0 {
         let sig = ext.pending_signal.load(Ordering::Acquire);
         if sig != 0 && !signal_is_blocked(ext, sig) {
+            #[cfg(feature = "net")]
+            if sig == general::SIGALRM as i32 && trace_netperf_process(ext.process.as_ref()) {
+                info!(
+                    "netperf-trace: path={} signal=inject sig={} tid={}",
+                    ext.process.exec_path(),
+                    sig,
+                    current_tid(),
+                );
+            }
             let _ = inject_pending_signal(tf, ext, sig);
         }
     }
@@ -3301,6 +3479,7 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         ),
         general::__NR_mprotect => sys_mprotect(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_munmap => sys_munmap(&process, tf, tf.arg0(), tf.arg1()),
+        general::__NR_msync => compat_msync(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_shmget => sys_shmget(&process, tf.arg0() as i32, tf.arg1(), tf.arg2() as i32),
         general::__NR_shmctl => sys_shmctl(&process, tf.arg0() as i32, tf.arg1() as i32, tf.arg2()),
         general::__NR_shmat => sys_shmat(&process, tf.arg0() as i32, tf.arg1(), tf.arg2() as i32),
@@ -3473,7 +3652,7 @@ fn sys_pwrite64(
 }
 
 fn sys_write(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize {
-    with_readable_slice(process, buf, count, |src| {
+    let ret = with_readable_slice(process, buf, count, |src| {
         #[cfg(feature = "net")]
         {
             let socket = {
@@ -3500,7 +3679,18 @@ fn sys_write(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isiz
             return pipe.write(src);
         }
         process.fds.lock().write(fd as i32, src)
-    })
+    });
+    #[cfg(feature = "net")]
+    if trace_netperf_process(process) && (fd <= 2 || ret < 0) {
+        info!(
+            "netperf-trace: path={} syscall=write fd={} len={} ret={}",
+            process.exec_path(),
+            fd,
+            count,
+            ret,
+        );
+    }
+    ret
 }
 
 fn sys_sched_yield(_tf: &TrapFrame) -> isize {
@@ -3707,6 +3897,7 @@ impl Drop for SocketNonblockingGuard {
 
 #[cfg(feature = "net")]
 fn socket_wait_interruptible(process: &UserProcess) -> Result<(), LinuxError> {
+    imp_time::poll_real_timers();
     axnet::poll_interfaces();
     if let Some(code) = process.pending_exit_group() {
         terminate_current_thread(process, code);
@@ -3989,10 +4180,19 @@ fn sys_connect(
             Err(err) => return neg_errno(err),
         }
     };
-    match socket_connect_interruptible(process, &socket, addr) {
+    let ret = match socket_connect_interruptible(process, &socket, addr) {
         Ok(()) => 0,
         Err(err) => neg_errno(err),
+    };
+    if trace_netperf_process(process) {
+        info!(
+            "netperf-trace: path={} syscall=connect fd={} ret={}",
+            process.exec_path(),
+            socket_fd,
+            ret,
+        );
     }
+    ret
 }
 
 #[cfg(feature = "net")]
@@ -4045,7 +4245,7 @@ fn sys_accept4(
         }
     }
     let accepted = Arc::new(UserSocket::Tcp(Mutex::new(accepted)));
-    match install_socket_fd(
+    let ret = match install_socket_fd(
         process,
         accepted,
         ctypes::SOCK_STREAM,
@@ -4058,7 +4258,16 @@ fn sys_accept4(
     ) {
         Ok(fd) => fd as isize,
         Err(err) => neg_errno(err),
+    };
+    if trace_netperf_process(process) {
+        info!(
+            "netperf-trace: path={} syscall=accept fd={} ret={}",
+            process.exec_path(),
+            socket_fd,
+            ret,
+        );
     }
+    ret
 }
 
 #[cfg(feature = "net")]
@@ -4115,7 +4324,7 @@ fn sys_sendto(
             Err(err) => return neg_errno(err),
         }
     };
-    with_readable_slice(process, buf_ptr, len, |src| {
+    let ret = with_readable_slice(process, buf_ptr, len, |src| {
         let socket = {
             let table = process.fds.lock();
             socket_entry(&table, socket_fd as i32)?
@@ -4130,7 +4339,18 @@ fn sys_sendto(
                 sock.send(src)
             }),
         }
-    })
+    });
+    if trace_netperf_process(process) && len != 1000 && len != 64 {
+        info!(
+            "netperf-trace: path={} syscall=sendto fd={} len={} target={} ret={}",
+            process.exec_path(),
+            socket_fd,
+            len,
+            socket_addr != 0,
+            ret,
+        );
+    }
+    ret
 }
 
 #[cfg(feature = "net")]
@@ -4146,7 +4366,7 @@ fn sys_recvfrom(
     if (socket_addr == 0) != (addrlen == 0) {
         return neg_errno(LinuxError::EFAULT);
     }
-    with_writable_slice(process, buf_ptr, len, |dst| {
+    let ret = with_writable_slice(process, buf_ptr, len, |dst| {
         let socket = {
             let table = process.fds.lock();
             socket_entry(&table, socket_fd as i32)?
@@ -4161,7 +4381,17 @@ fn sys_recvfrom(
             }
         }
         Ok(read)
-    })
+    });
+    if trace_netperf_process(process) && (ret < 0 || len != 1000 && len != 64) {
+        info!(
+            "netperf-trace: path={} syscall=recvfrom fd={} len={} ret={}",
+            process.exec_path(),
+            socket_fd,
+            len,
+            ret,
+        );
+    }
+    ret
 }
 
 #[cfg(feature = "net")]
@@ -4215,10 +4445,20 @@ fn sys_setsockopt(
         (SOL_SOCKET_LEVEL, SO_REUSEADDR_OPT)
         | (SOL_SOCKET_LEVEL, SO_REUSEPORT_OPT)
         | (SOL_SOCKET_LEVEL, SO_KEEPALIVE_OPT)
+        | (SOL_SOCKET_LEVEL, SO_DONTROUTE_OPT)
         | (SOL_SOCKET_LEVEL, SO_BROADCAST_OPT) => {
             if optval == 0 || optlen == 0 {
                 return neg_errno(LinuxError::EFAULT);
             }
+            0
+        }
+        (IPPROTO_IP_LEVEL, IP_RECVERR_OPT) => {
+            if optval == 0 || optlen == 0 {
+                return neg_errno(LinuxError::EFAULT);
+            }
+            // Linux-specific extended error queues are not exposed by the
+            // smoltcp-backed stack. Accepting the flag as a no-op is safe for
+            // loopback benchmarks that only use it for optional diagnostics.
             0
         }
         (IPPROTO_TCP_LEVEL, TCP_NODELAY_OPT) => {
@@ -4371,7 +4611,7 @@ fn sys_getsockopt(
 }
 
 #[cfg(feature = "net")]
-fn sys_shutdown(process: &UserProcess, socket_fd: usize, _how: usize) -> isize {
+fn sys_shutdown(process: &UserProcess, socket_fd: usize, how: usize) -> isize {
     let socket = {
         let table = process.fds.lock();
         match socket_entry(&table, socket_fd as i32) {
@@ -4379,10 +4619,24 @@ fn sys_shutdown(process: &UserProcess, socket_fd: usize, _how: usize) -> isize {
             Err(err) => return neg_errno(err),
         }
     };
-    match socket.socket.shutdown() {
+    let ret = match socket.socket.shutdown(how) {
         Ok(()) => 0,
         Err(err) => neg_errno(err),
+    };
+    if ret == 0 {
+        axnet::poll_interfaces();
+        axtask::yield_now();
     }
+    if trace_netperf_process(process) {
+        info!(
+            "netperf-trace: path={} syscall=shutdown fd={} how={} ret={}",
+            process.exec_path(),
+            socket_fd,
+            how,
+            ret,
+        );
+    }
+    ret
 }
 
 fn sys_ppoll(
@@ -4497,11 +4751,21 @@ fn sys_pselect6(
     };
     loop {
         if current_exit_or_signal_pending() {
+            if trace_netperf_process(process) {
+                info!(
+                    "netperf-trace: path={} syscall=pselect6 nfds={} ret=-4",
+                    process.exec_path(),
+                    nfds,
+                );
+            }
             return neg_errno(LinuxError::EINTR);
         }
 
         #[cfg(feature = "net")]
-        axnet::poll_interfaces();
+        for _ in 0..4 {
+            axnet::poll_interfaces();
+            axtask::yield_now();
+        }
         let mut ready_read = [0usize; FD_SET_WORDS];
         let mut ready_write = [0usize; FD_SET_WORDS];
         let mut ready_except = [0usize; FD_SET_WORDS];
@@ -4538,6 +4802,14 @@ fn sys_pselect6(
             if ret != 0 {
                 return ret;
             }
+            if trace_netperf_process(process) {
+                info!(
+                    "netperf-trace: path={} syscall=pselect6 nfds={} ret={}",
+                    process.exec_path(),
+                    nfds,
+                    ready,
+                );
+            }
             return ready as isize;
         }
         if let Some(ddl) = deadline {
@@ -4561,6 +4833,13 @@ fn sys_pselect6(
             let ret = write_fd_set(process, exceptfds, &[0; FD_SET_WORDS]);
             if ret != 0 {
                 return ret;
+            }
+            if trace_netperf_process(process) {
+                info!(
+                    "netperf-trace: path={} syscall=pselect6 nfds={} ret=0",
+                    process.exec_path(),
+                    nfds,
+                );
             }
             return 0;
         }
@@ -4942,17 +5221,65 @@ fn sys_wait4(
         | general::__WCLONE;
 
     let options = options as u32;
+    if trace_process_lifecycle() {
+        info!(
+            "process-trace: wait4 enter pid={} path={} requested={} options={:#x} children={}",
+            process.pid(),
+            process.exec_path(),
+            pid,
+            options,
+            process.children.lock().len(),
+        );
+    }
     if options & !SUPPORTED_WAIT_OPTIONS != 0 {
+        if trace_process_lifecycle() {
+            info!(
+                "process-trace: wait4 invalid-options pid={} path={} requested={} options={:#x}",
+                process.pid(),
+                process.exec_path(),
+                pid,
+                options,
+            );
+        }
         return neg_errno(LinuxError::EINVAL);
     }
 
     let nohang = options & general::WNOHANG != 0;
     let Some((child_pid, exit_code)) = (match process.wait_child(pid, nohang) {
         Ok(result) => result,
-        Err(err) => return neg_errno(err),
+        Err(err) => {
+            if trace_process_lifecycle() {
+                info!(
+                    "process-trace: wait4 error pid={} path={} requested={} err={:?}",
+                    process.pid(),
+                    process.exec_path(),
+                    pid,
+                    err,
+                );
+            }
+            return neg_errno(err);
+        }
     }) else {
+        if trace_process_lifecycle() {
+            info!(
+                "process-trace: wait4 none pid={} path={} requested={}",
+                process.pid(),
+                process.exec_path(),
+                pid,
+            );
+        }
         return 0;
     };
+    #[cfg(feature = "net")]
+    if option_env!("ARCEOS_TRACE_NETPERF").is_some() {
+        info!(
+            "netperf-trace: path={} syscall=wait4 requested={} child={} exit={}",
+            process.exec_path(),
+            pid,
+            child_pid,
+            exit_code,
+        );
+    }
     user_trace!("user-wait4: requested pid={pid}, child={child_pid}, exit={exit_code}");
     if status != 0 {
         let wait_status = (exit_code & 0xff) << 8;
@@ -5340,10 +5667,20 @@ fn sys_renameat2(
 }
 
 fn sys_close(process: &UserProcess, fd: usize) -> isize {
-    match process.fds.lock().close(fd as i32) {
+    let ret = match process.fds.lock().close(fd as i32) {
         Ok(()) => 0,
         Err(err) => neg_errno(err),
+    };
+    #[cfg(feature = "net")]
+    if trace_netperf_process(process) && (ret < 0 || fd == 4) {
+        info!(
+            "netperf-trace: path={} syscall=close-exit fd={} ret={}",
+            process.exec_path(),
+            fd,
+            ret,
+        );
     }
+    ret
 }
 
 fn sys_newfstatat(
@@ -6130,6 +6467,38 @@ fn sys_munmap(process: &UserProcess, tf: &TrapFrame, addr: usize, len: usize) ->
     }
 }
 
+// compat(mm-file-writeback): current mmap copies file contents into user pages
+// and has no shared dirty-page writeback or page-cache invalidation model.
+// delete-when: AddrSpace/mmap tracks file-backed VMAs and exposes real
+// msync(MS_SYNC/MS_ASYNC/MS_INVALIDATE) writeback and invalidation semantics.
+fn compat_msync(process: &UserProcess, addr: usize, len: usize, flags: usize) -> isize {
+    let supported_flags =
+        COMPAT_MS_ASYNC_FLAG | COMPAT_MS_INVALIDATE_FLAG | COMPAT_MS_SYNC_FLAG;
+    if flags & !supported_flags != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    if flags & COMPAT_MS_ASYNC_FLAG != 0 && flags & COMPAT_MS_SYNC_FLAG != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    if addr & (PAGE_SIZE_4K - 1) != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    if len == 0 {
+        return 0;
+    }
+    let end = match addr.checked_add(len) {
+        Some(end) => align_up(end, PAGE_SIZE_4K),
+        None => return neg_errno(LinuxError::ENOMEM),
+    };
+    let aspace = process.aspace.lock();
+    for page in PageIter4K::new(VirtAddr::from(addr), VirtAddr::from(end)).unwrap() {
+        if aspace.page_table().query(page).is_err() {
+            return neg_errno(LinuxError::ENOMEM);
+        }
+    }
+    0
+}
+
 fn sys_mprotect(_process: &UserProcess, _addr: usize, _len: usize, _prot: usize) -> isize {
     if _len == 0 {
         return neg_errno(LinuxError::EINVAL);
@@ -6404,7 +6773,7 @@ fn sys_futex(
                 current_task_ext().is_some_and(futex_wait_token_changed)
                     || read_user_value::<u32>(process, uaddr)
                         .map_or(true, |value| value != val as u32)
-                    || current_unblocked_pending_signal().is_some()
+                    || current_exit_or_signal_pending()
             };
             if let Some(timeout) = timeout {
                 let dur = match timeout {
@@ -6415,6 +6784,11 @@ fn sys_futex(
                     if wait_cond() {
                         if let Some(ext) = current_task_ext() {
                             clear_futex_wait_token(ext);
+                        }
+                        if let Some(ext) = current_task_ext()
+                            && let Some(code) = ext.process.pending_exit_group()
+                        {
+                            terminate_current_thread(ext.process.as_ref(), code);
                         }
                         if current_unblocked_pending_signal().is_some() {
                             return neg_errno(LinuxError::EINTR);
@@ -6430,9 +6804,18 @@ fn sys_futex(
                     axtask::yield_now();
                 }
             }
-            state.queue.wait_until(wait_cond);
+            while !wait_cond() {
+                state
+                    .queue
+                    .wait_timeout_until(Duration::from_millis(10), wait_cond);
+            }
             if let Some(ext) = current_task_ext() {
                 clear_futex_wait_token(ext);
+            }
+            if let Some(ext) = current_task_ext()
+                && let Some(code) = ext.process.pending_exit_group()
+            {
+                terminate_current_thread(ext.process.as_ref(), code);
             }
             if current_unblocked_pending_signal().is_some() {
                 return neg_errno(LinuxError::EINTR);
@@ -6571,6 +6954,14 @@ fn sys_rt_sigreturn(process: &UserProcess) -> isize {
                 restored.regs.sp,
                 restored.regs.tp,
                 restored.sepc,
+            );
+        }
+        #[cfg(feature = "net")]
+        if trace_netperf_process(process) {
+            info!(
+                "netperf-trace: path={} syscall=rt_sigreturn tid={} ret=0",
+                process.exec_path(),
+                current_tid(),
             );
         }
         ext.signal_frame.store(0, Ordering::Release);
@@ -6883,6 +7274,15 @@ fn sys_prlimit64(
 
 fn sys_exit(process: &UserProcess, tf: &TrapFrame, code: i32) -> ! {
     let _ = tf;
+    #[cfg(feature = "net")]
+    if trace_netperf_process(process) {
+        info!(
+            "netperf-trace: path={} syscall=exit tid={} code={}",
+            process.exec_path(),
+            current_tid(),
+            code,
+        );
+    }
     user_trace!(
         "user-exit: tid={} code={code} sp={:#x} tp={:#x} ra={:#x} pc={:#x}",
         current_tid(),
@@ -6896,6 +7296,15 @@ fn sys_exit(process: &UserProcess, tf: &TrapFrame, code: i32) -> ! {
 
 fn sys_exit_group(process: &UserProcess, tf: &TrapFrame, code: i32) -> ! {
     let _ = tf;
+    #[cfg(feature = "net")]
+    if trace_netperf_process(process) {
+        info!(
+            "netperf-trace: path={} syscall=exit_group tid={} code={}",
+            process.exec_path(),
+            current_tid(),
+            code,
+        );
+    }
     user_trace!(
         "user-exit-group: tid={} code={code} sp={:#x} tp={:#x} ra={:#x} pc={:#x}",
         current_tid(),

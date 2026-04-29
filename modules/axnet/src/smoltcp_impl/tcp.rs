@@ -27,7 +27,11 @@ const STATE_LISTENING: u8 = 4;
 const TCP_STACK_DRIVE_ROUNDS: usize = 4;
 
 fn drive_tcp_stack() {
-    for _ in 0..TCP_STACK_DRIVE_ROUNDS {
+    drive_tcp_stack_rounds(TCP_STACK_DRIVE_ROUNDS);
+}
+
+fn drive_tcp_stack_rounds(rounds: usize) {
+    for _ in 0..rounds {
         SOCKET_SET.poll_interfaces();
         axtask::yield_now();
     }
@@ -270,6 +274,22 @@ impl TcpSocket {
         Ok(())
     }
 
+    /// Half-closes the transmit side while keeping the receive side readable.
+    pub fn shutdown_write(&self) -> AxResult {
+        if !self.is_connected() {
+            return Ok(());
+        }
+
+        // SAFETY: `self.handle` should be initialized in a connected socket.
+        let handle = unsafe { self.handle.get().read().unwrap() };
+        SOCKET_SET.with_socket_mut::<tcp::Socket, _, _>(handle, |socket| {
+            debug!("TCP socket {}: shutting down write side", handle);
+            socket.close();
+        });
+        drive_tcp_stack();
+        Ok(())
+    }
+
     /// Receives data from the socket, stores it in the given buffer.
     pub fn recv(&self, buf: &mut [u8]) -> AxResult<usize> {
         if self.is_connecting() {
@@ -282,19 +302,19 @@ impl TcpSocket {
         let handle = unsafe { self.handle.get().read().unwrap() };
         let len = self.block_on(|| {
             SOCKET_SET.with_socket_mut::<tcp::Socket, _, _>(handle, |socket| {
-                if !socket.is_active() {
-                    // not open
-                    ax_err!(ConnectionRefused, "socket recv() failed")
-                } else if !socket.may_recv() {
-                    // connection closed
-                    Ok(0)
-                } else if socket.recv_queue() > 0 {
+                if socket.recv_queue() > 0 {
                     // data available
                     // TODO: use socket.recv(|buf| {...})
                     let len = socket
                         .recv_slice(buf)
                         .map_err(|_| ax_err_type!(BadState, "socket recv() failed"))?;
                     Ok(len)
+                } else if !socket.may_recv() {
+                    // connection closed
+                    Ok(0)
+                } else if !socket.is_active() {
+                    // not open
+                    ax_err!(ConnectionRefused, "socket recv() failed")
                 } else {
                     // no more data
                     Err(AxError::WouldBlock)

@@ -60,7 +60,7 @@ Status values:
 | `preadv` | 69 | `sys_preadv` | Real-partial | iozone | medium | syscall/fd/fs | Vector read uses explicit offset and shared iovec loader; `preadv2` flags remain separate future work. |
 | `pwritev` | 70 | `sys_pwritev` | Real-partial | iozone | medium | syscall/fd/fs | Vector write uses explicit offset and shared iovec loader; `pwritev2` flags remain separate future work. |
 | `sendfile` | 71 | none | Missing | busybox/coreutils possible | n/a | syscall/fd/fs | Defer; return `ENOSYS` until needed. |
-| `pselect6` | 72 | `sys_pselect6` | Partial | busybox, lmbench select | low | syscall/fd/signal | Finish readiness and signal mask semantics. |
+| `pselect6` | 72 | `sys_pselect6` | Partial | busybox, lmbench select, netperf control close | low | syscall/fd/signal | Finish readiness, timeout update, and signal mask semantics. |
 | `readlinkat` | 78 | none | Missing | busybox, LTP symlink | n/a | path/fs | Defer symlink support; return consistent errno. |
 | `sync` | 81 | none | Missing | busybox, LTP | n/a | fs | Add global flush or explicit `ENOSYS`. |
 | `fsync` | 82 | `sys_fsync` | Compat/partial | iozone, UnixBench, LTP | low | syscall/fd/fs | Calls backend `flush`; `compat_sync_unsupported_flush` treats unsupported synchronous-write backends as already clean. |
@@ -93,6 +93,7 @@ Status values:
 | `times` | 153 | `sys_times` | Partial | basic, UnixBench | medium | time/task | Fill process CPU times. |
 | `getrusage` | 165 | `sys_getrusage` | Partial | wait4, UnixBench | low | task/time | Add child/self resource accounting. |
 | `gettimeofday` | 169 | `sys_gettimeofday` | Real-partial | busybox, lmbench | medium | time | Confirm timezone behavior. |
+| `shutdown` | 210 | `sys_shutdown` | Real-partial | iperf, netperf | medium | syscall/socket | TCP `SHUT_WR` keeps the read side open for EOF readiness; complete `SHUT_RD` half-close semantics later. |
 | `getpid/getppid/gettid` | 172/173/178 | inline | Partial | basic, all process tests | medium | task/process | Separate pid/tgid/tid. |
 | `shmget/shmctl/shmat/shmdt` | 194-197 | `sys_shmget/sys_shmctl/sys_shmat/sys_shmdt` | Compat/partial | iozone, LTP mm/ipc | low | mm/ipc | `compat_shm_*` supports private anonymous segments, attach, detach, and `IPC_RMID`; keyed shm and explicit attach flags are rejected. |
 | `brk` | 214 | `sys_brk` | Partial | basic, libcbench | medium | mm/syscall | Move heap into VMA model. |

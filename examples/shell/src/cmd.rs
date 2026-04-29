@@ -452,10 +452,16 @@ fn copy_script_file(
     busybox_path: &str,
     rewrite_busybox_path: bool,
 ) -> io::Result<()> {
-    if let Some(parent) = parent_dir(dst) {
+    let parent = parent_dir(dst);
+    if let Some(parent) = parent {
         ensure_dir_all(parent)?;
     }
     let raw_script = fs::read_to_string(src)?;
+    if raw_script.contains("./busybox") {
+        if let Some(parent) = parent {
+            copy_file(busybox_path, &join_path(parent, "busybox"))?;
+        }
+    }
     let mut script = raw_script
         .lines()
         .map(|line| rewrite_script_line(line, busybox_path, rewrite_busybox_path))
@@ -568,7 +574,7 @@ fn rewrite_libctest_command(line: &str, busybox_path: &str) -> Option<String> {
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
-fn prepare_lmbench_script(stage_root: &str) -> io::Result<()> {
+fn prepare_lmbench_script(stage_root: &str, busybox_path: &str) -> io::Result<()> {
     let script_path = join_path(stage_root, "lmbench_testcode.sh");
     if !matches!(fs::metadata(&script_path), Ok(meta) if meta.is_file()) {
         return Ok(());
@@ -580,23 +586,43 @@ fn prepare_lmbench_script(stage_root: &str) -> io::Result<()> {
         "run_bounded ./lmbench_all lat_ctx -P 1 -N 1 -s 32 2 4 8 16 24 32 64 96",
         "run_bounded ./lmbench_all lat_ctx -P 1 -N 1 -s 32 2",
     );
-    let prefix = "set -x\nrun_bounded() {\n    ENOUGH=100 \"$@\" &\n    pid=$!\n    elapsed=0\n    while kill -0 \"$pid\" 2>/dev/null; do\n        if [ \"$elapsed\" -ge 30 ]; then\n            echo \"TIMEOUT: $*\"\n            kill \"$pid\" 2>/dev/null\n            wait \"$pid\" 2>/dev/null\n            return 124\n        fi\n        sleep 1\n        elapsed=$((elapsed + 1))\n    done\n    wait \"$pid\"\n}\n";
+    let prefix = format!(
+        "run_bounded() {{\n    ENOUGH=100 \"$@\" &\n    pid=$!\n    elapsed=0\n    while kill -0 \"$pid\" 2>/dev/null; do\n        if [ \"$elapsed\" -ge 30 ]; then\n            echo \"TIMEOUT: $*\"\n            kill \"$pid\" 2>/dev/null\n            wait \"$pid\" 2>/dev/null\n            return 124\n        fi\n        {busybox_path} sleep 1\n        elapsed=$((elapsed + 1))\n    done\n    wait \"$pid\"\n}}\n"
+    );
     write_text_file(&script_path, &format!("{prefix}{rewritten}"))
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
 fn rewrite_script_line(line: &str, busybox_path: &str, rewrite_busybox_path: bool) -> String {
-    let line = if rewrite_busybox_path {
-        line.replace("./busybox", busybox_path)
-    } else {
-        line.to_string()
-    };
+    let line = line.to_string();
+    let _ = rewrite_busybox_path;
+    if let Some(rewritten) = rewrite_relative_variable_exec(&line) {
+        return rewritten;
+    }
     for applet in SCRIPT_BUSYBOX_APPLETS {
         if let Some(rewritten) = prefix_busybox_applet(&line, applet, busybox_path) {
             return rewritten;
         }
     }
     line
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn rewrite_relative_variable_exec(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let var = trimmed.strip_prefix("./$")?;
+    if var.is_empty()
+        || !var
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return None;
+    }
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+    Some(format!(
+        "{indent}case \"${var}\" in /*) \"${var}\" ;; *) \"./${var}\" ;; esac"
+    ))
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
@@ -704,7 +730,7 @@ fn prepare_suite_stage_dir(suite_dir: &str, script_name: &str) -> io::Result<Opt
         prepare_libctest_runtest_wrapper(src_root, &stage_root, &busybox_path)?;
     }
     if group == "lmbench" {
-        prepare_lmbench_script(&stage_root)?;
+        prepare_lmbench_script(&stage_root, &busybox_path)?;
     }
 
     Ok(Some(stage_root))
@@ -803,9 +829,34 @@ pub fn maybe_run_official_tests() {
         std::process::exit(0);
     };
 
+    const AUTORUN_COMMAND: Option<&str> = option_env!("ARCEOS_AUTORUN_COMMAND");
+    const AUTORUN_CWD: Option<&str> = option_env!("ARCEOS_AUTORUN_CWD");
+    if let Some(command) = AUTORUN_COMMAND {
+        let cwd = AUTORUN_CWD.unwrap_or("/");
+        println!("#### OS COMP TEST GROUP START autorun-command ####");
+        if let Err(err) = std::env::set_current_dir(cwd) {
+            println!("autorun: cd {cwd} failed: {err}");
+        } else {
+            match run_user_program_argv_in(cwd, &[shell, "sh", "-c", command]) {
+                Ok(status) => println!("autorun-command status: {status}"),
+                Err(err) => println!("autorun-command failed: {err}"),
+            }
+        }
+        println!("#### OS COMP TEST GROUP END autorun-command ####");
+        std::io::stdout().flush().unwrap();
+        std::process::exit(0);
+    }
+
+    const AUTORUN_ONLY_GROUP: Option<&str> = option_env!("ARCEOS_AUTORUN_ONLY_GROUP");
+
     for (suite_dir, script_name) in scripts {
         let script = path_to_str(&script_name);
         let group = script.strip_suffix(SCRIPT_SUFFIX).unwrap_or(script);
+        if let Some(only_group) = AUTORUN_ONLY_GROUP {
+            if group != only_group {
+                continue;
+            }
+        }
         if suite_dir == "/glibc" && group == "libctest" {
             print_suite_skip(
                 &suite_dir,

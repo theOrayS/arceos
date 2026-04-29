@@ -1,5 +1,5 @@
 #[cfg(feature = "uspace")]
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{collections::BTreeMap, sync::Arc, vec::Vec};
 use axerrno::LinuxError;
 #[cfg(feature = "uspace")]
 use axsync::Mutex;
@@ -209,6 +209,40 @@ fn itimerval_from_state(state: &RealTimerState, now: axhal::time::TimeValue) -> 
 }
 
 #[cfg(feature = "uspace")]
+fn collect_due_real_timers(now: axhal::time::TimeValue) -> Vec<TimerCallback> {
+    let mut callbacks = Vec::new();
+    let mut states = real_timer_states().lock();
+    let due_pids = states
+        .iter()
+        .filter_map(|(&pid, state)| (state.deadline <= now).then_some(pid))
+        .collect::<Vec<_>>();
+    for pid in due_pids {
+        let Some(state) = states.get_mut(&pid) else {
+            continue;
+        };
+        callbacks.push(state.callback.clone());
+        if state.interval.is_zero() {
+            states.remove(&pid);
+        } else {
+            state.deadline = now + state.interval;
+        }
+    }
+    callbacks
+}
+
+#[cfg(feature = "uspace")]
+fn fire_due_real_timers(now: axhal::time::TimeValue) {
+    for callback in collect_due_real_timers(now) {
+        callback();
+    }
+}
+
+#[cfg(feature = "uspace")]
+pub(crate) fn poll_real_timers() {
+    fire_due_real_timers(axhal::time::wall_time());
+}
+
+#[cfg(feature = "uspace")]
 fn run_real_timer(pid: i32, generation: u64) {
     loop {
         let (deadline, callback) = {
@@ -228,6 +262,7 @@ fn run_real_timer(pid: i32, generation: u64) {
         }
 
         let next_deadline = {
+            let now = axhal::time::wall_time();
             let mut states = real_timer_states().lock();
             let Some(state) = states.get_mut(&pid) else {
                 return;
@@ -235,11 +270,14 @@ fn run_real_timer(pid: i32, generation: u64) {
             if state.generation != generation {
                 return;
             }
+            if state.deadline > now {
+                continue;
+            }
             if state.interval.is_zero() {
                 states.remove(&pid);
                 None
             } else {
-                let next = axhal::time::wall_time() + state.interval;
+                let next = now + state.interval;
                 state.deadline = next;
                 Some(next)
             }
