@@ -105,6 +105,42 @@ fn test_wait_queue() {
 }
 
 #[test]
+fn test_wait_queue_requeue() {
+    let _lock = SERIAL.lock();
+    INIT.call_once(axtask::init_scheduler);
+
+    const NUM_TASKS: usize = 4;
+
+    static SOURCE: WaitQueue = WaitQueue::new();
+    static TARGET: WaitQueue = WaitQueue::new();
+    static READY: WaitQueue = WaitQueue::new();
+    static DONE: WaitQueue = WaitQueue::new();
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+    static FINISHED: AtomicUsize = AtomicUsize::new(0);
+
+    STARTED.store(0, Ordering::Release);
+    FINISHED.store(0, Ordering::Release);
+
+    for _ in 0..NUM_TASKS {
+        axtask::spawn(move || {
+            STARTED.fetch_add(1, Ordering::Release);
+            READY.notify_one(true);
+            SOURCE.wait();
+            FINISHED.fetch_add(1, Ordering::Release);
+            DONE.notify_one(true);
+        });
+    }
+
+    READY.wait_until(|| STARTED.load(Ordering::Acquire) == NUM_TASKS);
+    assert_eq!(SOURCE.requeue(NUM_TASKS, &TARGET), NUM_TASKS);
+    assert_eq!(FINISHED.load(Ordering::Acquire), 0);
+
+    TARGET.notify_all(true);
+    DONE.wait_until(|| FINISHED.load(Ordering::Acquire) == NUM_TASKS);
+    assert_eq!(FINISHED.load(Ordering::Acquire), NUM_TASKS);
+}
+
+#[test]
 fn test_task_join() {
     let _lock = SERIAL.lock();
     INIT.call_once(axtask::init_scheduler);

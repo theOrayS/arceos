@@ -1,12 +1,35 @@
+use alloc::vec::Vec;
+use core::alloc::Layout;
+use core::ptr::NonNull;
+
 use axalloc::global_allocator;
 use axhal::mem::{phys_to_virt, virt_to_phys};
 use axhal::paging::{MappingFlags, PageSize, PageTable};
+use kspin::SpinNoIrq;
 use memory_addr::{PAGE_SIZE_4K, PageIter4K, PhysAddr, VirtAddr};
 
 use super::Backend;
 
+static FALLBACK_FRAMES: SpinNoIrq<Vec<usize>> = SpinNoIrq::new(Vec::new());
+
+fn frame_layout() -> Layout {
+    Layout::from_size_align(PAGE_SIZE_4K, PAGE_SIZE_4K).expect("valid frame layout")
+}
+
 fn alloc_frame(zeroed: bool) -> Option<PhysAddr> {
-    let vaddr = VirtAddr::from(global_allocator().alloc_pages(1, PAGE_SIZE_4K).ok()?);
+    let vaddr = if let Ok(vaddr) = global_allocator().alloc_pages(1, PAGE_SIZE_4K) {
+        VirtAddr::from(vaddr)
+    } else {
+        let ptr = global_allocator().alloc(frame_layout()).ok()?;
+        let vaddr = VirtAddr::from(ptr.as_ptr() as usize);
+        let mut fallback = FALLBACK_FRAMES.lock();
+        if fallback.try_reserve(1).is_err() {
+            global_allocator().dealloc(ptr, frame_layout());
+            return None;
+        }
+        fallback.push(vaddr.as_usize());
+        vaddr
+    };
     if zeroed {
         unsafe { core::ptr::write_bytes(vaddr.as_mut_ptr(), 0, PAGE_SIZE_4K) };
     }
@@ -16,7 +39,15 @@ fn alloc_frame(zeroed: bool) -> Option<PhysAddr> {
 
 fn dealloc_frame(frame: PhysAddr) {
     let vaddr = phys_to_virt(frame);
-    global_allocator().dealloc_pages(vaddr.as_usize(), 1);
+    let mut fallback = FALLBACK_FRAMES.lock();
+    if let Some(index) = fallback.iter().position(|&addr| addr == vaddr.as_usize()) {
+        fallback.swap_remove(index);
+        drop(fallback);
+        let ptr = NonNull::new(vaddr.as_mut_ptr()).expect("frame pointer must be non-null");
+        global_allocator().dealloc(ptr, frame_layout());
+    } else {
+        global_allocator().dealloc_pages(vaddr.as_usize(), 1);
+    }
 }
 
 impl Backend {

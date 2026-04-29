@@ -95,7 +95,7 @@ impl AddrSpace {
                 area.start(),
                 area.size(),
                 area.flags(),
-                area.backend().clone(),
+                area.backend().clone_for_fork(),
             );
             self.areas
                 .map(cloned_area, &mut self.pt, false)
@@ -369,6 +369,9 @@ impl AddrSpace {
             let orig_flags = area.flags();
             let access_flags = MappingFlags::from_bits_truncate(access_flags.bits());
             if orig_flags.contains(access_flags) {
+                if let Ok((_, mapped_flags, _)) = self.pt.query(vaddr) {
+                    return mapped_flags.contains(access_flags);
+                }
                 return area
                     .backend()
                     .handle_page_fault(vaddr, orig_flags, &mut self.pt);

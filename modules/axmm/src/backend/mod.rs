@@ -71,6 +71,13 @@ impl MappingBackend for Backend {
 }
 
 impl Backend {
+    pub(crate) fn clone_for_fork(&self) -> Self {
+        match *self {
+            Self::Linear { pa_va_offset } => Self::Linear { pa_va_offset },
+            Self::Alloc { .. } => Self::Alloc { populate: false },
+        }
+    }
+
     pub(crate) fn handle_page_fault(
         &self,
         vaddr: VirtAddr,

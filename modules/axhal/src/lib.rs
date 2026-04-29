@@ -42,6 +42,9 @@ extern crate axlog;
 #[macro_use]
 extern crate memory_addr;
 
+#[cfg(feature = "paging")]
+extern crate alloc;
+
 cfg_if::cfg_if! {
     if #[cfg(feature = "myplat")] {
         // link the custom platform crate in your application.

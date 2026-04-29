@@ -567,6 +567,7 @@ dependencies = [
  "cfg-if",
  "heapless 0.8.0",
  "kernel_guard",
+ "kspin",
  "lazyinit",
  "linkme",
  "log",

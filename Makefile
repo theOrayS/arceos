@@ -67,7 +67,10 @@ KERNEL_LA_CONFIG ?= $(KERNEL_BUILD_DIR)/loongarch64.axconfig.toml
 KERNEL_RV_TARGET_DIR ?= $(KERNEL_TARGET_DIR)/riscv64
 KERNEL_LA_TARGET_DIR ?= $(KERNEL_TARGET_DIR)/loongarch64
 KERNEL_RV_AXCONFIG_WRITES ?= -w plat.phys-memory-size=0x4000_0000
-KERNEL_LA_AXCONFIG_WRITES ?= -w plat.phys-memory-size=0x4000_0000
+# QEMU loongarch64 virt splits 1G RAM into lowram [0, 0x1000_0000)
+# and highram [0x8000_0000, 0xb000_0000). ArceOS uses highram as the
+# contiguous RAM window, so do not advertise the hole above 0xb000_0000.
+KERNEL_LA_AXCONFIG_WRITES ?= -w plat.phys-memory-size=0x3000_0000
 KERNEL_RV ?= $(CURDIR)/kernel-rv
 KERNEL_LA ?= $(CURDIR)/kernel-la
 TESTSUITE_DIR ?= $(abspath $(CURDIR)/../testsuits-for-oskernel)

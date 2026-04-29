@@ -60,6 +60,9 @@ pub fn rust_main_secondary(cpu_id: usize) -> ! {
     }
 
     #[cfg(feature = "irq")]
+    super::update_timer();
+
+    #[cfg(feature = "irq")]
     axhal::asm::enable_irqs();
 
     #[cfg(all(feature = "tls", not(feature = "multitask")))]

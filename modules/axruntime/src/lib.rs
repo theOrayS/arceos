@@ -33,6 +33,26 @@ mod mp;
 #[cfg(feature = "smp")]
 pub use self::mp::rust_main_secondary;
 
+#[cfg(feature = "irq")]
+const PERIODIC_INTERVAL_NANOS: u64 = axhal::time::NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64;
+
+#[cfg(feature = "irq")]
+#[percpu::def_percpu]
+static NEXT_DEADLINE: u64 = 0;
+
+#[cfg(feature = "irq")]
+fn update_timer() {
+    let now_ns = axhal::time::monotonic_time_nanos();
+    // Safety: callers run before IRQs are enabled or inside the IRQ handler,
+    // so the current CPU's deadline slot cannot be concurrently modified.
+    let mut deadline = unsafe { NEXT_DEADLINE.read_current_raw() };
+    if now_ns >= deadline {
+        deadline = now_ns + PERIODIC_INTERVAL_NANOS;
+    }
+    unsafe { NEXT_DEADLINE.write_current_raw(deadline + PERIODIC_INTERVAL_NANOS) };
+    axhal::time::set_oneshot_timer(deadline);
+}
+
 const LOGO: &str = r#"
        d8888                            .d88888b.   .d8888b.
       d88888                           d88P" "Y88b d88P  Y88b
@@ -316,24 +336,6 @@ fn proc_loadavg_contents() -> String {
 
 #[cfg(feature = "irq")]
 fn init_interrupt() {
-    // Setup timer interrupt handler
-    const PERIODIC_INTERVAL_NANOS: u64 =
-        axhal::time::NANOS_PER_SEC / axconfig::TICKS_PER_SEC as u64;
-
-    #[percpu::def_percpu]
-    static NEXT_DEADLINE: u64 = 0;
-
-    fn update_timer() {
-        let now_ns = axhal::time::monotonic_time_nanos();
-        // Safety: we have disabled preemption in IRQ handler.
-        let mut deadline = unsafe { NEXT_DEADLINE.read_current_raw() };
-        if now_ns >= deadline {
-            deadline = now_ns + PERIODIC_INTERVAL_NANOS;
-        }
-        unsafe { NEXT_DEADLINE.write_current_raw(deadline + PERIODIC_INTERVAL_NANOS) };
-        axhal::time::set_oneshot_timer(deadline);
-    }
-
     axhal::irq::register(axconfig::devices::TIMER_IRQ, || {
         update_timer();
         #[cfg(feature = "multitask")]
@@ -344,6 +346,8 @@ fn init_interrupt() {
     axhal::irq::register(axhal::irq::IPI_IRQ, || {
         axipi::ipi_handler();
     });
+
+    update_timer();
 
     // Enable IRQs before starting app
     axhal::asm::enable_irqs();
