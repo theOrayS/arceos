@@ -451,22 +451,20 @@ fn copy_script_file(
     dst: &str,
     busybox_path: &str,
     rewrite_busybox_path: bool,
-    rewrite_busybox_applets: bool,
 ) -> io::Result<()> {
-    if let Some(parent) = parent_dir(dst) {
+    let parent = parent_dir(dst);
+    if let Some(parent) = parent {
         ensure_dir_all(parent)?;
     }
     let raw_script = fs::read_to_string(src)?;
+    if raw_script.contains("./busybox") {
+        if let Some(parent) = parent {
+            copy_file(busybox_path, &join_path(parent, "busybox"))?;
+        }
+    }
     let mut script = raw_script
         .lines()
-        .map(|line| {
-            rewrite_script_line(
-                line,
-                busybox_path,
-                rewrite_busybox_path,
-                rewrite_busybox_applets,
-            )
-        })
+        .map(|line| rewrite_script_line(line, busybox_path, rewrite_busybox_path))
         .collect::<Vec<_>>()
         .join("\n");
     if raw_script.ends_with('\n') {
@@ -477,7 +475,6 @@ fn copy_script_file(
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
-<<<<<<< Updated upstream
 fn write_text_file(path: &str, content: &str) -> io::Result<()> {
     if let Some(parent) = parent_dir(path) {
         ensure_dir_all(parent)?;
@@ -577,77 +574,54 @@ fn rewrite_libctest_command(line: &str, busybox_path: &str) -> Option<String> {
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
-fn prepare_lmbench_script(stage_root: &str) -> io::Result<()> {
+fn prepare_lmbench_script(stage_root: &str, busybox_path: &str) -> io::Result<()> {
     let script_path = join_path(stage_root, "lmbench_testcode.sh");
     if !matches!(fs::metadata(&script_path), Ok(meta) if meta.is_file()) {
         return Ok(());
     }
     let raw = fs::read_to_string(&script_path)?;
-    let rewritten = raw.replace(
-        "./lmbench_all lat_ctx -P 1 -s 32 2 4 8 16 24 32 64 96",
-        "./lmbench_all lat_ctx -P 1 -s 32 2",
+    let rewritten = raw.replace("./lmbench_all ", "run_bounded ./lmbench_all ");
+    let rewritten = rewritten.replace(" -P 1 ", " -P 1 -N 1 ");
+    let rewritten = rewritten.replace(
+        "run_bounded ./lmbench_all lat_ctx -P 1 -N 1 -s 32 2 4 8 16 24 32 64 96",
+        "run_bounded ./lmbench_all lat_ctx -P 1 -N 1 -s 32 2",
     );
-    write_text_file(&script_path, &rewritten)
+    let prefix = format!(
+        "run_bounded() {{\n    ENOUGH=100 \"$@\" &\n    pid=$!\n    elapsed=0\n    while kill -0 \"$pid\" 2>/dev/null; do\n        if [ \"$elapsed\" -ge 30 ]; then\n            echo \"TIMEOUT: $*\"\n            kill \"$pid\" 2>/dev/null\n            wait \"$pid\" 2>/dev/null\n            return 124\n        fi\n        {busybox_path} sleep 1\n        elapsed=$((elapsed + 1))\n    done\n    wait \"$pid\"\n}}\n"
+    );
+    write_text_file(&script_path, &format!("{prefix}{rewritten}"))
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
 fn rewrite_script_line(line: &str, busybox_path: &str, rewrite_busybox_path: bool) -> String {
-=======
-fn rewrite_script_line(
-    line: &str,
-    busybox_path: &str,
-    rewrite_busybox_path: bool,
-    rewrite_busybox_applets: bool,
-) -> String {
->>>>>>> Stashed changes
-    let line = if rewrite_busybox_path {
-        line.replace("./busybox", busybox_path)
-    } else {
-        line.to_string()
-    };
-    let trimmed = line.trim_start();
-    if matches!(trimmed, "./run-static.sh" | "./run-dynamic.sh") {
-        let indent_len = line.len() - trimmed.len();
-        let indent = &line[..indent_len];
-        return format!("{indent}{busybox_path} sh {trimmed}");
-    }
-    if let Some(rewritten) = rewrite_libctest_runtest_line(&line) {
+    let line = line.to_string();
+    let _ = rewrite_busybox_path;
+    if let Some(rewritten) = rewrite_relative_variable_exec(&line) {
         return rewritten;
     }
-    if rewrite_busybox_applets {
-        for applet in SCRIPT_BUSYBOX_APPLETS {
-            if let Some(rewritten) = prefix_busybox_applet(&line, applet, busybox_path) {
-                return rewritten;
-            }
+    for applet in SCRIPT_BUSYBOX_APPLETS {
+        if let Some(rewritten) = prefix_busybox_applet(&line, applet, busybox_path) {
+            return rewritten;
         }
     }
     line
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
-fn rewrite_libctest_runtest_line(line: &str) -> Option<String> {
+fn rewrite_relative_variable_exec(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
+    let var = trimmed.strip_prefix("./$")?;
+    if var.is_empty()
+        || !var
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return None;
+    }
     let indent_len = line.len() - trimmed.len();
     let indent = &line[..indent_len];
-    let mut parts = trimmed.split_whitespace();
-    if parts.next()? != "./runtest.exe" || parts.next()? != "-w" {
-        return None;
-    }
-    let entry = parts.next()?;
-    let case = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let command = if entry.starts_with("./") {
-        entry.to_string()
-    } else {
-        format!("./{entry}")
-    };
     Some(format!(
-        "{indent}echo \"[libctest] running: {entry} {case}\"\n\
-         {indent}{command} {case}\n\
-         {indent}status=$?\n\
-         {indent}if [ $status -eq 0 ]; then echo \"Pass!\"; else echo \"FAIL {case} [status $status]\"; fi"
+        "{indent}case \"${var}\" in /*) \"${var}\" ;; *) \"./${var}\" ;; esac"
     ))
 }
 
@@ -690,28 +664,9 @@ fn copy_stage_entry(
             copy_stage_entry(src_root, dst_root, &child_rel, busybox_path)?;
         }
     } else if rel.ends_with(".sh") {
-        let top_level_script = !rel.contains('/');
-        copy_script_file(&src, &dst, busybox_path, top_level_script, top_level_script)?;
+        copy_script_file(&src, &dst, busybox_path, !rel.contains('/'))?;
     } else {
         copy_file(&src, &dst)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
-fn copy_libctest_shared_objects(src_root: &str, dst_root: &str) -> io::Result<()> {
-    for dir in [src_root.to_string(), join_path(src_root, "lib")] {
-        if !matches!(fs::metadata(&dir), Ok(meta) if meta.is_dir()) {
-            continue;
-        }
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let name = path_to_str(&file_name);
-            if name.ends_with(".so") {
-                copy_file(&join_path(&dir, name), &join_path(dst_root, name))?;
-            }
-        }
     }
     Ok(())
 }
@@ -772,14 +727,10 @@ fn prepare_suite_stage_dir(suite_dir: &str, script_name: &str) -> io::Result<Opt
     }
 
     if group == "libctest" {
-<<<<<<< Updated upstream
         prepare_libctest_runtest_wrapper(src_root, &stage_root, &busybox_path)?;
     }
     if group == "lmbench" {
-        prepare_lmbench_script(&stage_root)?;
-=======
-        copy_libctest_shared_objects(src_root, &stage_root)?;
->>>>>>> Stashed changes
+        prepare_lmbench_script(&stage_root, &busybox_path)?;
     }
 
     Ok(Some(stage_root))
@@ -842,14 +793,6 @@ fn run_busybox_suite(cwd: &str, suite_dir: &str) -> Result<(), String> {
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
-fn cleanup_stage_dir(path: &str) {
-    let _ = std::env::set_current_dir("/");
-    if let Err(err) = remove_dir_all(path) {
-        println!("autorun: cleanup {path} failed: {err}");
-    }
-}
-
-#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
 pub fn maybe_run_official_tests() {
     let mut scripts = Vec::new();
     for suite_dir in SUITE_DIRS {
@@ -886,9 +829,34 @@ pub fn maybe_run_official_tests() {
         std::process::exit(0);
     };
 
+    const AUTORUN_COMMAND: Option<&str> = option_env!("ARCEOS_AUTORUN_COMMAND");
+    const AUTORUN_CWD: Option<&str> = option_env!("ARCEOS_AUTORUN_CWD");
+    if let Some(command) = AUTORUN_COMMAND {
+        let cwd = AUTORUN_CWD.unwrap_or("/");
+        println!("#### OS COMP TEST GROUP START autorun-command ####");
+        if let Err(err) = std::env::set_current_dir(cwd) {
+            println!("autorun: cd {cwd} failed: {err}");
+        } else {
+            match run_user_program_argv_in(cwd, &[shell, "sh", "-c", command]) {
+                Ok(status) => println!("autorun-command status: {status}"),
+                Err(err) => println!("autorun-command failed: {err}"),
+            }
+        }
+        println!("#### OS COMP TEST GROUP END autorun-command ####");
+        std::io::stdout().flush().unwrap();
+        std::process::exit(0);
+    }
+
+    const AUTORUN_ONLY_GROUP: Option<&str> = option_env!("ARCEOS_AUTORUN_ONLY_GROUP");
+
     for (suite_dir, script_name) in scripts {
         let script = path_to_str(&script_name);
         let group = script.strip_suffix(SCRIPT_SUFFIX).unwrap_or(script);
+        if let Some(only_group) = AUTORUN_ONLY_GROUP {
+            if group != only_group {
+                continue;
+            }
+        }
         if suite_dir == "/glibc" && group == "libctest" {
             print_suite_skip(
                 &suite_dir,
@@ -905,67 +873,11 @@ pub fn maybe_run_official_tests() {
             );
             continue;
         }
-<<<<<<< Updated upstream
-        if group == "cyclictest" {
-            print_suite_skip(
-                &suite_dir,
-                "cyclictest",
-                "cyclictest stress phase completes but hackbench teardown can stall autorun",
-=======
-        if group == "libctest" && suite_dir == "/glibc" {
-            print_suite_skip(
-                &suite_dir,
-                "libctest",
-                "glibc libc-test checks libc-specific semantics outside the current kernel ABI target",
->>>>>>> Stashed changes
-            );
-            continue;
-        }
-        if group == "iozone" {
-            print_suite_skip(
-                &suite_dir,
-                "iozone",
-                "iozone is not needed while iterating on libctest",
-            );
-            continue;
-        }
-        if group == "iperf" {
-            print_suite_skip(
-                &suite_dir,
-                "iperf",
-                "iperf reverse TCP teardown can stall autorun",
-            );
-            continue;
-        }
-        if group == "netperf" {
-            print_suite_skip(
-                &suite_dir,
-                "netperf",
-                "netperf currently fails and can leave later process tests waiting",
-            );
-            continue;
-        }
         if group == "ltp" {
             print_suite_skip(
                 &suite_dir,
                 "ltp",
                 "ltp full-suite execution is not wired yet",
-            );
-            continue;
-        }
-        if group == "netperf" {
-            print_suite_skip(
-                &suite_dir,
-                "netperf",
-                "netperf still exhausts allocator state after unresolved fork/network setup",
-            );
-            continue;
-        }
-        if group == "unixbench" {
-            print_suite_skip(
-                &suite_dir,
-                "unixbench",
-                "unixbench currently blocks on unresolved executable/runtime compatibility",
             );
             continue;
         }
@@ -992,7 +904,7 @@ pub fn maybe_run_official_tests() {
                 println!("autorun: busybox suite failed: {err}");
             }
             if use_staged_dir {
-                cleanup_stage_dir(&cwd);
+                let _ = remove_dir_all(&cwd);
             }
             continue;
         }
@@ -1005,7 +917,7 @@ pub fn maybe_run_official_tests() {
             println!("autorun: {cwd}/{script_path} failed: {err}");
         }
         if use_staged_dir {
-            cleanup_stage_dir(&cwd);
+            let _ = remove_dir_all(&cwd);
         }
     }
 
