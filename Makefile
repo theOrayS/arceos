@@ -36,6 +36,9 @@
 #     - `IP`: ArceOS IPv4 address (default is 10.0.2.15 for QEMU user netdev)
 #     - `GW`: Gateway IPv4 address (default is 10.0.2.2 for QEMU user netdev)
 
+# Ensure Cargo-installed build helpers are reachable in non-login shells.
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+
 # General options
 ARCH ?= x86_64
 MYPLAT ?=
@@ -70,7 +73,11 @@ KERNEL_RV_AXCONFIG_WRITES ?= -w plat.phys-memory-size=0x4000_0000
 KERNEL_LA_AXCONFIG_WRITES ?= -w plat.phys-memory-size=0x4000_0000
 KERNEL_RV ?= $(CURDIR)/kernel-rv
 KERNEL_LA ?= $(CURDIR)/kernel-la
+ifneq ($(wildcard $(CURDIR)/testsuits-for-oskernel),)
+TESTSUITE_DIR ?= $(abspath $(CURDIR)/testsuits-for-oskernel)
+else
 TESTSUITE_DIR ?= $(abspath $(CURDIR)/../testsuits-for-oskernel)
+endif
 RV_TESTSUITE_IMG ?= $(TESTSUITE_DIR)/sdcard-rv.img
 LA_TESTSUITE_IMG ?= $(TESTSUITE_DIR)/sdcard-la.img
 RV_TESTSUITE_RUN_IMG ?= /tmp/arceos-sdcard-rv.run.qcow2

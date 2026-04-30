@@ -638,6 +638,10 @@ fn run_busybox_suite(cwd: &str, suite_dir: &str) -> Result<(), String> {
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
 pub fn maybe_run_official_tests() {
+    if let Err(err) = uspace::run_internal_ipc_regressions() {
+        println!("autorun: internal ipc regressions failed: {err}");
+    }
+
     let mut scripts = Vec::new();
     for suite_dir in SUITE_DIRS {
         let Ok(entries) = fs::read_dir(suite_dir) else {
