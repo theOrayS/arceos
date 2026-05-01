@@ -4,7 +4,7 @@ use core::ops::{Deref, DerefMut};
 use axerrno::{AxError, AxResult, ax_err};
 use axsync::Mutex;
 use smoltcp::iface::{SocketHandle, SocketSet};
-use smoltcp::socket::tcp::{self, State};
+use smoltcp::socket::{self, tcp::State};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use super::{LISTEN_QUEUE_SIZE, SOCKET_SET, SocketSetWrapper};
@@ -29,6 +29,24 @@ impl ListenTableEntry {
         match self.listen_endpoint.addr {
             Some(addr) => addr == dst,
             None => true,
+        }
+    }
+
+    fn prune_unclaimed(&mut self, sockets: &mut SocketSet<'_>) {
+        let mut idx = 0;
+        while idx < self.syn_queue.len() {
+            let handle = self.syn_queue[idx];
+            let state = sockets.get::<socket::tcp::Socket>(handle).state();
+            if matches!(state, State::Closed | State::Listen) {
+                self.syn_queue.remove(idx);
+                sockets.remove(handle);
+                debug!(
+                    "TCP socket {}: drop unclaimed listener in {:?}",
+                    handle, state
+                );
+            } else {
+                idx += 1;
+            }
         }
     }
 }
@@ -121,6 +139,11 @@ impl ListenTable {
                 // not listening on this address
                 return;
             }
+            entry.prune_unclaimed(sockets);
+            if has_connection(src, dst, sockets) {
+                // This SYN belongs to a connection that is already being tracked.
+                return;
+            }
             if entry.syn_queue.len() >= LISTEN_QUEUE_SIZE {
                 // SYN queue is full, drop the packet
                 warn!("SYN queue overflow!");
@@ -140,13 +163,26 @@ impl ListenTable {
 }
 
 fn is_connected(handle: SocketHandle) -> bool {
-    SOCKET_SET.with_socket::<tcp::Socket, _, _>(handle, |socket| {
-        !matches!(socket.state(), State::Listen | State::SynReceived)
+    SOCKET_SET.with_socket::<socket::tcp::Socket, _, _>(handle, |socket| {
+        matches!(socket.state(), State::Established | State::CloseWait)
+    })
+}
+
+fn has_connection(src: IpEndpoint, dst: IpEndpoint, sockets: &SocketSet<'_>) -> bool {
+    sockets.iter().any(|(_, socket)| {
+        let socket::Socket::Tcp(socket) = socket else {
+            return false;
+        };
+        matches!(
+            socket.state(),
+            State::SynSent | State::SynReceived | State::Established
+        ) && socket.local_endpoint() == Some(dst)
+            && socket.remote_endpoint() == Some(src)
     })
 }
 
 fn get_addr_tuple(handle: SocketHandle) -> (IpEndpoint, IpEndpoint) {
-    SOCKET_SET.with_socket::<tcp::Socket, _, _>(handle, |socket| {
+    SOCKET_SET.with_socket::<socket::tcp::Socket, _, _>(handle, |socket| {
         (
             socket.local_endpoint().unwrap(),
             socket.remote_endpoint().unwrap(),

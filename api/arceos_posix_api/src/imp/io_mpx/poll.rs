@@ -22,12 +22,17 @@ pub(crate) fn poll_events<F>(
     events: &mut [PollEvent],
     timeout: Option<Duration>,
     mut poll_state: F,
+    mut interrupted: impl FnMut() -> bool,
 ) -> Result<usize, LinuxError>
 where
     F: FnMut(i32) -> Result<PollState, LinuxError>,
 {
     let deadline = timeout.map(|timeout| wall_time() + timeout);
     loop {
+        if interrupted() {
+            return Err(LinuxError::EINTR);
+        }
+
         #[cfg(feature = "net")]
         axnet::poll_interfaces();
 
@@ -59,6 +64,9 @@ where
         }
         if deadline.is_some_and(|deadline| wall_time() >= deadline) {
             return Ok(0);
+        }
+        if interrupted() {
+            return Err(LinuxError::EINTR);
         }
         crate::imp::task::sys_sched_yield();
     }

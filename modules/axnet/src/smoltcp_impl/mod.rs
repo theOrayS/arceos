@@ -46,14 +46,19 @@ const STANDARD_MTU: usize = 1500;
 
 const RANDOM_SEED: u64 = 0xA2CE_05A2_CE05_A2CE;
 
-const TCP_RX_BUF_LEN: usize = 64 * 1024;
-const TCP_TX_BUF_LEN: usize = 64 * 1024;
-const UDP_RX_BUF_LEN: usize = 64 * 1024;
-const UDP_TX_BUF_LEN: usize = 64 * 1024;
+const TCP_RX_BUF_LEN: usize = 128 * 1024;
+const TCP_TX_BUF_LEN: usize = 128 * 1024;
+const UDP_RX_META_LEN: usize = 512;
+const UDP_TX_META_LEN: usize = 256;
+const UDP_RX_BUF_LEN: usize = 1024 * 1024;
+const UDP_TX_BUF_LEN: usize = 256 * 1024;
 const LISTEN_QUEUE_SIZE: usize = 512;
+const LOOPBACK_POLL_BUDGET: usize = 256;
+const LOOPBACK_QUEUE_LIMIT: usize = 256;
+const LOOPBACK_MTU: usize = 9216;
+const TCP_CLOSE_DRAIN_TIMEOUT_NANOS: u64 = 500_000_000;
 const LOOPBACK_PREFIX: u8 = 8;
 const LOOPBACK_ADDR: [u8; 4] = [127, 0, 0, 1];
-const LOOPBACK_ETHER_ADDR: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
 
 static LISTEN_TABLE: LazyInit<ListenTable> = LazyInit::new();
 static SOCKET_SET: LazyInit<SocketSetWrapper> = LazyInit::new();
@@ -96,11 +101,11 @@ impl<'a> SocketSetWrapper<'a> {
 
     pub fn new_udp_socket() -> socket::udp::Socket<'a> {
         let udp_rx_buffer = socket::udp::PacketBuffer::new(
-            vec![socket::udp::PacketMetadata::EMPTY; 8],
+            vec![socket::udp::PacketMetadata::EMPTY; UDP_RX_META_LEN],
             vec![0; UDP_RX_BUF_LEN],
         );
         let udp_tx_buffer = socket::udp::PacketBuffer::new(
-            vec![socket::udp::PacketMetadata::EMPTY; 8],
+            vec![socket::udp::PacketMetadata::EMPTY; UDP_TX_META_LEN],
             vec![0; UDP_TX_BUF_LEN],
         );
         socket::udp::Socket::new(udp_rx_buffer, udp_tx_buffer)
@@ -136,17 +141,36 @@ impl<'a> SocketSetWrapper<'a> {
     }
 
     pub fn poll_interfaces(&self) {
+        let mut loopback_active = false;
         if let Some(loopback) = LOOPBACK.get() {
-            loopback.poll(&self.0);
+            loopback_active = loopback.poll(&self.0);
         }
         if let Some(eth0) = ETH0.get() {
-            eth0.poll(&self.0);
+            if !loopback_active {
+                eth0.poll(&self.0);
+            }
         }
     }
 
     pub fn remove(&self, handle: SocketHandle) {
         self.0.lock().remove(handle);
         debug!("socket {}: destroyed", handle);
+    }
+
+    pub fn close_tcp_socket(&self, handle: SocketHandle) {
+        self.with_socket_mut::<socket::tcp::Socket, _, _>(handle, |socket| {
+            debug!("TCP socket {}: closing", handle);
+            socket.close();
+        });
+        let deadline = wall_time_nanos() + TCP_CLOSE_DRAIN_TIMEOUT_NANOS;
+        while wall_time_nanos() < deadline {
+            self.poll_interfaces();
+            if self.with_socket::<socket::tcp::Socket, _, _>(handle, |socket| !socket.is_open()) {
+                break;
+            }
+            axtask::yield_now();
+        }
+        self.remove(handle);
     }
 }
 
@@ -237,8 +261,8 @@ impl Device for LoopbackDevice {
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
-        caps.max_transmission_unit = 65535;
-        caps.medium = Medium::Ethernet;
+        caps.max_transmission_unit = LOOPBACK_MTU;
+        caps.medium = Medium::Ip;
         caps.checksum = ChecksumCapabilities::ignored();
         caps
     }
@@ -250,7 +274,7 @@ struct LoopbackRxToken {
 
 impl RxToken for LoopbackRxToken {
     fn preprocess(&self, sockets: &mut SocketSet<'_>) {
-        snoop_tcp_packet(&self.buffer, sockets).ok();
+        snoop_tcp_packet(&self.buffer, Medium::Ip, sockets).ok();
     }
 
     fn consume<R, F>(self, f: F) -> R
@@ -272,6 +296,9 @@ impl TxToken for LoopbackTxToken<'_> {
     {
         let mut buffer = vec![0; len];
         let result = f(&mut buffer);
+        if self.queue.len() >= LOOPBACK_QUEUE_LIMIT {
+            self.queue.pop_front();
+        }
         self.queue.push_back(buffer);
         result
     }
@@ -280,7 +307,8 @@ impl TxToken for LoopbackTxToken<'_> {
 impl LoopbackInterfaceWrapper {
     fn new(name: &'static str) -> Self {
         let mut dev = LoopbackDevice::new();
-        let config = Config::new(HardwareAddress::Ethernet(LOOPBACK_ETHER_ADDR));
+        let mut config = Config::new(HardwareAddress::Ip);
+        config.random_seed = RANDOM_SEED;
         let iface = Mutex::new(Interface::new(
             config,
             &mut dev,
@@ -304,17 +332,21 @@ impl LoopbackInterfaceWrapper {
         });
     }
 
-    pub fn poll(&self, sockets: &Mutex<SocketSet>) {
+    pub fn poll(&self, sockets: &Mutex<SocketSet>) -> bool {
         let mut dev = self.dev.lock();
         let mut iface = self.iface.lock();
         let mut sockets = sockets.lock();
-        for _ in 0..16 {
+        let mut active = false;
+        for _ in 0..LOOPBACK_POLL_BUDGET {
             let timestamp = InterfaceWrapper::current_time();
             let result = iface.poll(timestamp, dev.deref_mut(), &mut sockets);
+            active |= result != PollResult::None;
             if result == PollResult::None && dev.queue.is_empty() {
-                break;
+                return active;
             }
+            active = true;
         }
+        active || !dev.queue.is_empty()
     }
 }
 
@@ -385,7 +417,7 @@ struct AxNetTxToken<'a>(&'a RefCell<AxNetDevice>);
 
 impl RxToken for AxNetRxToken<'_> {
     fn preprocess(&self, sockets: &mut SocketSet<'_>) {
-        snoop_tcp_packet(self.1.packet(), sockets).ok();
+        snoop_tcp_packet(self.1.packet(), Medium::Ethernet, sockets).ok();
     }
 
     fn consume<R, F>(self, f: F) -> R
@@ -418,21 +450,78 @@ impl TxToken for AxNetTxToken<'_> {
     }
 }
 
-fn snoop_tcp_packet(buf: &[u8], sockets: &mut SocketSet<'_>) -> Result<(), smoltcp::wire::Error> {
-    use smoltcp::wire::{EthernetFrame, IpProtocol, Ipv4Packet, TcpPacket};
+fn snoop_tcp_packet(
+    buf: &[u8],
+    medium: Medium,
+    sockets: &mut SocketSet<'_>,
+) -> Result<(), smoltcp::wire::Error> {
+    use smoltcp::wire::{EthernetFrame, EthernetProtocol};
 
-    let ether_frame = EthernetFrame::new_checked(buf)?;
-    let ipv4_packet = Ipv4Packet::new_checked(ether_frame.payload())?;
-
-    if ipv4_packet.next_header() == IpProtocol::Tcp {
-        let tcp_packet = TcpPacket::new_checked(ipv4_packet.payload())?;
-        let src_addr = (ipv4_packet.src_addr(), tcp_packet.src_port()).into();
-        let dst_addr = (ipv4_packet.dst_addr(), tcp_packet.dst_port()).into();
-        let is_first = tcp_packet.syn() && !tcp_packet.ack();
-        if is_first {
-            // create a socket for the first incoming TCP packet, as the later accept() returns.
-            LISTEN_TABLE.incoming_tcp_packet(src_addr, dst_addr, sockets);
+    match medium {
+        Medium::Ethernet => {
+            let ether_frame = EthernetFrame::new_checked(buf)?;
+            match ether_frame.ethertype() {
+                EthernetProtocol::Ipv4 | EthernetProtocol::Ipv6 => {
+                    snoop_ip_packet(ether_frame.payload(), sockets)
+                }
+                _ => Ok(()),
+            }
         }
+        Medium::Ip => snoop_ip_packet(buf, sockets),
+        #[allow(unreachable_patterns)]
+        _ => Ok(()),
+    }
+}
+
+fn snoop_ip_packet(buf: &[u8], sockets: &mut SocketSet<'_>) -> Result<(), smoltcp::wire::Error> {
+    use smoltcp::wire::{IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet};
+
+    if buf.is_empty() {
+        return Err(smoltcp::wire::Error);
+    }
+
+    match IpVersion::of_packet(buf)? {
+        IpVersion::Ipv4 => {
+            let ipv4_packet = Ipv4Packet::new_checked(buf)?;
+            if ipv4_packet.next_header() == IpProtocol::Tcp {
+                snoop_tcp_segment(
+                    ipv4_packet.src_addr().into(),
+                    ipv4_packet.dst_addr().into(),
+                    ipv4_packet.payload(),
+                    sockets,
+                )?;
+            }
+        }
+        IpVersion::Ipv6 => {
+            let ipv6_packet = Ipv6Packet::new_checked(buf)?;
+            if ipv6_packet.next_header() == IpProtocol::Tcp {
+                snoop_tcp_segment(
+                    ipv6_packet.src_addr().into(),
+                    ipv6_packet.dst_addr().into(),
+                    ipv6_packet.payload(),
+                    sockets,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn snoop_tcp_segment(
+    src_addr: IpAddress,
+    dst_addr: IpAddress,
+    payload: &[u8],
+    sockets: &mut SocketSet<'_>,
+) -> Result<(), smoltcp::wire::Error> {
+    use smoltcp::wire::{IpEndpoint, TcpPacket};
+
+    let tcp_packet = TcpPacket::new_checked(payload)?;
+    let is_first = tcp_packet.syn() && !tcp_packet.ack();
+    if is_first {
+        let src_addr = IpEndpoint::new(src_addr, tcp_packet.src_port());
+        let dst_addr = IpEndpoint::new(dst_addr, tcp_packet.dst_port());
+        // Create a socket for the first incoming TCP packet, as the later accept() returns.
+        LISTEN_TABLE.incoming_tcp_packet(src_addr, dst_addr, sockets);
     }
     Ok(())
 }
@@ -479,7 +568,6 @@ pub(crate) fn init(net_dev: AxNetDevice) {
     LISTEN_TABLE.init_once(ListenTable::new());
 
     info!("created net interface {:?}:", LOOPBACK.name());
-    info!("  ether:    {}", LOOPBACK_ETHER_ADDR);
     info!("  ip:       {}/{}", loopback_ip, LOOPBACK_PREFIX);
     info!("created net interface {:?}:", ETH0.name());
     info!("  ether:    {}", ETH0.ethernet_address());

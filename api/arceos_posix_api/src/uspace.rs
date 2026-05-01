@@ -64,6 +64,9 @@ const MAX_SCRIPT_INTERPRETER_DEPTH: usize = 4;
 const TESTSUITE_STAGE_ROOT: &str = "/tmp/testsuite";
 const COMPAT_RUNTIME_WRITE_SHADOW_ROOT: &str = "/tmp/.arceos-runtime-writes";
 const AUX_CLOCK_TICKS: usize = 100;
+const MAX_LIVE_USER_TASKS: usize = 64;
+const USER_TASK_MEMORY_RESERVE_BYTES: usize = 4 * 1024 * 1024;
+const EXEC_IMAGE_READ_RESERVE_BYTES: usize = 4 * 1024 * 1024;
 const SIGCHLD_NUM: isize = 17;
 const SIGCANCEL_NUM: i32 = 33;
 const SI_TKILL_CODE: i32 = -6;
@@ -152,6 +155,8 @@ const ST_MODE_DIR: u32 = 0o040000;
 const ST_MODE_FILE: u32 = 0o100000;
 const ST_MODE_CHR: u32 = 0o020000;
 const ST_MODE_LNK: u32 = 0o120000;
+const DEV_NULL_RDEV: u64 = linux_makedev(1, 3);
+const DEV_ZERO_RDEV: u64 = linux_makedev(1, 5);
 
 #[cfg(target_arch = "riscv64")]
 const AUX_PLATFORM: &str = "riscv64";
@@ -385,7 +390,7 @@ impl UserSocket {
         match self {
             Self::Udp(socket) => socket.lock().shutdown().map_err(LinuxError::from),
             Self::Tcp(socket) if how == SHUT_WR => {
-                socket.lock().shutdown().map_err(LinuxError::from)
+                socket.lock().shutdown_write().map_err(LinuxError::from)
             }
             Self::Tcp(socket) if how == SHUT_RD || how == SHUT_RDWR => {
                 socket.lock().shutdown().map_err(LinuxError::from)
@@ -1178,6 +1183,47 @@ pub fn run_user_program_in(cwd: &str, argv: &[&str]) -> Result<i32, String> {
     Ok(exit_code)
 }
 
+pub fn terminate_user_processes_by_basename(name: &str) -> usize {
+    let mut targets = Vec::<Arc<UserProcess>>::new();
+    {
+        let table = user_thread_table().lock();
+        for entry in table.values() {
+            let exec_path = entry.process.exec_path();
+            if exec_path.rsplit('/').next() != Some(name) {
+                continue;
+            }
+            if !targets
+                .iter()
+                .any(|process| process.pid() == entry.process.pid())
+            {
+                targets.push(entry.process.clone());
+            }
+        }
+    }
+
+    for process in &targets {
+        process.request_exit_group(128 + general::SIGTERM as i32);
+        for entry in user_thread_entries_by_pid(process.pid()) {
+            let _ = deliver_user_signal(&entry, general::SIGTERM as i32);
+        }
+    }
+
+    let deadline = axhal::time::wall_time() + Duration::from_secs(2);
+    while targets
+        .iter()
+        .any(|process| process.live_threads.load(Ordering::Acquire) != 0)
+    {
+        #[cfg(feature = "net")]
+        axnet::poll_interfaces();
+        if axhal::time::wall_time() >= deadline {
+            break;
+        }
+        axtask::yield_now();
+    }
+
+    targets.len()
+}
+
 fn user_task_entry(_process: Arc<UserProcess>, context: UspaceContext) {
     let curr = axtask::current();
     let kstack_top = curr
@@ -1334,6 +1380,12 @@ fn prepare_program(cwd: &str, argv: &[&str], depth: usize) -> Result<PreparedPro
     }
 
     let path = resolve_exec_program_path(cwd, argv[0])?;
+    if let Ok(metadata) = axfs::api::metadata(path.as_str()) {
+        let image_len = cmp::min(metadata.len(), usize::MAX as u64) as usize;
+        if image_len.saturating_add(EXEC_IMAGE_READ_RESERVE_BYTES) > allocator_available_bytes() {
+            return Err(format!("not enough memory to read {path}"));
+        }
+    }
     let image =
         axfs::api::read(path.as_str()).map_err(|err| format!("failed to read {path}: {err}"))?;
 
@@ -2529,6 +2581,27 @@ fn register_user_task(task: AxTaskRef, process: Arc<UserProcess>) {
 
 fn unregister_user_task(tid: i32) {
     user_thread_table().lock().remove(&tid);
+}
+
+fn live_user_task_count() -> usize {
+    user_thread_table()
+        .lock()
+        .values()
+        .filter(|entry| entry.process.live_threads.load(Ordering::Acquire) != 0)
+        .count()
+}
+
+fn allocator_available_bytes() -> usize {
+    global_allocator().available_bytes().saturating_add(
+        global_allocator()
+            .available_pages()
+            .saturating_mul(PAGE_SIZE_4K),
+    )
+}
+
+fn can_create_user_task() -> bool {
+    live_user_task_count() < MAX_LIVE_USER_TASKS
+        && allocator_available_bytes() >= USER_TASK_MEMORY_RESERVE_BYTES
 }
 
 fn user_thread_entry_by_tid(tid: i32) -> Option<UserThreadEntry> {
@@ -4697,7 +4770,12 @@ fn poll_ready_events(
             revents: 0,
         })
         .collect::<Vec<_>>();
-    let ready = poll_events(&mut events, timeout, |fd| process.fds.lock().poll_state(fd))?;
+    let ready = poll_events(
+        &mut events,
+        timeout,
+        |fd| process.fds.lock().poll_state(fd),
+        current_exit_or_signal_pending,
+    )?;
     for (pollfd, event) in pollfds.iter_mut().zip(events.iter()) {
         pollfd.revents = event.revents;
     }
@@ -5014,6 +5092,9 @@ fn sys_clone(
         && (clone_flags & general::CLONE_VM as usize == 0
             || clone_flags & vfork_flags == vfork_flags);
     if fork_like_flags {
+        if !can_create_user_task() {
+            return neg_errno(LinuxError::EAGAIN);
+        }
         if !matches!(exit_signal, 0) && exit_signal != SIGCHLD_NUM as usize {
             return neg_errno(LinuxError::ENOSYS);
         }
@@ -5130,6 +5211,9 @@ fn sys_clone(
         && ctid == 0
     {
         return neg_errno(LinuxError::EFAULT);
+    }
+    if !can_create_user_task() {
+        return neg_errno(LinuxError::EAGAIN);
     }
 
     let mut child_tf = child_trap_frame(tf, child_stack);
@@ -7915,8 +7999,10 @@ fn stat_to_statx(st: &general::stat, requested_mask: u32, mnt_id: u64) -> genera
     out.stx_size = st.st_size as u64;
     out.stx_blocks = st.st_blocks as u64;
     out.stx_mnt_id = mnt_id;
-    out.stx_dev_major = 0;
-    out.stx_dev_minor = st.st_dev as u32;
+    out.stx_rdev_major = linux_major(st.st_rdev as u64);
+    out.stx_rdev_minor = linux_minor(st.st_rdev as u64);
+    out.stx_dev_major = linux_major(st.st_dev as u64);
+    out.stx_dev_minor = linux_minor(st.st_dev as u64);
     out
 }
 
@@ -7936,6 +8022,11 @@ fn statx_mount_id(path: Option<&str>) -> u64 {
 }
 
 fn stat_path_no_follow(path: &str) -> Result<general::stat, LinuxError> {
+    match path {
+        "/dev/null" => return Ok(dev_stat(DEV_NULL_RDEV)),
+        "/dev/zero" => return Ok(dev_stat(DEV_ZERO_RDEV)),
+        _ => {}
+    }
     let meta = axfs::api::metadata(path).map_err(LinuxError::from)?;
     if meta.file_type() == axfs::api::FileType::SymLink {
         let target = axfs::api::read_to_string(path).map_err(LinuxError::from)?;
@@ -8264,8 +8355,8 @@ impl FdTable {
         match self.entry_mut(fd)? {
             FdEntry::Stdin => Ok(stdio_stat(true)),
             FdEntry::Stdout | FdEntry::Stderr => Ok(stdio_stat(false)),
-            FdEntry::DevNull => Ok(stdio_stat(false)),
-            FdEntry::DevZero => Ok(stdio_stat(true)),
+            FdEntry::DevNull => Ok(dev_stat(DEV_NULL_RDEV)),
+            FdEntry::DevZero => Ok(dev_stat(DEV_ZERO_RDEV)),
             FdEntry::File(file) => {
                 let mut st = file_attr_to_stat(
                     &file.file.get_attr().map_err(LinuxError::from)?,
@@ -8310,8 +8401,8 @@ impl FdTable {
             Ok(FdEntry::Directory(dir)) => {
                 Ok(file_attr_to_stat(&dir.attr, Some(dir.path.as_str())))
             }
-            Ok(FdEntry::DevNull) => Ok(stdio_stat(false)),
-            Ok(FdEntry::DevZero) => Ok(stdio_stat(true)),
+            Ok(FdEntry::DevNull) => Ok(dev_stat(DEV_NULL_RDEV)),
+            Ok(FdEntry::DevZero) => Ok(dev_stat(DEV_ZERO_RDEV)),
             Ok(_) => Err(LinuxError::EINVAL),
             Err(err) => Err(err),
         }
@@ -8878,10 +8969,31 @@ fn dirent_type(ty: FileType) -> u32 {
 
 fn stdio_stat(readable: bool) -> general::stat {
     let perm = if readable { 0o440 } else { 0o220 };
+    char_stat(perm, 0)
+}
+
+fn dev_stat(rdev: u64) -> general::stat {
+    char_stat(0o666, rdev)
+}
+
+fn char_stat(perm: u32, rdev: u64) -> general::stat {
     let mut st: general::stat = unsafe { core::mem::zeroed() };
     st.st_ino = 1;
     st.st_mode = ST_MODE_CHR | perm;
     st.st_nlink = 1;
+    st.st_rdev = rdev as _;
     st.st_blksize = 512;
     st
+}
+
+const fn linux_makedev(major: u64, minor: u64) -> u64 {
+    ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12)
+}
+
+const fn linux_major(dev: u64) -> u32 {
+    (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32
+}
+
+const fn linux_minor(dev: u64) -> u32 {
+    ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32
 }

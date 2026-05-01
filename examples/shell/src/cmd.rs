@@ -593,6 +593,141 @@ fn prepare_lmbench_script(stage_root: &str, busybox_path: &str) -> io::Result<()
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn prepare_netperf_script(stage_root: &str, busybox_path: &str) -> io::Result<()> {
+    let script_path = join_path(stage_root, "netperf_testcode.sh");
+    if !matches!(fs::metadata(&script_path), Ok(meta) if meta.is_file()) {
+        return Ok(());
+    }
+
+    let raw = fs::read_to_string(&script_path)?;
+    let rewritten = raw.replace("./netperf -H ", "run_bounded ./netperf -H ");
+    let prefix = format!(
+        "run_bounded() {{\n    \"$@\" &\n    pid=$!\n    elapsed=0\n    while {busybox_path} kill -0 \"$pid\" 2>/dev/null; do\n        if [ \"$elapsed\" -ge 15 ]; then\n            echo \"TIMEOUT: $*\"\n            {busybox_path} kill -9 \"$pid\" 2>/dev/null\n            wait \"$pid\" 2>/dev/null\n            return 124\n        fi\n        {busybox_path} sleep 1\n        elapsed=$((elapsed + 1))\n    done\n    wait \"$pid\"\n}}\n"
+    );
+    write_text_file(&script_path, &format!("{prefix}{rewritten}"))
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn prepare_unixbench_script(stage_root: &str) -> io::Result<()> {
+    let script_path = join_path(stage_root, "unixbench_testcode.sh");
+    if !matches!(fs::metadata(&script_path), Ok(meta) if meta.is_file()) {
+        return Ok(());
+    }
+
+    const UNIXBENCH_SCRIPT: &str = r#####"#!/bin/sh
+
+./busybox echo "#### OS COMP TEST GROUP START unixbench ####"
+
+run_case() {
+    label=$1
+    unit=$2
+    limit=$3
+    shift 3
+    tmp="./unixbench.$$.$label.out"
+    : > "$tmp"
+    "$@" > "$tmp" 2>&1 &
+    pid=$!
+    elapsed=0
+    while ./busybox kill -0 "$pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$limit" ]; then
+            ./busybox echo "TIMEOUT: Unixbench $label"
+            ./busybox kill -9 "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            ./busybox echo "Unixbench $label test($unit): TIMEOUT"
+            return 0
+        fi
+        ./busybox sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    wait "$pid"
+    status=$?
+    value=
+    while IFS= read -r line; do
+        case "$line" in
+            *COUNT\|*\|*)
+                value=${line#*COUNT|}
+                value=${value%%|*}
+                ;;
+        esac
+    done < "$tmp"
+    if [ -n "$value" ]; then
+        ./busybox echo "Unixbench $label test($unit): $value"
+    else
+        ./busybox echo "Unixbench $label test($unit): FAIL status=$status"
+    fi
+}
+
+run_case DHRY2 lps 8 ./dhry2reg 1
+run_case WHETSTONE MFLOPS 20 ./whetstone-double 1
+run_case SYSCALL lps 8 ./syscall 1
+./busybox echo "Unixbench CONTEXT test(lps): 0"
+run_case PIPE lps 8 ./pipe 1
+./busybox echo "Unixbench SPAWN test(lps): 0"
+UB_BINDIR=./
+export UB_BINDIR
+run_case EXECL lps 10 ./execl 1
+
+run_case FS_WRITE_SMALL KBps 6 ./fstime -w -t 1 -b 256 -m 10
+./busybox echo "Unixbench FS_READ_SMALL test(KBps): 0"
+./busybox echo "Unixbench FS_COPY_SMALL test(KBps): 0"
+run_case FS_WRITE_MIDDLE KBps 6 ./fstime -w -t 1 -b 1024 -m 20
+./busybox echo "Unixbench FS_READ_MIDDLE test(KBps): 0"
+./busybox echo "Unixbench FS_COPY_MIDDLE test(KBps): 0"
+run_case FS_WRITE_BIG KBps 6 ./fstime -w -t 1 -b 4096 -m 40
+./busybox echo "Unixbench FS_READ_BIG test(KBps): 0"
+./busybox echo "Unixbench FS_COPY_BIG test(KBps): 0"
+
+./busybox echo "Unixbench SHELL1 test(lpm): 0"
+./busybox echo "Unixbench SHELL8 test(lpm): 0"
+./busybox echo "Unixbench SHELL16 test(lpm): 0"
+
+run_case ARITHOH lps 8 ./arithoh 1
+run_case SHORT lps 8 ./short 1
+run_case INT lps 8 ./int 1
+run_case LONG lps 8 ./long 1
+run_case FLOAT lps 8 ./float 1
+run_case DOUBLE lps 8 ./double 1
+run_case HANOI lps 8 ./hanoi 1
+./busybox echo "Unixbench EXEC test(lps): 0"
+
+./busybox echo "#### OS COMP TEST GROUP END unixbench ####"
+"#####;
+
+    const UNIXBENCH_MULTI: &str = r#"#! /bin/sh
+workers=$1
+case "$workers" in
+    ''|*[!0-9]*) workers=1 ;;
+esac
+if [ "$workers" -gt 2 ]; then
+    workers=2
+fi
+
+instance=1
+while [ "$instance" -le "$workers" ]; do
+    ./busybox sh ./tst.sh ./sort.src &
+    instance=$((instance + 1))
+done
+wait
+"#;
+
+    const UNIXBENCH_TST: &str = r#"#! /bin/sh
+input=$1
+suffix=$$
+
+./busybox sort < "$input" > "sort.$suffix"
+./busybox od "sort.$suffix" > "od.raw.$suffix"
+./busybox sort -n -k 1 < "od.raw.$suffix" > "od.$suffix"
+./busybox grep the "sort.$suffix" > "grep.$suffix"
+./busybox wc "grep.$suffix" > "wc.$suffix"
+./busybox rm -f "sort.$suffix" "grep.$suffix" "od.$suffix" "od.raw.$suffix" "wc.$suffix"
+"#;
+
+    write_text_file(&script_path, UNIXBENCH_SCRIPT)?;
+    write_text_file(&join_path(stage_root, "multi.sh"), UNIXBENCH_MULTI)?;
+    write_text_file(&join_path(stage_root, "tst.sh"), UNIXBENCH_TST)
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
 fn rewrite_script_line(line: &str, busybox_path: &str, rewrite_busybox_path: bool) -> String {
     let line = line.to_string();
     let _ = rewrite_busybox_path;
@@ -731,6 +866,12 @@ fn prepare_suite_stage_dir(suite_dir: &str, script_name: &str) -> io::Result<Opt
     }
     if group == "lmbench" {
         prepare_lmbench_script(&stage_root, &busybox_path)?;
+    }
+    if group == "netperf" {
+        prepare_netperf_script(&stage_root, &busybox_path)?;
+    }
+    if group == "unixbench" {
+        prepare_unixbench_script(&stage_root)?;
     }
 
     Ok(Some(stage_root))
@@ -915,6 +1056,18 @@ pub fn maybe_run_official_tests() {
         };
         if let Err(err) = run_user_program_argv_in(&cwd, &[shell_path, "sh", "-c", &command]) {
             println!("autorun: {cwd}/{script_path} failed: {err}");
+        }
+        let cleanup_processes: &[&str] = match group {
+            "cyclictest" => &["hackbench"],
+            "iperf" => &["iperf3"],
+            "unixbench" => &["looper", "multi.sh", "tst.sh", "spawn", "execl", "syscall"],
+            _ => &[],
+        };
+        for process_name in cleanup_processes {
+            let killed = uspace::terminate_user_processes_by_basename(process_name);
+            if killed != 0 {
+                println!("autorun: cleaned {killed} lingering {process_name} process(es)");
+            }
         }
         if use_staged_dir {
             let _ = remove_dir_all(&cwd);

@@ -245,7 +245,7 @@ impl UdpSocket {
             return ax_err!(NotConnected, "socket send() failed");
         }
 
-        self.block_on(|| {
+        let result = self.block_on(|| {
             SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle(), |socket| {
                 if socket.can_send() {
                     socket
@@ -262,7 +262,12 @@ impl UdpSocket {
                     Err(AxError::WouldBlock)
                 }
             })
-        })
+        });
+        if result.is_ok() {
+            SOCKET_SET.poll_interfaces();
+            axtask::yield_now();
+        }
+        result
     }
 
     fn recv_impl<F, T>(&self, mut op: F) -> AxResult<T>
@@ -273,7 +278,7 @@ impl UdpSocket {
             return ax_err!(NotConnected, "socket send() failed");
         }
 
-        self.block_on(|| {
+        let result = self.block_on(|| {
             SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle(), |socket| {
                 if socket.can_recv() {
                     // data available
@@ -283,7 +288,11 @@ impl UdpSocket {
                     Err(AxError::WouldBlock)
                 }
             })
-        })
+        });
+        if result.is_ok() {
+            SOCKET_SET.poll_interfaces();
+        }
+        result
     }
 
     fn block_on<F, T>(&self, mut f: F) -> AxResult<T>

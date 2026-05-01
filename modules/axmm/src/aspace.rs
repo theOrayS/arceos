@@ -109,7 +109,7 @@ impl AddrSpace {
                     continue;
                 };
                 if self.pt.query(vaddr).is_err() && !self.handle_page_fault(vaddr, fault_flags) {
-                    return ax_err!(BadState, "failed to materialize child page");
+                    return ax_err!(NoMemory, "failed to materialize child page");
                 }
                 let (dst_paddr, _, _) = self.pt.query(vaddr).map_err(|_| AxError::BadState)?;
                 unsafe {

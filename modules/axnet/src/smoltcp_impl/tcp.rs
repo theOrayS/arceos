@@ -41,6 +41,7 @@ pub struct TcpSocket {
     local_addr: UnsafeCell<IpEndpoint>,
     peer_addr: UnsafeCell<IpEndpoint>,
     nonblock: AtomicBool,
+    write_shutdown: AtomicBool,
 }
 
 unsafe impl Sync for TcpSocket {}
@@ -54,6 +55,7 @@ impl TcpSocket {
             local_addr: UnsafeCell::new(UNSPECIFIED_ENDPOINT),
             peer_addr: UnsafeCell::new(UNSPECIFIED_ENDPOINT),
             nonblock: AtomicBool::new(false),
+            write_shutdown: AtomicBool::new(false),
         }
     }
 
@@ -69,6 +71,7 @@ impl TcpSocket {
             local_addr: UnsafeCell::new(local_addr),
             peer_addr: UnsafeCell::new(peer_addr),
             nonblock: AtomicBool::new(false),
+            write_shutdown: AtomicBool::new(false),
         }
     }
 
@@ -262,6 +265,23 @@ impl TcpSocket {
         Ok(())
     }
 
+    /// Shuts down the transmit side while keeping the receive side observable.
+    pub fn shutdown_write(&self) -> AxResult {
+        if !self.is_connected() {
+            return ax_err!(NotConnected, "socket shutdown() failed");
+        }
+
+        // SAFETY: `self.handle` should be initialized in a connected socket.
+        let handle = unsafe { self.handle.get().read().unwrap() };
+        SOCKET_SET.with_socket_mut::<tcp::Socket, _, _>(handle, |socket| {
+            debug!("TCP socket {}: shutting down write side", handle);
+            socket.close();
+        });
+        self.write_shutdown.store(true, Ordering::Release);
+        SOCKET_SET.poll_interfaces();
+        Ok(())
+    }
+
     /// Receives data from the socket, stores it in the given buffer.
     pub fn recv(&self, buf: &mut [u8]) -> AxResult<usize> {
         if self.is_connecting() {
@@ -272,27 +292,33 @@ impl TcpSocket {
 
         // SAFETY: `self.handle` should be initialized in a connected socket.
         let handle = unsafe { self.handle.get().read().unwrap() };
-        self.block_on(|| {
+        let result = self.block_on(|| {
             SOCKET_SET.with_socket_mut::<tcp::Socket, _, _>(handle, |socket| {
-                if !socket.is_active() {
-                    // not open
-                    ax_err!(ConnectionRefused, "socket recv() failed")
-                } else if !socket.may_recv() {
-                    // connection closed
-                    Ok(0)
-                } else if socket.recv_queue() > 0 {
+                if socket.recv_queue() > 0 {
                     // data available
                     // TODO: use socket.recv(|buf| {...})
                     let len = socket
                         .recv_slice(buf)
                         .map_err(|_| ax_err_type!(BadState, "socket recv() failed"))?;
                     Ok(len)
+                } else if self.write_shutdown.load(Ordering::Acquire) {
+                    Ok(0)
+                } else if !socket.may_recv() {
+                    // connection closed
+                    Ok(0)
+                } else if !socket.is_active() {
+                    // not open
+                    ax_err!(ConnectionRefused, "socket recv() failed")
                 } else {
                     // no more data
                     Err(AxError::WouldBlock)
                 }
             })
-        })
+        });
+        if result.is_ok() {
+            SOCKET_SET.poll_interfaces();
+        }
+        result
     }
 
     /// Transmits data in the given buffer.
@@ -305,7 +331,7 @@ impl TcpSocket {
 
         // SAFETY: `self.handle` should be initialized in a connected socket.
         let handle = unsafe { self.handle.get().read().unwrap() };
-        self.block_on(|| {
+        let result = self.block_on(|| {
             SOCKET_SET.with_socket_mut::<tcp::Socket, _, _>(handle, |socket| {
                 if !socket.is_active() || !socket.may_send() {
                     // closed by remote
@@ -322,7 +348,11 @@ impl TcpSocket {
                     Err(AxError::WouldBlock)
                 }
             })
-        })
+        });
+        if result.is_ok() {
+            SOCKET_SET.poll_interfaces();
+        }
+        result
     }
 
     /// Whether the socket is readable or writable.
@@ -487,7 +517,9 @@ impl TcpSocket {
         let handle = unsafe { self.handle.get().read().unwrap() };
         SOCKET_SET.with_socket::<tcp::Socket, _, _>(handle, |socket| {
             Ok(PollState {
-                readable: !socket.may_recv() || socket.can_recv(),
+                readable: self.write_shutdown.load(Ordering::Acquire)
+                    || !socket.may_recv()
+                    || socket.can_recv(),
                 writable: !socket.may_send() || socket.can_send(),
             })
         })
@@ -528,10 +560,10 @@ impl TcpSocket {
 
 impl Drop for TcpSocket {
     fn drop(&mut self) {
-        self.shutdown().ok();
-        // Safe because we have mut reference to `self`.
-        if let Some(handle) = unsafe { self.handle.get().read() } {
-            SOCKET_SET.remove(handle);
+        if self.is_listening() {
+            self.shutdown().ok();
+        } else if let Some(handle) = unsafe { self.handle.get().read() } {
+            SOCKET_SET.close_tcp_socket(handle);
         }
     }
 }
