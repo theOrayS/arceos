@@ -128,7 +128,8 @@ impl RootDirectory {
                 Err(AxError::NotFound) => {}
                 Err(err) => return Err(err),
             },
-            Err(AxError::Unsupported | AxError::ReadOnlyFilesystem | AxError::PermissionDenied) => {}
+            Err(AxError::Unsupported | AxError::ReadOnlyFilesystem | AxError::PermissionDenied) => {
+            }
             Err(AxError::NotFound) => {}
             Err(err) => return Err(err),
         }
@@ -170,34 +171,36 @@ impl RootDirectory {
         }
     }
 
+    fn mounted_fs_match<'a>(&self, path: &'a str) -> (Option<usize>, &'a str) {
+        let path = path.trim_matches('/');
+        if let Some(rest) = path.strip_prefix("./") {
+            return self.mounted_fs_match(rest);
+        }
+
+        let mut idx = None;
+        let mut max_len = 0;
+
+        // Find the filesystem that has the longest mounted path match.
+        for (i, mp) in self.mounts.iter().enumerate() {
+            if let Some(matched_len) = Self::mount_match_len(path, mp.path) {
+                if matched_len > max_len {
+                    max_len = matched_len;
+                    idx = Some(i);
+                }
+            }
+        }
+
+        idx.map_or((None, path), |i| (Some(i), &path[max_len..]))
+    }
+
     fn lookup_mounted_fs<F, T>(&self, path: &str, f: F) -> AxResult<T>
     where
         F: FnOnce(Arc<dyn VfsOps>, &str) -> AxResult<T>,
     {
         debug!("lookup at root: {}", path);
-        let path = path.trim_matches('/');
-        if let Some(rest) = path.strip_prefix("./") {
-            return self.lookup_mounted_fs(rest, f);
-        }
-
-        let mut idx = 0;
-        let mut max_len = 0;
-
-        // Find the filesystem that has the longest mounted path match
-        // TODO: more efficient, e.g. trie
-        for (i, mp) in self.mounts.iter().enumerate() {
-            if let Some(matched_len) = Self::mount_match_len(path, mp.path) {
-                if matched_len > max_len {
-                    max_len = matched_len;
-                    idx = i;
-                }
-            }
-        }
-
-        if max_len == 0 {
-            f(self.main_fs.clone(), path) // not matched any mount point
-        } else {
-            f(self.mounts[idx].fs.clone(), &path[max_len..]) // matched at `idx`
+        match self.mounted_fs_match(path) {
+            (Some(idx), rest_path) => f(self.mounts[idx].fs.clone(), rest_path),
+            (None, rest_path) => f(self.main_fs.clone(), rest_path),
         }
     }
 }
@@ -234,13 +237,20 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
-            }
-        })
+        let (src_mount, src_rest) = self.mounted_fs_match(src_path);
+        let (dst_mount, dst_rest) = self.mounted_fs_match(dst_path);
+        if src_mount != dst_mount {
+            return ax_err!(CrossesDevices);
+        }
+        if src_rest.is_empty() || dst_rest.is_empty() {
+            return ax_err!(PermissionDenied); // cannot rename mount points
+        }
+
+        let fs = match src_mount {
+            Some(idx) => self.mounts[idx].fs.clone(),
+            None => self.main_fs.clone(),
+        };
+        fs.root_dir().rename(src_rest, dst_rest)
     }
 
     fn read_dir(&self, start_idx: usize, dirents: &mut [VfsDirEntry]) -> VfsResult<usize> {
