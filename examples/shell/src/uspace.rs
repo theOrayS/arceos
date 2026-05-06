@@ -4,6 +4,7 @@ use core::mem::{offset_of, size_of};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use axalloc::global_allocator;
 use axerrno::LinuxError;
 use axfs::fops::{self, Directory, File, FileAttr, FileType, OpenOptions};
 use axhal::context::{TrapFrame, UspaceContext};
@@ -69,6 +70,13 @@ const RISCV_SIGTRAMP_CODE: [u32; 3] = [0x08b0_0893, 0x0000_0073, 0x0010_0073];
 const ST_MODE_DIR: u32 = 0o040000;
 const ST_MODE_FILE: u32 = 0o100000;
 const ST_MODE_CHR: u32 = 0o020000;
+const STATFS_BLOCK_SIZE: i64 = 4096;
+const STATFS_NAME_MAX: i64 = 255;
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+const PROC_SUPER_MAGIC: i64 = 0x9fa0;
+const SYSFS_MAGIC: i64 = 0x6265_6572;
+const DEVFS_MAGIC: i64 = 0x1373;
+const PIPEFS_MAGIC: i64 = 0x5049_5045;
 
 #[cfg(target_arch = "riscv64")]
 const AUX_PLATFORM: &str = "riscv64";
@@ -1869,6 +1877,8 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         general::__NR_write => sys_write(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_writev => sys_writev(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_readv => sys_readv(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_statfs => sys_statfs(&process, tf.arg0(), tf.arg1()),
+        general::__NR_fstatfs => sys_fstatfs(&process, tf.arg0(), tf.arg1()),
         general::__NR_getcwd => sys_getcwd(&process, tf.arg0(), tf.arg1()),
         general::__NR_chdir => sys_chdir(&process, tf.arg0()),
         general::__NR_openat => sys_openat(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3()),
@@ -1948,10 +1958,22 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         ),
         general::__NR_mprotect => sys_mprotect(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_munmap => sys_munmap(&process, tf, tf.arg0(), tf.arg1()),
-        general::__NR_mbind => sys_mbind(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3(), tf.arg4()),
-        general::__NR_get_mempolicy => {
-            sys_get_mempolicy(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3(), tf.arg4())
-        }
+        general::__NR_mbind => sys_mbind(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+        ),
+        general::__NR_get_mempolicy => sys_get_mempolicy(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+        ),
         general::__NR_set_mempolicy => sys_set_mempolicy(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_mlock
         | general::__NR_munlock
@@ -2760,6 +2782,40 @@ fn sys_fstat(process: &UserProcess, fd: usize, statbuf: usize) -> isize {
     write_user_value(process, statbuf, &st)
 }
 
+fn sys_statfs(process: &UserProcess, pathname: usize, statfsbuf: usize) -> isize {
+    if statfsbuf == 0 {
+        return neg_errno(LinuxError::EFAULT);
+    }
+    let path = match read_cstr(process, pathname) {
+        Ok(path) => path,
+        Err(err) => return neg_errno(err),
+    };
+    let cwd = process.cwd();
+    let Some(abs_path) = normalize_path(cwd.as_str(), path.as_str()) else {
+        return neg_errno(LinuxError::EINVAL);
+    };
+    let st = match process
+        .fds
+        .lock()
+        .statfs_path(process, general::AT_FDCWD, abs_path.as_str())
+    {
+        Ok(st) => st,
+        Err(err) => return neg_errno(err),
+    };
+    write_user_value(process, statfsbuf, &st)
+}
+
+fn sys_fstatfs(process: &UserProcess, fd: usize, statfsbuf: usize) -> isize {
+    if statfsbuf == 0 {
+        return neg_errno(LinuxError::EFAULT);
+    }
+    let st = match process.fds.lock().statfs(fd as i32) {
+        Ok(st) => st,
+        Err(err) => return neg_errno(err),
+    };
+    write_user_value(process, statfsbuf, &st)
+}
+
 fn sys_getdents64(process: &UserProcess, fd: usize, dirp: usize, count: usize) -> isize {
     let Some(dst) = user_bytes_mut(process, dirp, count, true) else {
         return neg_errno(LinuxError::EFAULT);
@@ -2958,12 +3014,7 @@ fn sys_sched_getscheduler(process: &UserProcess, pid: i32) -> isize {
     0
 }
 
-fn sys_sched_setaffinity(
-    process: &UserProcess,
-    pid: i32,
-    cpusetsize: usize,
-    mask: usize,
-) -> isize {
+fn sys_sched_setaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mask: usize) -> isize {
     if !is_same_sched_target(process, pid) {
         return neg_errno(LinuxError::ESRCH);
     }
@@ -4205,6 +4256,39 @@ fn file_attr_to_stat(attr: &FileAttr, path: Option<&str>) -> general::stat {
     st
 }
 
+fn statfs_type_for_path(path: Option<&str>) -> i64 {
+    match path {
+        Some(path) if path == "/proc" || path.starts_with("/proc/") => PROC_SUPER_MAGIC,
+        Some(path) if path == "/sys" || path.starts_with("/sys/") => SYSFS_MAGIC,
+        Some(path) if path == "/dev" || path.starts_with("/dev/") => DEVFS_MAGIC,
+        Some(path) if path.starts_with("pipe:") => PIPEFS_MAGIC,
+        _ => TMPFS_MAGIC,
+    }
+}
+
+fn generic_statfs(path: Option<&str>) -> general::statfs {
+    let alloc = global_allocator();
+    let available_pages = alloc.available_pages() as i64;
+    let total_pages = (alloc.used_pages() as i64 + available_pages).max(1);
+    let fs_type = statfs_type_for_path(path);
+    general::statfs {
+        f_type: fs_type as _,
+        f_bsize: STATFS_BLOCK_SIZE as _,
+        f_blocks: total_pages as _,
+        f_bfree: available_pages as _,
+        f_bavail: available_pages as _,
+        f_files: total_pages as _,
+        f_ffree: available_pages as _,
+        f_fsid: general::__kernel_fsid_t {
+            val: [fs_type as i32, 0],
+        },
+        f_namelen: STATFS_NAME_MAX as _,
+        f_frsize: STATFS_BLOCK_SIZE as _,
+        f_flags: 0,
+        f_spare: [0; 4],
+    }
+}
+
 fn path_inode(path: Option<&str>) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -4467,6 +4551,17 @@ impl FdTable {
         }
     }
 
+    fn statfs(&self, fd: i32) -> Result<general::statfs, LinuxError> {
+        let path = match self.entry(fd)? {
+            FdEntry::DevNull => Some("/dev/null"),
+            FdEntry::File(file) => Some(file.path.as_str()),
+            FdEntry::Directory(dir) => Some(dir.path.as_str()),
+            FdEntry::Pipe(_) => Some("pipe:"),
+            FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => None,
+        };
+        Ok(generic_statfs(path))
+    }
+
     fn stat_path(
         &mut self,
         process: &UserProcess,
@@ -4478,8 +4573,26 @@ impl FdTable {
                 &file.file.get_attr().map_err(LinuxError::from)?,
                 Some(file.path.as_str()),
             )),
-            Ok(FdEntry::Directory(dir)) => Ok(file_attr_to_stat(&dir.attr, Some(dir.path.as_str()))),
+            Ok(FdEntry::Directory(dir)) => {
+                Ok(file_attr_to_stat(&dir.attr, Some(dir.path.as_str())))
+            }
             Ok(_) => Err(LinuxError::EINVAL),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn statfs_path(
+        &mut self,
+        process: &UserProcess,
+        dirfd: i32,
+        path: &str,
+    ) -> Result<general::statfs, LinuxError> {
+        match open_fd_entry(process, self, dirfd, path, general::O_RDONLY) {
+            Ok(FdEntry::File(file)) => Ok(generic_statfs(Some(file.path.as_str()))),
+            Ok(FdEntry::Directory(dir)) => Ok(generic_statfs(Some(dir.path.as_str()))),
+            Ok(FdEntry::DevNull) => Ok(generic_statfs(Some("/dev/null"))),
+            Ok(FdEntry::Pipe(_)) => Ok(generic_statfs(Some("pipe:"))),
+            Ok(_) => Ok(generic_statfs(None)),
             Err(err) => Err(err),
         }
     }

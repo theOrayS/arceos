@@ -33,6 +33,7 @@ axfs_devfs = { version = "0.1", optional = true }
 axfs_ramfs = { version = "0.1", optional = true }
 crate_interface = { version = "0.3", optional = true }
 axsync = { workspace = true }
+axalloc = { workspace = true }
 axdriver = { workspace = true, features = ["block"] }
 axdriver_block = "0.2"
 axns = { workspace = true }

@@ -10,6 +10,7 @@ authors = ["Yuekai Jia <equation618@gmail.com>"]
 use-ramfs = ["axstd/myfs", "dep:axfs_vfs", "dep:axfs_ramfs", "dep:crate_interface"]
 uspace = [
     "axstd/fp-simd",
+    "dep:axalloc",
     "dep:axerrno",
     "dep:axfs",
     "dep:axhal",
@@ -31,6 +32,7 @@ default = []
 
 [dependencies]
 arceos_posix_api = { workspace = true, optional = true, features = ["alloc", "multitask", "fd", "fs", "uspace"] }
+axalloc = { workspace = true, optional = true }
 axerrno = { version = "0.1", optional = true }
 axfs = { workspace = true, optional = true }
 axfs_vfs = { version = "0.1", optional = true }

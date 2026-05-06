@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{format, sync::Arc};
 use axfs_vfs::{VfsNodeType, VfsOps, VfsResult};
 
 use crate::fs;
@@ -28,6 +28,16 @@ pub(crate) fn procfs() -> VfsResult<Arc<fs::ramfs::RamFileSystem>> {
     let procfs = fs::ramfs::RamFileSystem::new();
     let proc_root = procfs.root_dir();
 
+    // Create Linux-compatible proc files used by common user-space tools.
+    proc_root.create("mounts", VfsNodeType::File)?;
+    let file_mounts = proc_root.clone().lookup("./mounts")?;
+    file_mounts.write_at(0, proc_mounts().as_bytes())?;
+
+    proc_root.create("meminfo", VfsNodeType::File)?;
+    let file_meminfo = proc_root.clone().lookup("./meminfo")?;
+    let meminfo = proc_meminfo();
+    file_meminfo.write_at(0, meminfo.as_bytes())?;
+
     // Create /proc/sys/net/core/somaxconn
     proc_root.create("sys", VfsNodeType::Dir)?;
     proc_root.create("sys/net", VfsNodeType::Dir)?;
@@ -47,6 +57,48 @@ pub(crate) fn procfs() -> VfsResult<Arc<fs::ramfs::RamFileSystem>> {
     proc_root.create("self/stat", VfsNodeType::File)?;
 
     Ok(Arc::new(procfs))
+}
+
+#[cfg(feature = "procfs")]
+fn proc_mounts() -> &'static str {
+    "rootfs / rootfs rw 0 0\n\
+     devfs /dev devfs rw 0 0\n\
+     tmpfs /tmp tmpfs rw 0 0\n\
+     tmpfs /var tmpfs rw 0 0\n\
+     proc /proc proc rw 0 0\n\
+     sysfs /sys sysfs rw 0 0\n"
+}
+
+#[cfg(feature = "procfs")]
+fn proc_meminfo() -> alloc::string::String {
+    const PAGE_SIZE_KIB: usize = 4;
+
+    let allocator = axalloc::global_allocator();
+    let used_pages_kib = allocator.used_pages().saturating_mul(PAGE_SIZE_KIB);
+    let free_pages_kib = allocator.available_pages().saturating_mul(PAGE_SIZE_KIB);
+    let heap_free_kib = allocator.available_bytes() / 1024;
+    let heap_used_kib = allocator.used_bytes() / 1024;
+    let total_kib = used_pages_kib.saturating_add(free_pages_kib);
+    let free_kib = free_pages_kib.saturating_add(heap_free_kib);
+    let used_kib = total_kib
+        .saturating_sub(free_kib)
+        .saturating_add(heap_used_kib);
+
+    format!(
+        "MemTotal:       {total_kib:8} kB\n\
+         MemFree:        {free_kib:8} kB\n\
+         MemAvailable:   {free_kib:8} kB\n\
+         Buffers:               0 kB\n\
+         Cached:                0 kB\n\
+         SwapCached:            0 kB\n\
+         Active:                0 kB\n\
+         Inactive:              0 kB\n\
+         SwapTotal:             0 kB\n\
+         SwapFree:              0 kB\n\
+         Dirty:                 0 kB\n\
+         Writeback:             0 kB\n\
+         Slab:           {used_kib:8} kB\n"
+    )
 }
 
 #[cfg(feature = "sysfs")]
