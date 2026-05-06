@@ -2,21 +2,21 @@
 resolver = "2"
 
 members = [
-    "modules/axalloc",
-    "modules/axconfig",
-    "modules/axdisplay",
-    "modules/axdriver",
-    "modules/axfs",
-    "modules/axhal",
-    "modules/axlog",
-    "modules/axmm",
-    "modules/axdma",
-    "modules/axnet",
-    "modules/axns",
-    "modules/axruntime",
-    "modules/axsync",
-    "modules/axtask",
-    "modules/axipi",
+    "kernel/arch/axhal",
+    "kernel/config/axconfig",
+    "kernel/diagnostics/axlog",
+    "kernel/drivers/axdisplay",
+    "kernel/drivers/axdma",
+    "kernel/drivers/axdriver",
+    "kernel/fs/axfs",
+    "kernel/memory/axalloc",
+    "kernel/memory/axmm",
+    "kernel/namespace/axns",
+    "kernel/net/axnet",
+    "kernel/runtime/axruntime",
+    "kernel/smp/axipi",
+    "kernel/sync/axsync",
+    "kernel/task/axtask",
 
     "api/axfeat",
     "api/arceos_api",
@@ -51,21 +51,21 @@ arceos_api = { path = "api/arceos_api" }
 arceos_posix_api = { path = "api/arceos_posix_api" }
 axfeat = { path = "api/axfeat" }
 
-axalloc = { path = "modules/axalloc" }
-axconfig = { path = "modules/axconfig" }
-axdisplay = { path = "modules/axdisplay" }
-axdriver = { path = "modules/axdriver" }
-axfs = { path = "modules/axfs" }
-axhal = { path = "modules/axhal" }
-axlog = { path = "modules/axlog" }
-axmm = { path = "modules/axmm" }
-axnet = { path = "modules/axnet" }
-axns = { path = "modules/axns" }
-axruntime = { path = "modules/axruntime" }
-axsync = { path = "modules/axsync" }
-axtask = { path = "modules/axtask" }
-axdma = { path = "modules/axdma" }
-axipi = { path = "modules/axipi" }
+axalloc = { path = "kernel/memory/axalloc" }
+axconfig = { path = "kernel/config/axconfig" }
+axdisplay = { path = "kernel/drivers/axdisplay" }
+axdriver = { path = "kernel/drivers/axdriver" }
+axfs = { path = "kernel/fs/axfs" }
+axhal = { path = "kernel/arch/axhal" }
+axlog = { path = "kernel/diagnostics/axlog" }
+axmm = { path = "kernel/memory/axmm" }
+axnet = { path = "kernel/net/axnet" }
+axns = { path = "kernel/namespace/axns" }
+axruntime = { path = "kernel/runtime/axruntime" }
+axsync = { path = "kernel/sync/axsync" }
+axtask = { path = "kernel/task/axtask" }
+axdma = { path = "kernel/drivers/axdma" }
+axipi = { path = "kernel/smp/axipi" }
 
 [profile.release]
 lto = true
