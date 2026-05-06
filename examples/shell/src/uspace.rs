@@ -77,6 +77,7 @@ const PROC_SUPER_MAGIC: i64 = 0x9fa0;
 const SYSFS_MAGIC: i64 = 0x6265_6572;
 const DEVFS_MAGIC: i64 = 0x1373;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
+const RTC_RD_TIME: u32 = 0x8024_7009;
 
 #[cfg(target_arch = "riscv64")]
 const AUX_PLATFORM: &str = "riscv64";
@@ -141,6 +142,7 @@ enum FdEntry {
     Stdout,
     Stderr,
     DevNull,
+    Rtc,
     File(FileEntry),
     Directory(DirectoryEntry),
     Pipe(PipeEndpoint),
@@ -234,6 +236,20 @@ struct Tms {
     tms_stime: c_long,
     tms_cutime: c_long,
     tms_cstime: c_long,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RtcTime {
+    tm_sec: i32,
+    tm_min: i32,
+    tm_hour: i32,
+    tm_mday: i32,
+    tm_mon: i32,
+    tm_year: i32,
+    tm_wday: i32,
+    tm_yday: i32,
+    tm_isdst: i32,
 }
 
 #[repr(C)]
@@ -1400,6 +1416,19 @@ impl UserProcess {
         drop(child);
         axtask::yield_now();
         Ok(Some((child_pid, status)))
+    }
+
+    fn child_thread_entry_by_pid(&self, pid: i32) -> Option<UserThreadEntry> {
+        let children = self.children.lock();
+        children
+            .iter()
+            .find(|child| {
+                child.pid == pid && child.process.live_threads.load(Ordering::Acquire) != 0
+            })
+            .map(|child| UserThreadEntry {
+                task: child.task.clone(),
+                process: child.process.clone(),
+            })
     }
 }
 
@@ -2863,6 +2892,10 @@ fn sys_fcntl(process: &UserProcess, fd: usize, cmd: usize, arg: usize) -> isize 
 }
 
 fn sys_ioctl(process: &UserProcess, fd: usize, req: usize, arg: usize) -> isize {
+    if req as u32 == RTC_RD_TIME && process.fds.lock().is_rtc(fd as i32) {
+        let rtc = rtc_time_from_wall_time();
+        return write_user_value(process, arg, &rtc);
+    }
     if req as u32 == ioctl::TIOCGWINSZ {
         let winsize = general::winsize {
             ws_row: 0,
@@ -3175,6 +3208,55 @@ fn clock_now_duration(clockid: u32) -> Result<core::time::Duration, LinuxError> 
         general::CLOCK_REALTIME_ALARM | general::CLOCK_BOOTTIME_ALARM => Err(LinuxError::EINVAL),
         _ => Err(LinuxError::EINVAL),
     }
+}
+
+fn rtc_time_from_wall_time() -> RtcTime {
+    let now = axhal::time::wall_time();
+    let total_secs = now.as_secs() as i64;
+    let days = total_secs.div_euclid(86_400);
+    let secs_of_day = total_secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+
+    RtcTime {
+        tm_sec: (secs_of_day % 60) as i32,
+        tm_min: ((secs_of_day / 60) % 60) as i32,
+        tm_hour: (secs_of_day / 3600) as i32,
+        tm_mday: day,
+        tm_mon: month - 1,
+        tm_year: year - 1900,
+        tm_wday: (days + 4).rem_euclid(7) as i32,
+        tm_yday: year_day(year, month, day),
+        tm_isdst: 0,
+    }
+}
+
+fn civil_from_days(days: i64) -> (i32, i32, i32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year as i32, month as i32, day as i32)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn year_day(year: i32, month: i32, day: i32) -> i32 {
+    const DAYS_BEFORE_MONTH: [i32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    let mut yday = DAYS_BEFORE_MONTH[(month - 1) as usize] + day - 1;
+    if month > 2 && is_leap_year(year) {
+        yday += 1;
+    }
+    yday
 }
 
 fn validate_clock_id(clockid: u32) -> Result<(), LinuxError> {
@@ -3701,6 +3783,15 @@ fn sys_kill(process: &UserProcess, pid: i32, sig: i32) -> isize {
         return neg_errno(err);
     }
     if pid == 0 || pid == process.pid() || pid == current_tid() {
+        return 0;
+    }
+    if let Some(entry) = process.child_thread_entry_by_pid(pid) {
+        if sig == 0 {
+            return 0;
+        }
+        if let Err(err) = deliver_user_signal(&entry, sig) {
+            return neg_errno(err);
+        }
         return 0;
     }
     neg_errno(LinuxError::ESRCH)
@@ -4397,6 +4488,7 @@ impl FdEntry {
             Self::Stdout => Ok(Self::Stdout),
             Self::Stderr => Ok(Self::Stderr),
             Self::DevNull => Ok(Self::DevNull),
+            Self::Rtc => Ok(Self::Rtc),
             Self::File(file) => Ok(Self::File(file.clone())),
             Self::Directory(dir) => Ok(Self::Directory(dir.clone())),
             Self::Pipe(pipe) => Ok(Self::Pipe(pipe.clone())),
@@ -4430,6 +4522,10 @@ impl FdTable {
         matches!(fd, 0..=2)
     }
 
+    fn is_rtc(&self, fd: i32) -> bool {
+        matches!(self.entry(fd), Ok(FdEntry::Rtc))
+    }
+
     fn poll(&self, fd: i32, mode: SelectMode) -> bool {
         let Ok(entry) = self.entry(fd) else {
             return matches!(mode, SelectMode::Except);
@@ -4438,12 +4534,12 @@ impl FdTable {
             SelectMode::Read => match entry {
                 FdEntry::Stdin => false,
                 FdEntry::Stdout | FdEntry::Stderr => false,
-                FdEntry::DevNull | FdEntry::File(_) | FdEntry::Directory(_) => true,
+                FdEntry::DevNull | FdEntry::Rtc | FdEntry::File(_) | FdEntry::Directory(_) => true,
                 FdEntry::Pipe(pipe) => pipe.poll().readable,
             },
             SelectMode::Write => match entry {
                 FdEntry::Stdin => false,
-                FdEntry::Stdout | FdEntry::Stderr | FdEntry::DevNull => true,
+                FdEntry::Stdout | FdEntry::Stderr | FdEntry::DevNull | FdEntry::Rtc => true,
                 FdEntry::File(_) => true,
                 FdEntry::Directory(_) => false,
                 FdEntry::Pipe(pipe) => pipe.poll().writable,
@@ -4456,6 +4552,7 @@ impl FdTable {
         match self.entry_mut(fd)? {
             FdEntry::Stdin => Ok(0),
             FdEntry::DevNull => Ok(0),
+            FdEntry::Rtc => Ok(0),
             FdEntry::File(file) => file.file.read(dst).map_err(LinuxError::from),
             FdEntry::Directory(_) => Err(LinuxError::EISDIR),
             FdEntry::Pipe(pipe) => pipe.read(dst),
@@ -4470,6 +4567,7 @@ impl FdTable {
                 Ok(src.len())
             }
             FdEntry::DevNull => Ok(src.len()),
+            FdEntry::Rtc => Ok(src.len()),
             FdEntry::File(file) => file.file.write(src).map_err(LinuxError::from),
             FdEntry::Pipe(pipe) => pipe.write(src),
             _ => Err(LinuxError::EBADF),
@@ -4542,6 +4640,7 @@ impl FdTable {
             FdEntry::Stdin => Ok(stdio_stat(true)),
             FdEntry::Stdout | FdEntry::Stderr => Ok(stdio_stat(false)),
             FdEntry::DevNull => Ok(stdio_stat(false)),
+            FdEntry::Rtc => Ok(stdio_stat(false)),
             FdEntry::File(file) => Ok(file_attr_to_stat(
                 &file.file.get_attr().map_err(LinuxError::from)?,
                 Some(file.path.as_str()),
@@ -4554,6 +4653,7 @@ impl FdTable {
     fn statfs(&self, fd: i32) -> Result<general::statfs, LinuxError> {
         let path = match self.entry(fd)? {
             FdEntry::DevNull => Some("/dev/null"),
+            FdEntry::Rtc => Some("/dev/misc/rtc"),
             FdEntry::File(file) => Some(file.path.as_str()),
             FdEntry::Directory(dir) => Some(dir.path.as_str()),
             FdEntry::Pipe(_) => Some("pipe:"),
@@ -4569,6 +4669,7 @@ impl FdTable {
         path: &str,
     ) -> Result<general::stat, LinuxError> {
         match open_fd_entry(process, self, dirfd, path, general::O_RDONLY) {
+            Ok(FdEntry::DevNull) | Ok(FdEntry::Rtc) => Ok(stdio_stat(false)),
             Ok(FdEntry::File(file)) => Ok(file_attr_to_stat(
                 &file.file.get_attr().map_err(LinuxError::from)?,
                 Some(file.path.as_str()),
@@ -4591,6 +4692,7 @@ impl FdTable {
             Ok(FdEntry::File(file)) => Ok(generic_statfs(Some(file.path.as_str()))),
             Ok(FdEntry::Directory(dir)) => Ok(generic_statfs(Some(dir.path.as_str()))),
             Ok(FdEntry::DevNull) => Ok(generic_statfs(Some("/dev/null"))),
+            Ok(FdEntry::Rtc) => Ok(generic_statfs(Some("/dev/misc/rtc"))),
             Ok(FdEntry::Pipe(_)) => Ok(generic_statfs(Some("pipe:"))),
             Ok(_) => Ok(generic_statfs(None)),
             Err(err) => Err(err),
@@ -4601,6 +4703,7 @@ impl FdTable {
         match self.entry_mut(fd)? {
             FdEntry::File(file) => file.file.truncate(size).map_err(LinuxError::from),
             FdEntry::DevNull => Ok(()),
+            FdEntry::Rtc => Ok(()),
             _ => Err(LinuxError::EINVAL),
         }
     }
@@ -4624,6 +4727,7 @@ impl FdTable {
         match self.entry_mut(fd)? {
             FdEntry::File(file) => file.file.seek(pos).map_err(LinuxError::from),
             FdEntry::DevNull => Ok(0),
+            FdEntry::Rtc => Ok(0),
             FdEntry::Directory(_) => Err(LinuxError::EISDIR),
             FdEntry::Pipe(_) => Err(LinuxError::ESPIPE),
             _ => Err(LinuxError::ESPIPE),
@@ -4835,6 +4939,12 @@ fn open_fd_candidates(
                 return Err(LinuxError::ENOTDIR);
             }
             return Ok(FdEntry::DevNull);
+        }
+        if path == "/dev/misc/rtc" || path == "/dev/rtc" {
+            if prefer_dir {
+                return Err(LinuxError::ENOTDIR);
+            }
+            return Ok(FdEntry::Rtc);
         }
         if prefer_dir {
             match open_dir_entry(path.as_str()) {
