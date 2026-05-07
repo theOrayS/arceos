@@ -1,5 +1,6 @@
 use core::net::SocketAddr;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
 
 use axerrno::{AxError, AxResult, ax_err, ax_err_type};
 use axio::PollState;
@@ -11,6 +12,10 @@ use smoltcp::socket::udp::{self, BindError, SendError};
 use smoltcp::wire::{IpEndpoint, IpListenEndpoint};
 
 use super::addr::UNSPECIFIED_ENDPOINT;
+use super::udp_loopback::{
+    UdpLoopbackQueue, is_loopback_endpoint, register_udp_loopback, send_udp_loopback,
+    unregister_udp_loopback,
+};
 use super::{SOCKET_SET, SocketSetWrapper};
 
 /// A UDP socket that provides POSIX-like APIs.
@@ -18,7 +23,10 @@ pub struct UdpSocket {
     handle: SocketHandle,
     local_addr: RwLock<Option<IpEndpoint>>,
     peer_addr: RwLock<Option<IpEndpoint>>,
+    loopback_queue: UdpLoopbackQueue,
     nonblock: AtomicBool,
+    recv_timeout: Mutex<Option<Duration>>,
+    send_timeout: Mutex<Option<Duration>>,
 }
 
 impl UdpSocket {
@@ -31,7 +39,10 @@ impl UdpSocket {
             handle,
             local_addr: RwLock::new(None),
             peer_addr: RwLock::new(None),
+            loopback_queue: UdpLoopbackQueue::new(),
             nonblock: AtomicBool::new(false),
+            recv_timeout: Mutex::new(None),
+            send_timeout: Mutex::new(None),
         }
     }
 
@@ -69,6 +80,30 @@ impl UdpSocket {
         self.nonblock.store(nonblocking, Ordering::Release);
     }
 
+    /// Sets the timeout used by blocking receive operations.
+    #[inline]
+    pub fn set_recv_timeout(&self, timeout: Option<Duration>) {
+        *self.recv_timeout.lock() = timeout;
+    }
+
+    /// Returns the timeout used by blocking receive operations.
+    #[inline]
+    pub fn recv_timeout(&self) -> Option<Duration> {
+        *self.recv_timeout.lock()
+    }
+
+    /// Sets the timeout used by blocking send operations.
+    #[inline]
+    pub fn set_send_timeout(&self, timeout: Option<Duration>) {
+        *self.send_timeout.lock() = timeout;
+    }
+
+    /// Returns the timeout used by blocking send operations.
+    #[inline]
+    pub fn send_timeout(&self) -> Option<Duration> {
+        *self.send_timeout.lock()
+    }
+
     /// Binds an unbound socket to the given address and port.
     ///
     /// It's must be called before [`send_to`](Self::send_to) and
@@ -96,6 +131,7 @@ impl UdpSocket {
         })?;
 
         *self_local_addr = Some(local_endpoint);
+        register_udp_loopback(local_endpoint, self.loopback_queue.clone());
         debug!("UDP socket {}: bound on {}", self.handle, endpoint);
         Ok(())
     }
@@ -106,15 +142,33 @@ impl UdpSocket {
         if remote_addr.port() == 0 || remote_addr.ip().is_unspecified() {
             return ax_err!(InvalidInput, "socket send_to() failed: invalid address");
         }
-        self.send_impl(buf, IpEndpoint::from(remote_addr))
+        let remote_endpoint = IpEndpoint::from(remote_addr);
+        if is_loopback_endpoint(remote_endpoint) {
+            return self.send_loopback(buf, remote_endpoint);
+        }
+        self.send_impl(buf, remote_endpoint)
     }
 
     /// Receives a single datagram message on the socket. On success, returns
     /// the number of bytes read and the origin.
     pub fn recv_from(&self, buf: &mut [u8]) -> AxResult<(usize, SocketAddr)> {
-        self.recv_impl(|socket| match socket.recv_slice(buf) {
-            Ok((len, meta)) => Ok((len, SocketAddr::from(meta.endpoint))),
-            Err(_) => ax_err!(BadState, "socket recv_from() failed"),
+        if self.local_addr.read().is_none() {
+            return ax_err!(NotConnected, "socket recv_from() failed");
+        }
+        self.block_on_timeout(self.recv_timeout(), || {
+            if let Some(datagram) = self.try_recv_loopback_from(buf, None) {
+                return Ok(datagram);
+            }
+            SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
+                if socket.can_recv() {
+                    match socket.recv_slice(buf) {
+                        Ok((len, meta)) => Ok((len, SocketAddr::from(meta.endpoint))),
+                        Err(_) => ax_err!(BadState, "socket recv_from() failed"),
+                    }
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            })
         })
     }
 
@@ -149,6 +203,9 @@ impl UdpSocket {
     /// Sends data on the socket to the remote address to which it is connected.
     pub fn send(&self, buf: &[u8]) -> AxResult<usize> {
         let remote_endpoint = self.remote_endpoint()?;
+        if is_loopback_endpoint(remote_endpoint) {
+            return self.send_loopback(buf, remote_endpoint);
+        }
         self.send_impl(buf, remote_endpoint)
     }
 
@@ -156,23 +213,36 @@ impl UdpSocket {
     /// to which it is connected. On success, returns the number of bytes read.
     pub fn recv(&self, buf: &mut [u8]) -> AxResult<usize> {
         let remote_endpoint = self.remote_endpoint()?;
-        self.recv_impl(|socket| {
-            let (len, meta) = socket
-                .recv_slice(buf)
-                .map_err(|_| ax_err_type!(BadState, "socket recv() failed"))?;
-            if !remote_endpoint.addr.is_unspecified() && remote_endpoint.addr != meta.endpoint.addr
-            {
-                return Err(AxError::WouldBlock);
+        self.block_on_timeout(self.recv_timeout(), || {
+            if let Some((len, _)) = self.try_recv_loopback_from(buf, Some(remote_endpoint)) {
+                return Ok(len);
             }
-            if remote_endpoint.port != 0 && remote_endpoint.port != meta.endpoint.port {
-                return Err(AxError::WouldBlock);
-            }
-            Ok(len)
+            SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
+                if socket.can_recv() {
+                    let (len, meta) = socket
+                        .recv_slice(buf)
+                        .map_err(|_| ax_err_type!(BadState, "socket recv() failed"))?;
+                    if !remote_endpoint.addr.is_unspecified()
+                        && remote_endpoint.addr != meta.endpoint.addr
+                    {
+                        return Err(AxError::WouldBlock);
+                    }
+                    if remote_endpoint.port != 0 && remote_endpoint.port != meta.endpoint.port {
+                        return Err(AxError::WouldBlock);
+                    }
+                    Ok(len)
+                } else {
+                    Err(AxError::WouldBlock)
+                }
+            })
         })
     }
 
     /// Close the socket.
     pub fn shutdown(&self) -> AxResult {
+        if let Some(local) = self.local_addr.write().take() {
+            unregister_udp_loopback(local, &self.loopback_queue);
+        }
         SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
             debug!("UDP socket {}: shutting down", self.handle);
             socket.close();
@@ -191,7 +261,7 @@ impl UdpSocket {
         }
         SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
             Ok(PollState {
-                readable: socket.can_recv(),
+                readable: self.loopback_queue.has_packet() || socket.can_recv(),
                 writable: socket.can_send(),
             })
         })
@@ -212,7 +282,7 @@ impl UdpSocket {
             return ax_err!(NotConnected, "socket send() failed");
         }
 
-        self.block_on(|| {
+        self.block_on_timeout(self.send_timeout(), || {
             SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
                 if socket.can_send() {
                     socket
@@ -232,6 +302,42 @@ impl UdpSocket {
         })
     }
 
+    fn send_loopback(&self, buf: &[u8], remote_endpoint: IpEndpoint) -> AxResult<usize> {
+        let local_endpoint = match self.local_addr.read().as_ref() {
+            Some(local) => *local,
+            None => return ax_err!(NotConnected, "socket send() failed"),
+        };
+        let len = send_udp_loopback(local_endpoint, remote_endpoint, buf);
+        axtask::yield_now();
+        Ok(len)
+    }
+
+    fn recv_loopback(&self, buf: &mut [u8], remote: Option<IpEndpoint>) -> AxResult<usize> {
+        self.recv_loopback_from(buf, remote).map(|(len, _)| len)
+    }
+
+    fn recv_loopback_from(
+        &self,
+        buf: &mut [u8],
+        remote: Option<IpEndpoint>,
+    ) -> AxResult<(usize, SocketAddr)> {
+        self.block_on_timeout(self.recv_timeout(), || {
+            self.try_recv_loopback_from(buf, remote)
+                .ok_or(AxError::WouldBlock)
+        })
+    }
+
+    fn try_recv_loopback_from(
+        &self,
+        buf: &mut [u8],
+        remote: Option<IpEndpoint>,
+    ) -> Option<(usize, SocketAddr)> {
+        let packet = self.loopback_queue.pop_matching(remote)?;
+        let len = packet.data.len().min(buf.len());
+        buf[..len].copy_from_slice(&packet.data[..len]);
+        Some((len, SocketAddr::from(packet.peer)))
+    }
+
     fn recv_impl<F, T>(&self, mut op: F) -> AxResult<T>
     where
         F: FnMut(&mut udp::Socket) -> AxResult<T>,
@@ -240,7 +346,7 @@ impl UdpSocket {
             return ax_err!(NotConnected, "socket send() failed");
         }
 
-        self.block_on(|| {
+        self.block_on_timeout(self.recv_timeout(), || {
             SOCKET_SET.with_socket_mut::<udp::Socket, _, _>(self.handle, |socket| {
                 if socket.can_recv() {
                     // data available
@@ -253,18 +359,24 @@ impl UdpSocket {
         })
     }
 
-    fn block_on<F, T>(&self, mut f: F) -> AxResult<T>
+    fn block_on_timeout<F, T>(&self, timeout: Option<Duration>, mut f: F) -> AxResult<T>
     where
         F: FnMut() -> AxResult<T>,
     {
         if self.is_nonblocking() {
             f()
         } else {
+            let deadline = timeout.map(|dur| axhal::time::wall_time() + dur);
             loop {
                 SOCKET_SET.poll_interfaces();
                 match f() {
                     Ok(t) => return Ok(t),
-                    Err(AxError::WouldBlock) => axtask::yield_now(),
+                    Err(AxError::WouldBlock) => {
+                        if deadline.is_some_and(|ddl| axhal::time::wall_time() >= ddl) {
+                            return Err(AxError::WouldBlock);
+                        }
+                        axtask::yield_now();
+                    }
                     Err(e) => return Err(e),
                 }
             }

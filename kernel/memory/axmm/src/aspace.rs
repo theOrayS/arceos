@@ -91,8 +91,12 @@ impl AddrSpace {
         self.clear();
 
         for area in other.areas.iter() {
-            let cloned_area =
-                MemoryArea::new(area.start(), area.size(), area.flags(), area.backend().clone());
+            let cloned_area = MemoryArea::new(
+                area.start(),
+                area.size(),
+                area.flags(),
+                area.backend().clone(),
+            );
             self.areas
                 .map(cloned_area, &mut self.pt, false)
                 .map_err(mapping_err_to_ax_err)?;

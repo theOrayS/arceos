@@ -37,7 +37,7 @@ pub use imp::task::{sys_exit, sys_getpid, sys_sched_yield};
 pub use imp::time::{sys_clock_gettime, sys_nanosleep};
 
 #[cfg(feature = "fd")]
-pub use imp::fd_ops::{sys_close, sys_dup, sys_dup2, sys_fcntl};
+pub use imp::fd_ops::{poll_file_like, sys_close, sys_dup, sys_dup2, sys_fcntl};
 #[cfg(feature = "fs")]
 pub use imp::fs::{sys_fstat, sys_getcwd, sys_lseek, sys_lstat, sys_open, sys_rename, sys_stat};
 #[cfg(feature = "select")]
@@ -46,6 +46,7 @@ pub use imp::io_mpx::sys_select;
 pub use imp::io_mpx::{sys_epoll_create, sys_epoll_ctl, sys_epoll_wait};
 #[cfg(feature = "net")]
 pub use imp::net::{
+    set_socket_recv_timeout, set_socket_send_timeout, socket_recv_timeout, socket_send_timeout,
     sys_accept, sys_bind, sys_connect, sys_freeaddrinfo, sys_getaddrinfo, sys_getpeername,
     sys_getsockname, sys_listen, sys_recv, sys_recvfrom, sys_send, sys_sendto, sys_shutdown,
     sys_socket,

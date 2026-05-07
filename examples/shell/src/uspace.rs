@@ -1,9 +1,10 @@
 use core::cmp;
-use core::ffi::{CStr, c_char, c_long};
+use core::ffi::{CStr, c_char, c_long, c_void};
 use core::mem::{offset_of, size_of};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use arceos_posix_api::ctypes as posix_ctypes;
 use axalloc::global_allocator;
 use axerrno::LinuxError;
 use axfs::fops::{self, Directory, File, FileAttr, FileType, OpenOptions};
@@ -43,6 +44,8 @@ const MAX_SCRIPT_INTERPRETER_DEPTH: usize = 4;
 const TESTSUITE_STAGE_ROOT: &str = "/tmp/testsuite";
 const AUX_CLOCK_TICKS: usize = 100;
 const SIGCHLD_NUM: isize = 17;
+const SIGKILL_NUM: i32 = 9;
+const SIGALRM_NUM: i32 = 14;
 const SIGCANCEL_NUM: i32 = 33;
 #[cfg(target_arch = "riscv64")]
 const SI_TKILL_CODE: i32 = -6;
@@ -70,6 +73,7 @@ const RISCV_SIGTRAMP_CODE: [u32; 3] = [0x08b0_0893, 0x0000_0073, 0x0010_0073];
 const ST_MODE_DIR: u32 = 0o040000;
 const ST_MODE_FILE: u32 = 0o100000;
 const ST_MODE_CHR: u32 = 0o020000;
+const ST_MODE_SOCKET: u32 = 0o140000;
 const STATFS_BLOCK_SIZE: i64 = 4096;
 const STATFS_NAME_MAX: i64 = 255;
 const TMPFS_MAGIC: i64 = 0x0102_1994;
@@ -78,6 +82,29 @@ const SYSFS_MAGIC: i64 = 0x6265_6572;
 const DEVFS_MAGIC: i64 = 0x1373;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 const RTC_RD_TIME: u32 = 0x8024_7009;
+const SOL_SOCKET_LEVEL: i32 = 1;
+const SO_REUSEADDR_OPT: i32 = 2;
+const SO_TYPE_OPT: i32 = 3;
+const SO_ERROR_OPT: i32 = 4;
+const SO_DONTROUTE_OPT: i32 = 5;
+const SO_BROADCAST_OPT: i32 = 6;
+const SO_SNDBUF_OPT: i32 = 7;
+const SO_RCVBUF_OPT: i32 = 8;
+const SO_KEEPALIVE_OPT: i32 = 9;
+const SO_REUSEPORT_OPT: i32 = 15;
+const SO_RCVTIMEO_OPT: i32 = 20;
+const SO_SNDTIMEO_OPT: i32 = 21;
+const IPPROTO_IP_LEVEL: i32 = 0;
+const IP_RECVERR_OPT: i32 = 11;
+const TCP_NODELAY_OPT: i32 = 1;
+const TCP_MAXSEG_OPT: i32 = 2;
+const DEFAULT_SOCKET_BUFFER_SIZE: i32 = 64 * 1024;
+const INTERRUPTIBLE_SOCKET_RECV_QUANTUM: core::time::Duration =
+    core::time::Duration::from_millis(20);
+// Linux UAPI socket errno values used by both RV64 and LA64 targets here.
+const LINUX_EPROTONOSUPPORT: u32 = 93;
+const LINUX_ESOCKTNOSUPPORT: u32 = 94;
+const LINUX_EAFNOSUPPORT: u32 = 97;
 
 #[cfg(target_arch = "riscv64")]
 const AUX_PLATFORM: &str = "riscv64";
@@ -114,9 +141,14 @@ struct UserProcess {
     fds: Mutex<FdTable>,
     cwd: Mutex<String>,
     exec_root: Mutex<String>,
+    exec_path: Mutex<String>,
     children: Mutex<Vec<ChildTask>>,
+    child_exit_wait: WaitQueue,
     rlimits: Mutex<BTreeMap<u32, UserRlimit>>,
     signal_actions: Mutex<BTreeMap<usize, general::kernel_sigaction>>,
+    real_timer_generation: AtomicU64,
+    real_timer_deadline_us: AtomicU64,
+    real_timer_interval_us: AtomicU64,
     pid: AtomicI32,
     ppid: i32,
     live_threads: AtomicUsize,
@@ -146,6 +178,7 @@ enum FdEntry {
     File(FileEntry),
     Directory(DirectoryEntry),
     Pipe(PipeEndpoint),
+    Socket(SocketEntry),
 }
 
 #[derive(Clone)]
@@ -195,6 +228,12 @@ struct PipeEndpoint {
     buffer: Arc<Mutex<PipeRingBuffer>>,
 }
 
+#[derive(Clone, Copy)]
+struct SocketEntry {
+    posix_fd: i32,
+    socktype: i32,
+}
+
 struct LoadedProgram {
     process: Arc<UserProcess>,
     context: UspaceContext,
@@ -206,6 +245,7 @@ struct LoadedImage {
     argc: usize,
     brk: BrkState,
     exec_root: String,
+    exec_path: String,
 }
 
 struct PreparedProgram {
@@ -492,6 +532,78 @@ impl PipeEndpoint {
     }
 }
 
+fn posix_errno_from_ret(ret: isize) -> LinuxError {
+    LinuxError::try_from((-ret) as i32).unwrap_or(LinuxError::EIO)
+}
+
+fn posix_ret_usize(ret: isize) -> Result<usize, LinuxError> {
+    if ret < 0 {
+        Err(posix_errno_from_ret(ret))
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+fn posix_ret_i32(ret: i32) -> Result<i32, LinuxError> {
+    if ret < 0 {
+        Err(posix_errno_from_ret(ret as isize))
+    } else {
+        Ok(ret)
+    }
+}
+
+impl SocketEntry {
+    fn duplicate(&self) -> Result<Self, LinuxError> {
+        let posix_fd = posix_ret_i32(arceos_posix_api::sys_dup(self.posix_fd))?;
+        Ok(Self {
+            posix_fd,
+            socktype: self.socktype,
+        })
+    }
+
+    fn read(&self, dst: &mut [u8]) -> Result<usize, LinuxError> {
+        posix_ret_usize(arceos_posix_api::sys_recv(
+            self.posix_fd,
+            dst.as_mut_ptr() as *mut c_void,
+            dst.len(),
+            0,
+        ))
+    }
+
+    fn write(&self, src: &[u8]) -> Result<usize, LinuxError> {
+        posix_ret_usize(arceos_posix_api::sys_send(
+            self.posix_fd,
+            src.as_ptr() as *const c_void,
+            src.len(),
+            0,
+        ))
+    }
+
+    fn close(&self) -> Result<(), LinuxError> {
+        posix_ret_i32(arceos_posix_api::sys_close(self.posix_fd)).map(|_| ())
+    }
+
+    fn poll(&self, mode: SelectMode) -> bool {
+        match arceos_posix_api::poll_file_like(self.posix_fd) {
+            Ok(state) => match mode {
+                SelectMode::Read => state.readable,
+                SelectMode::Write => state.writable,
+                SelectMode::Except => false,
+            },
+            Err(_) => matches!(mode, SelectMode::Except),
+        }
+    }
+
+    fn stat(&self) -> general::stat {
+        let mut st: general::stat = unsafe { core::mem::zeroed() };
+        st.st_ino = self.posix_fd as _;
+        st.st_mode = ST_MODE_SOCKET | 0o666;
+        st.st_nlink = 1;
+        st.st_blksize = 512;
+        st
+    }
+}
+
 #[crate_interface::impl_interface]
 impl axns::AxNamespaceIf for AxNamespaceImpl {
     fn current_namespace_base() -> *mut u8 {
@@ -570,9 +682,14 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         fds: Mutex::new(FdTable::new()),
         cwd: Mutex::new(cwd.into()),
         exec_root: Mutex::new(image.exec_root.clone()),
+        exec_path: Mutex::new(image.exec_path.clone()),
         children: Mutex::new(Vec::new()),
+        child_exit_wait: WaitQueue::new(),
         rlimits: Mutex::new(BTreeMap::new()),
         signal_actions: Mutex::new(BTreeMap::new()),
+        real_timer_generation: AtomicU64::new(0),
+        real_timer_deadline_us: AtomicU64::new(0),
+        real_timer_interval_us: AtomicU64::new(0),
         pid: AtomicI32::new(0),
         ppid: 1,
         live_threads: AtomicUsize::new(1),
@@ -679,6 +796,7 @@ fn load_program_image(
             ),
         },
         exec_root: prepared.exec_root,
+        exec_path: prepared.path,
     })
 }
 
@@ -1258,6 +1376,7 @@ fn exec_program(
     };
     *process.brk.lock() = image.brk;
     process.set_exec_root(image.exec_root);
+    process.set_exec_path(image.exec_path);
     Ok((image.entry, image.stack_ptr, image.argc))
 }
 
@@ -1270,6 +1389,10 @@ impl UserProcess {
         self.exec_root.lock().clone()
     }
 
+    fn exec_path(&self) -> String {
+        self.exec_path.lock().clone()
+    }
+
     fn set_cwd(&self, cwd: String) {
         *self.cwd.lock() = cwd;
     }
@@ -1278,9 +1401,15 @@ impl UserProcess {
         *self.exec_root.lock() = exec_root;
     }
 
+    fn set_exec_path(&self, exec_path: String) {
+        *self.exec_path.lock() = exec_path;
+    }
+
     fn teardown(&self) {
         self.aspace.lock().clear();
-        *self.fds.lock() = FdTable::new();
+        let mut fds = self.fds.lock();
+        fds.close_all();
+        *fds = FdTable::new();
     }
 
     fn ppid(&self) -> i32 {
@@ -1295,14 +1424,20 @@ impl UserProcess {
         self.pid.store(pid, Ordering::Release);
     }
 
+    fn real_timer_active(&self) -> bool {
+        self.real_timer_deadline_us.load(Ordering::Acquire) != 0
+    }
+
     fn add_thread(&self) {
         self.live_threads.fetch_add(1, Ordering::AcqRel);
     }
 
     fn note_thread_exit(&self, code: i32) {
         self.exit_code.store(code, Ordering::Release);
-        if self.live_threads.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let live_before = self.live_threads.fetch_sub(1, Ordering::AcqRel);
+        if live_before == 1 {
             self.exit_wait.notify_all(false);
+            notify_parent_child_exit(self.ppid);
         }
     }
 
@@ -1355,9 +1490,14 @@ impl UserProcess {
             fds: Mutex::new(self.fds.lock().fork_copy()?),
             cwd: Mutex::new(self.cwd()),
             exec_root: Mutex::new(self.exec_root()),
+            exec_path: Mutex::new(self.exec_path()),
             children: Mutex::new(Vec::new()),
+            child_exit_wait: WaitQueue::new(),
             rlimits: Mutex::new(self.rlimits.lock().clone()),
             signal_actions: Mutex::new(self.signal_actions.lock().clone()),
+            real_timer_generation: AtomicU64::new(0),
+            real_timer_deadline_us: AtomicU64::new(0),
+            real_timer_interval_us: AtomicU64::new(0),
             pid: AtomicI32::new(0),
             ppid: axtask::current().id().as_u64() as i32,
             live_threads: AtomicUsize::new(1),
@@ -1378,37 +1518,51 @@ impl UserProcess {
             child.process.live_threads.load(Ordering::Acquire) == 0
         }
 
-        let child = {
-            let mut children = self.children.lock();
-            if children.is_empty() {
-                return Err(LinuxError::ECHILD);
-            }
-
-            let exited_index = match pid {
-                -1 => children.iter().position(is_exited),
-                p if p > 0 => {
-                    let index = children
-                        .iter()
-                        .position(|child| child.pid == p)
-                        .ok_or(LinuxError::ECHILD)?;
-                    is_exited(&children[index]).then_some(index)
+        let child = loop {
+            let maybe_child = {
+                let mut children = self.children.lock();
+                if children.is_empty() {
+                    return Err(LinuxError::ECHILD);
                 }
-                _ => return Err(LinuxError::EINVAL),
+
+                let exited_index = match pid {
+                    -1 => children.iter().position(is_exited),
+                    p if p > 0 => {
+                        let index = children
+                            .iter()
+                            .position(|child| child.pid == p)
+                            .ok_or(LinuxError::ECHILD)?;
+                        is_exited(&children[index]).then_some(index)
+                    }
+                    _ => return Err(LinuxError::EINVAL),
+                };
+
+                if let Some(index) = exited_index {
+                    Some(children.remove(index))
+                } else if nohang {
+                    return Ok(None);
+                } else {
+                    match pid {
+                        p if p > 0 => {
+                            let index = children
+                                .iter()
+                                .position(|child| child.pid == p)
+                                .ok_or(LinuxError::ECHILD)?;
+                            Some(children.remove(index))
+                        }
+                        -1 => None,
+                        _ => return Err(LinuxError::EINVAL),
+                    }
+                }
             };
 
-            if let Some(index) = exited_index {
-                children.remove(index)
-            } else if nohang {
-                return Ok(None);
-            } else if pid == -1 {
-                children.remove(0)
-            } else {
-                let index = children
-                    .iter()
-                    .position(|child| child.pid == pid)
-                    .ok_or(LinuxError::ECHILD)?;
-                children.remove(index)
+            if let Some(child) = maybe_child {
+                break child;
             }
+            self.child_exit_wait.wait_until(|| {
+                let children = self.children.lock();
+                children.is_empty() || children.iter().any(is_exited)
+            });
         };
         let status = child.task.join().ok_or(LinuxError::ECHILD)?;
         let child_pid = child.pid;
@@ -1435,6 +1589,12 @@ impl UserProcess {
 fn current_process() -> Option<Arc<UserProcess>> {
     let ext = current_task_ext()?;
     Some(ext.process.clone())
+}
+
+fn notify_parent_child_exit(ppid: i32) {
+    if let Some(parent) = user_thread_entry_by_process_pid(ppid) {
+        parent.process.child_exit_wait.notify_all(false);
+    }
 }
 
 fn current_task_ext() -> Option<&'static UserTaskExt> {
@@ -1486,11 +1646,38 @@ fn user_thread_entry_by_tid(tid: i32) -> Option<UserThreadEntry> {
     user_thread_table().lock().get(&tid).cloned()
 }
 
+fn user_thread_entry_by_process_pid(pid: i32) -> Option<UserThreadEntry> {
+    let table = user_thread_table().lock();
+    table.get(&pid).cloned().or_else(|| {
+        table
+            .values()
+            .find(|entry| {
+                entry.process.pid() == pid
+                    && entry.process.live_threads.load(Ordering::Acquire) != 0
+            })
+            .cloned()
+    })
+}
+
+fn user_thread_entry_for_process(process: &UserProcess) -> Option<UserThreadEntry> {
+    let pid = process.pid();
+    let table = user_thread_table().lock();
+    table.get(&pid).cloned().or_else(|| {
+        table
+            .values()
+            .find(|entry| entry.process.pid() == pid)
+            .cloned()
+    })
+}
+
 fn deliver_user_signal(entry: &UserThreadEntry, sig: i32) -> Result<(), LinuxError> {
     if sig == 0 {
         return Ok(());
     }
     let ext = task_ext(&entry.task).ok_or(LinuxError::ESRCH)?;
+    if sig == SIGKILL_NUM {
+        ext.process.request_exit_group(128 + sig);
+    }
     ext.pending_signal.store(sig, Ordering::Release);
     if sig == SIGCANCEL_NUM {
         user_trace!(
@@ -1590,6 +1777,13 @@ fn current_sigcancel_pending() -> bool {
     current_task_ext().is_some_and(|ext| {
         ext.pending_signal.load(Ordering::Acquire) == SIGCANCEL_NUM
             && !signal_is_blocked(ext, SIGCANCEL_NUM)
+    })
+}
+
+fn current_unblocked_signal_pending() -> bool {
+    current_task_ext().is_some_and(|ext| {
+        let sig = ext.pending_signal.load(Ordering::Acquire);
+        sig != 0 && !signal_is_blocked(ext, sig)
     })
 }
 
@@ -1779,6 +1973,10 @@ fn inject_pending_signal(
     }
     if handler <= 1 {
         ext.pending_signal.store(0, Ordering::Release);
+        if sig == SIGKILL_NUM {
+            ext.process.request_exit_group(128 + sig);
+            terminate_current_thread(ext.process.as_ref(), 128 + sig);
+        }
         return Ok(());
     }
     let current_mask = ext.signal_mask.load(Ordering::Acquire);
@@ -1930,6 +2128,7 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
             tf.arg4(),
         ),
         general::__NR_close => sys_close(&process, tf.arg0()),
+        general::__NR_fsync | general::__NR_fdatasync => sys_fsync(&process, tf.arg0()),
         general::__NR_newfstatat => {
             sys_newfstatat(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3())
         }
@@ -1939,6 +2138,59 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         general::__NR_dup => sys_dup(&process, tf.arg0()),
         general::__NR_dup3 => sys_dup3(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_fcntl => sys_fcntl(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_fchdir => sys_fchdir(&process, tf.arg0()),
+        general::__NR_readlinkat => {
+            sys_readlinkat(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3())
+        }
+        general::__NR_socket => sys_socket_bridge(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_bind => sys_bind_bridge(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_listen => sys_listen_bridge(&process, tf.arg0(), tf.arg1()),
+        general::__NR_accept => sys_accept_bridge(&process, tf.arg0(), tf.arg1(), tf.arg2(), 0),
+        general::__NR_accept4 => {
+            sys_accept_bridge(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3())
+        }
+        general::__NR_connect => sys_connect_bridge(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_sendto => sys_sendto_bridge(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+            tf.arg5(),
+        ),
+        general::__NR_recvfrom => sys_recvfrom_bridge(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+            tf.arg5(),
+        ),
+        general::__NR_shutdown => sys_shutdown_bridge(&process, tf.arg0(), tf.arg1()),
+        general::__NR_getsockname => {
+            sys_getsockname_bridge(&process, tf.arg0(), tf.arg1(), tf.arg2())
+        }
+        general::__NR_getpeername => {
+            sys_getpeername_bridge(&process, tf.arg0(), tf.arg1(), tf.arg2())
+        }
+        general::__NR_setsockopt => sys_setsockopt_bridge(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+        ),
+        general::__NR_getsockopt => sys_getsockopt_bridge(
+            &process,
+            tf.arg0(),
+            tf.arg1(),
+            tf.arg2(),
+            tf.arg3(),
+            tf.arg4(),
+        ),
         general::__NR_pselect6 => sys_pselect6(
             &process,
             tf.arg0() as i32,
@@ -1952,6 +2204,7 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         general::__NR_clock_gettime => sys_clock_gettime(&process, tf.arg0(), tf.arg1()),
         general::__NR_clock_getres => sys_clock_getres(&process, tf.arg0(), tf.arg1()),
         general::__NR_gettimeofday => sys_gettimeofday(&process, tf.arg0(), tf.arg1()),
+        general::__NR_getrandom => sys_getrandom(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_setitimer => sys_setitimer(&process, tf.arg0() as i32, tf.arg1(), tf.arg2()),
         general::__NR_times => sys_times(&process, tf.arg0()),
         general::__NR_getrusage => sys_getrusage(&process, tf.arg0() as i32, tf.arg1()),
@@ -2028,6 +2281,8 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         general::__NR_getgid => 0,
         general::__NR_setuid => 0,
         general::__NR_setgid => 0,
+        general::__NR_umask => 0,
+        general::__NR_prctl => 0,
         general::__NR_kill => sys_kill(&process, tf.arg0() as i32, tf.arg1() as i32),
         general::__NR_tkill => sys_tkill(&process, tf.arg0() as i32, tf.arg1() as i32),
         general::__NR_tgkill => sys_tgkill(
@@ -2076,6 +2331,15 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
 }
 
 fn sys_read(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize {
+    if let Ok(socket) = socket_entry(process, fd) {
+        if let Err(err) = validate_user_write(process, buf, count) {
+            return neg_errno(err);
+        }
+        let ret = recv_with_real_timer_interrupt(process, socket.posix_fd, || {
+            arceos_posix_api::sys_recv(socket.posix_fd, buf as *mut c_void, count, 0)
+        });
+        return ret;
+    }
     with_writable_slice(process, buf, count, |dst| {
         process.fds.lock().read(fd as i32, dst)
     })
@@ -2224,6 +2488,9 @@ fn sys_pselect6(
         Err(err) => return neg_errno(err),
     };
     loop {
+        if current_unblocked_signal_pending() {
+            return neg_errno(LinuxError::EINTR);
+        }
         let mut ready_read = [0usize; FD_SET_WORDS];
         let mut ready_write = [0usize; FD_SET_WORDS];
         let mut ready_except = [0usize; FD_SET_WORDS];
@@ -2260,6 +2527,9 @@ fn sys_pselect6(
             if ret != 0 {
                 return ret;
             }
+            // In this cooperative single-core environment, a hot readiness loop
+            // can otherwise starve the peer process that would consume the event.
+            axtask::yield_now();
             return ready as isize;
         }
         if deadline.is_some_and(|ddl| axhal::time::wall_time() >= ddl) {
@@ -2891,6 +3161,743 @@ fn sys_fcntl(process: &UserProcess, fd: usize, cmd: usize, arg: usize) -> isize 
     }
 }
 
+fn validate_user_read(process: &UserProcess, ptr: usize, len: usize) -> Result<(), LinuxError> {
+    if len == 0 {
+        return Ok(());
+    }
+    if ptr == 0 || user_bytes(process, ptr, len, false).is_none() {
+        return Err(LinuxError::EFAULT);
+    }
+    Ok(())
+}
+
+fn validate_user_write(process: &UserProcess, ptr: usize, len: usize) -> Result<(), LinuxError> {
+    if len == 0 {
+        return Ok(());
+    }
+    if ptr == 0 || user_bytes_mut(process, ptr, len, true).is_none() {
+        return Err(LinuxError::EFAULT);
+    }
+    Ok(())
+}
+
+fn socket_entry(process: &UserProcess, fd: usize) -> Result<SocketEntry, LinuxError> {
+    let table = process.fds.lock();
+    match table.entry(fd as i32)? {
+        FdEntry::Socket(socket) => Ok(*socket),
+        _ => Err(LinuxError::ENOTSOCK),
+    }
+}
+
+fn insert_socket_entry(process: &UserProcess, posix_fd: i32, socktype: i32, flags: i32) -> isize {
+    if flags & posix_ctypes::SOCK_NONBLOCK as i32 != 0 {
+        let ret = arceos_posix_api::sys_fcntl(
+            posix_fd,
+            posix_ctypes::F_SETFL as i32,
+            posix_ctypes::O_NONBLOCK as usize,
+        );
+        if ret < 0 {
+            let _ = arceos_posix_api::sys_close(posix_fd);
+            return neg_errno(posix_errno_from_ret(ret as isize));
+        }
+    }
+    match process
+        .fds
+        .lock()
+        .insert(FdEntry::Socket(SocketEntry { posix_fd, socktype }))
+    {
+        Ok(fd) => fd as isize,
+        Err(err) => {
+            let _ = arceos_posix_api::sys_close(posix_fd);
+            neg_errno(err)
+        }
+    }
+}
+
+fn sys_socket_bridge(
+    process: &UserProcess,
+    domain: usize,
+    socktype: usize,
+    protocol: usize,
+) -> isize {
+    let domain = domain as i32;
+    let raw_socktype = socktype as i32;
+    let protocol = protocol as i32;
+    let flag_mask = (posix_ctypes::SOCK_CLOEXEC | posix_ctypes::SOCK_NONBLOCK) as i32;
+    let flags = raw_socktype & flag_mask;
+    let base_socktype = raw_socktype & !flag_mask;
+    if domain as u32 != posix_ctypes::AF_INET {
+        return neg_errno_code(LINUX_EAFNOSUPPORT);
+    }
+    if base_socktype as u32 == posix_ctypes::SOCK_STREAM {
+        if protocol != 0 && protocol as u32 != posix_ctypes::IPPROTO_TCP {
+            return neg_errno_code(LINUX_EPROTONOSUPPORT);
+        }
+    } else if base_socktype as u32 == posix_ctypes::SOCK_DGRAM {
+        if protocol != 0 && protocol as u32 != posix_ctypes::IPPROTO_UDP {
+            return neg_errno_code(LINUX_EPROTONOSUPPORT);
+        }
+    } else {
+        return neg_errno_code(LINUX_ESOCKTNOSUPPORT);
+    }
+    let posix_fd = match posix_ret_i32(arceos_posix_api::sys_socket(
+        domain,
+        base_socktype,
+        protocol,
+    )) {
+        Ok(fd) => fd,
+        Err(err) => return neg_errno(err),
+    };
+    let ret = insert_socket_entry(process, posix_fd, base_socktype, flags);
+    ret
+}
+
+fn sys_bind_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = validate_user_read(process, addr, addrlen) {
+        return neg_errno(err);
+    }
+    let ret = match posix_ret_i32(arceos_posix_api::sys_bind(
+        socket.posix_fd,
+        addr as *const posix_ctypes::sockaddr,
+        addrlen as posix_ctypes::socklen_t,
+    )) {
+        Ok(_) => 0,
+        Err(err) => neg_errno(err),
+    };
+    ret
+}
+
+fn sys_listen_bridge(process: &UserProcess, fd: usize, backlog: usize) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    let ret = match posix_ret_i32(arceos_posix_api::sys_listen(
+        socket.posix_fd,
+        backlog as i32,
+    )) {
+        Ok(_) => 0,
+        Err(err) => neg_errno(err),
+    };
+    ret
+}
+
+fn sys_accept_bridge(
+    process: &UserProcess,
+    fd: usize,
+    addr: usize,
+    addrlen: usize,
+    flags: usize,
+) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    let flag_mask = (posix_ctypes::SOCK_CLOEXEC | posix_ctypes::SOCK_NONBLOCK) as usize;
+    if flags & !flag_mask != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+
+    let mut local_addr: posix_ctypes::sockaddr = unsafe { core::mem::zeroed() };
+    let mut local_len = size_of::<posix_ctypes::sockaddr>() as posix_ctypes::socklen_t;
+    let (addr_ptr, addrlen_ptr) = if addr == 0 && addrlen == 0 {
+        (&mut local_addr as *mut _, &mut local_len as *mut _)
+    } else {
+        if addr == 0 || addrlen == 0 {
+            return neg_errno(LinuxError::EFAULT);
+        }
+        if let Err(err) =
+            validate_user_write(process, addrlen, size_of::<posix_ctypes::socklen_t>())
+        {
+            return neg_errno(err);
+        }
+        let len = match read_user_value::<posix_ctypes::socklen_t>(process, addrlen) {
+            Ok(len) => len as usize,
+            Err(err) => return neg_errno(err),
+        };
+        if let Err(err) = validate_user_write(process, addr, len) {
+            return neg_errno(err);
+        }
+        (
+            addr as *mut posix_ctypes::sockaddr,
+            addrlen as *mut posix_ctypes::socklen_t,
+        )
+    };
+
+    let new_posix_fd = match posix_ret_i32(unsafe {
+        arceos_posix_api::sys_accept(socket.posix_fd, addr_ptr, addrlen_ptr)
+    }) {
+        Ok(fd) => fd,
+        Err(err) => return neg_errno(err),
+    };
+    let ret = insert_socket_entry(process, new_posix_fd, socket.socktype, flags as i32);
+    ret
+}
+
+fn sys_connect_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = validate_user_read(process, addr, addrlen) {
+        return neg_errno(err);
+    }
+    let ret = match posix_ret_i32(arceos_posix_api::sys_connect(
+        socket.posix_fd,
+        addr as *const posix_ctypes::sockaddr,
+        addrlen as posix_ctypes::socklen_t,
+    )) {
+        Ok(_) => 0,
+        Err(err) => neg_errno(err),
+    };
+    ret
+}
+
+fn sys_sendto_bridge(
+    process: &UserProcess,
+    fd: usize,
+    buf: usize,
+    len: usize,
+    flags: usize,
+    addr: usize,
+    addrlen: usize,
+) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = validate_user_read(process, buf, len) {
+        return neg_errno(err);
+    }
+    let ret = if addr == 0 {
+        arceos_posix_api::sys_send(socket.posix_fd, buf as *const c_void, len, flags as i32)
+    } else {
+        if let Err(err) = validate_user_read(process, addr, addrlen) {
+            return neg_errno(err);
+        }
+        arceos_posix_api::sys_sendto(
+            socket.posix_fd,
+            buf as *const c_void,
+            len,
+            flags as i32,
+            addr as *const posix_ctypes::sockaddr,
+            addrlen as posix_ctypes::socklen_t,
+        )
+    };
+    let ret = match posix_ret_usize(ret) {
+        Ok(n) => n as isize,
+        Err(err) => neg_errno(err),
+    };
+    ret
+}
+
+fn sys_recvfrom_bridge(
+    process: &UserProcess,
+    fd: usize,
+    buf: usize,
+    len: usize,
+    flags: usize,
+    addr: usize,
+    addrlen: usize,
+) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = validate_user_write(process, buf, len) {
+        return neg_errno(err);
+    }
+    let ret = if addr == 0 || addrlen == 0 {
+        recv_with_real_timer_interrupt(process, socket.posix_fd, || {
+            arceos_posix_api::sys_recv(socket.posix_fd, buf as *mut c_void, len, flags as i32)
+        })
+    } else {
+        if let Err(err) =
+            validate_user_write(process, addrlen, size_of::<posix_ctypes::socklen_t>())
+        {
+            return neg_errno(err);
+        }
+        let addr_len_value = match read_user_value::<posix_ctypes::socklen_t>(process, addrlen) {
+            Ok(len) => len as usize,
+            Err(err) => return neg_errno(err),
+        };
+        if let Err(err) = validate_user_write(process, addr, addr_len_value) {
+            return neg_errno(err);
+        }
+        recv_with_real_timer_interrupt(process, socket.posix_fd, || unsafe {
+            arceos_posix_api::sys_recvfrom(
+                socket.posix_fd,
+                buf as *mut c_void,
+                len,
+                flags as i32,
+                addr as *mut posix_ctypes::sockaddr,
+                addrlen as *mut posix_ctypes::socklen_t,
+            )
+        })
+    };
+    ret
+}
+
+fn sys_shutdown_bridge(process: &UserProcess, fd: usize, how: usize) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    match posix_ret_i32(arceos_posix_api::sys_shutdown(socket.posix_fd, how as i32)) {
+        Ok(_) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
+fn sys_getsockname_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = validate_user_write(process, addrlen, size_of::<posix_ctypes::socklen_t>()) {
+        return neg_errno(err);
+    }
+    let len = match read_user_value::<posix_ctypes::socklen_t>(process, addrlen) {
+        Ok(len) => len as usize,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = validate_user_write(process, addr, len) {
+        return neg_errno(err);
+    }
+    match posix_ret_i32(unsafe {
+        arceos_posix_api::sys_getsockname(
+            socket.posix_fd,
+            addr as *mut posix_ctypes::sockaddr,
+            addrlen as *mut posix_ctypes::socklen_t,
+        )
+    }) {
+        Ok(_) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
+fn sys_getpeername_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = validate_user_write(process, addrlen, size_of::<posix_ctypes::socklen_t>()) {
+        return neg_errno(err);
+    }
+    let len = match read_user_value::<posix_ctypes::socklen_t>(process, addrlen) {
+        Ok(len) => len as usize,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = validate_user_write(process, addr, len) {
+        return neg_errno(err);
+    }
+    match posix_ret_i32(unsafe {
+        arceos_posix_api::sys_getpeername(
+            socket.posix_fd,
+            addr as *mut posix_ctypes::sockaddr,
+            addrlen as *mut posix_ctypes::socklen_t,
+        )
+    }) {
+        Ok(_) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
+fn socket_option_supported(level: i32, optname: i32) -> bool {
+    if level == SOL_SOCKET_LEVEL {
+        matches!(
+            optname,
+            SO_REUSEADDR_OPT
+                | SO_REUSEPORT_OPT
+                | SO_DONTROUTE_OPT
+                | SO_BROADCAST_OPT
+                | SO_KEEPALIVE_OPT
+                | SO_SNDBUF_OPT
+                | SO_RCVBUF_OPT
+                | SO_RCVTIMEO_OPT
+                | SO_SNDTIMEO_OPT
+                | SO_ERROR_OPT
+                | SO_TYPE_OPT
+        )
+    } else if level == IPPROTO_IP_LEVEL {
+        matches!(optname, IP_RECVERR_OPT)
+    } else if level == posix_ctypes::IPPROTO_TCP as i32 {
+        matches!(optname, TCP_NODELAY_OPT | TCP_MAXSEG_OPT)
+    } else {
+        false
+    }
+}
+
+fn socket_timeval_to_duration(
+    value: general::timeval,
+) -> Result<Option<core::time::Duration>, LinuxError> {
+    if value.tv_sec < 0 || value.tv_usec < 0 || value.tv_usec >= 1_000_000 {
+        return Err(LinuxError::EINVAL);
+    }
+    if value.tv_sec == 0 && value.tv_usec == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(core::time::Duration::new(
+            value.tv_sec as u64,
+            value.tv_usec as u32 * 1000,
+        )))
+    }
+}
+
+fn socket_duration_to_timeval(timeout: Option<core::time::Duration>) -> general::timeval {
+    match timeout {
+        Some(timeout) => general::timeval {
+            tv_sec: timeout.as_secs().min(i64::MAX as u64) as _,
+            tv_usec: timeout.subsec_micros() as _,
+        },
+        None => general::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    }
+}
+
+fn duration_to_micros(duration: core::time::Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_mul(1_000_000)
+        .saturating_add(duration.subsec_micros() as u64)
+}
+
+fn micros_to_duration(micros: u64) -> core::time::Duration {
+    core::time::Duration::new(micros / 1_000_000, ((micros % 1_000_000) as u32) * 1000)
+}
+
+fn timeval_to_micros(value: general::timeval) -> Result<u64, LinuxError> {
+    Ok(socket_timeval_to_duration(value)?
+        .map(duration_to_micros)
+        .unwrap_or(0))
+}
+
+fn micros_to_timeval(micros: u64) -> general::timeval {
+    general::timeval {
+        tv_sec: (micros / 1_000_000).min(i64::MAX as u64) as _,
+        tv_usec: (micros % 1_000_000) as _,
+    }
+}
+
+fn monotonic_time_micros() -> u64 {
+    axhal::time::monotonic_time()
+        .as_micros()
+        .min(u64::MAX as u128) as u64
+}
+
+fn current_real_itimer(process: &UserProcess) -> general::itimerval {
+    let deadline = process.real_timer_deadline_us.load(Ordering::Acquire);
+    let remaining = if deadline == 0 {
+        0
+    } else {
+        deadline.saturating_sub(monotonic_time_micros())
+    };
+    general::itimerval {
+        it_interval: micros_to_timeval(process.real_timer_interval_us.load(Ordering::Acquire)),
+        it_value: micros_to_timeval(remaining),
+    }
+}
+
+fn arm_real_itimer(
+    process: Arc<UserProcess>,
+    generation: u64,
+    first_delay_us: u64,
+    interval_us: u64,
+) {
+    let _ = axtask::spawn(move || {
+        let mut delay_us = first_delay_us;
+        loop {
+            if delay_us == 0 {
+                axtask::yield_now();
+            } else {
+                axtask::sleep(micros_to_duration(delay_us));
+            }
+            if process.real_timer_generation.load(Ordering::Acquire) != generation
+                || process.live_threads.load(Ordering::Acquire) == 0
+            {
+                break;
+            }
+            if let Some(entry) = user_thread_entry_for_process(&process) {
+                let _ = deliver_user_signal(&entry, SIGALRM_NUM);
+            }
+            if interval_us == 0 {
+                if process.real_timer_generation.load(Ordering::Acquire) == generation {
+                    process.real_timer_deadline_us.store(0, Ordering::Release);
+                }
+                break;
+            }
+            process.real_timer_deadline_us.store(
+                monotonic_time_micros().saturating_add(interval_us),
+                Ordering::Release,
+            );
+            delay_us = interval_us;
+        }
+    });
+}
+
+fn recv_with_real_timer_interrupt<F>(
+    process: &UserProcess,
+    posix_fd: i32,
+    mut recv_once: F,
+) -> isize
+where
+    F: FnMut() -> isize,
+{
+    let original_timeout = match arceos_posix_api::socket_recv_timeout(posix_fd) {
+        Ok(timeout) => timeout,
+        Err(err) => return neg_errno(err),
+    };
+    if original_timeout.is_some() || !process.real_timer_active() {
+        return match posix_ret_usize(recv_once()) {
+            Ok(n) => n as isize,
+            Err(err) => neg_errno(err),
+        };
+    }
+
+    if let Err(err) =
+        arceos_posix_api::set_socket_recv_timeout(posix_fd, Some(INTERRUPTIBLE_SOCKET_RECV_QUANTUM))
+    {
+        return neg_errno(err);
+    }
+
+    let result = loop {
+        if current_unblocked_signal_pending() {
+            break neg_errno(LinuxError::EINTR);
+        }
+        match posix_ret_usize(recv_once()) {
+            Ok(n) => break n as isize,
+            Err(LinuxError::EAGAIN) => {
+                if current_unblocked_signal_pending() {
+                    break neg_errno(LinuxError::EINTR);
+                }
+                if !process.real_timer_active() {
+                    break neg_errno(LinuxError::EAGAIN);
+                }
+            }
+            Err(err) => break neg_errno(err),
+        }
+    };
+
+    match arceos_posix_api::set_socket_recv_timeout(posix_fd, original_timeout) {
+        Ok(()) => result,
+        Err(err) if result >= 0 => neg_errno(err),
+        Err(_) => result,
+    }
+}
+
+fn sys_setsockopt_bridge(
+    process: &UserProcess,
+    fd: usize,
+    level: usize,
+    optname: usize,
+    optval: usize,
+    optlen: usize,
+) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    if optlen > 0 {
+        if let Err(err) = validate_user_read(process, optval, optlen) {
+            return neg_errno(err);
+        }
+    }
+    let level_i32 = level as i32;
+    let optname_i32 = optname as i32;
+    let ret = if !socket_option_supported(level_i32, optname_i32) {
+        neg_errno(LinuxError::EINVAL)
+    } else if level_i32 == SOL_SOCKET_LEVEL
+        && matches!(optname_i32, SO_RCVTIMEO_OPT | SO_SNDTIMEO_OPT)
+    {
+        if optlen < size_of::<general::timeval>() {
+            neg_errno(LinuxError::EINVAL)
+        } else {
+            match read_user_value::<general::timeval>(process, optval)
+                .and_then(socket_timeval_to_duration)
+            {
+                Ok(timeout) => {
+                    let result = if optname_i32 == SO_RCVTIMEO_OPT {
+                        arceos_posix_api::set_socket_recv_timeout(socket.posix_fd, timeout)
+                    } else {
+                        arceos_posix_api::set_socket_send_timeout(socket.posix_fd, timeout)
+                    };
+                    match result {
+                        Ok(()) => 0,
+                        Err(err) => neg_errno(err),
+                    }
+                }
+                Err(err) => neg_errno(err),
+            }
+        }
+    } else {
+        0
+    };
+    ret
+}
+
+fn sys_getsockopt_bridge(
+    process: &UserProcess,
+    fd: usize,
+    level: usize,
+    optname: usize,
+    optval: usize,
+    optlen: usize,
+) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    if optval == 0 || optlen == 0 {
+        return neg_errno(LinuxError::EFAULT);
+    }
+    let len = match read_user_value::<posix_ctypes::socklen_t>(process, optlen) {
+        Ok(len) => len as usize,
+        Err(err) => return neg_errno(err),
+    };
+    let level = level as i32;
+    let optname = optname as i32;
+    if level == SOL_SOCKET_LEVEL && matches!(optname, SO_RCVTIMEO_OPT | SO_SNDTIMEO_OPT) {
+        if len < size_of::<general::timeval>() {
+            return neg_errno(LinuxError::EINVAL);
+        }
+        if let Err(err) = validate_user_write(process, optval, size_of::<general::timeval>()) {
+            return neg_errno(err);
+        }
+        let timeout = if optname == SO_RCVTIMEO_OPT {
+            arceos_posix_api::socket_recv_timeout(socket.posix_fd)
+        } else {
+            arceos_posix_api::socket_send_timeout(socket.posix_fd)
+        };
+        let value = match timeout {
+            Ok(timeout) => socket_duration_to_timeval(timeout),
+            Err(err) => return neg_errno(err),
+        };
+        let ret = write_user_value(process, optval, &value);
+        if ret != 0 {
+            return ret;
+        }
+        let out_len = size_of::<general::timeval>() as posix_ctypes::socklen_t;
+        return write_user_value(process, optlen, &out_len);
+    }
+    if len < size_of::<i32>() {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    if let Err(err) = validate_user_write(process, optval, size_of::<i32>()) {
+        return neg_errno(err);
+    }
+    let value = if level == SOL_SOCKET_LEVEL {
+        match optname {
+            SO_ERROR_OPT => 0,
+            SO_TYPE_OPT => socket.socktype,
+            SO_SNDBUF_OPT | SO_RCVBUF_OPT => DEFAULT_SOCKET_BUFFER_SIZE,
+            _ if socket_option_supported(level, optname) => 0,
+            _ => return neg_errno(LinuxError::EINVAL),
+        }
+    } else if level == posix_ctypes::IPPROTO_TCP as i32 && socket_option_supported(level, optname) {
+        0
+    } else if level == IPPROTO_IP_LEVEL && socket_option_supported(level, optname) {
+        0
+    } else {
+        return neg_errno(LinuxError::EINVAL);
+    };
+    let ret = write_user_value(process, optval, &value);
+    if ret != 0 {
+        return ret;
+    }
+    let out_len = size_of::<i32>() as posix_ctypes::socklen_t;
+    write_user_value(process, optlen, &out_len)
+}
+
+fn sys_getrandom(process: &UserProcess, buf: usize, len: usize, flags: usize) -> isize {
+    const GRND_NONBLOCK: usize = 0x0001;
+    const GRND_RANDOM: usize = 0x0002;
+    const GRND_INSECURE: usize = 0x0004;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    with_writable_slice(process, buf, len, |dst| {
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        let mut file = File::open("/dev/urandom", &opts).map_err(LinuxError::from)?;
+        let mut filled = 0usize;
+        while filled < dst.len() {
+            let n = file.read(&mut dst[filled..]).map_err(LinuxError::from)?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        Ok(filled)
+    })
+}
+
+fn proc_exe_link_target(process: &UserProcess, path: &str) -> Option<String> {
+    let pid_path = format!("/proc/{}/exe", process.pid());
+    (path == "/proc/self/exe" || path == pid_path).then(|| process.exec_path())
+}
+
+fn sys_readlinkat(
+    process: &UserProcess,
+    dirfd: usize,
+    pathname: usize,
+    buf: usize,
+    bufsiz: usize,
+) -> isize {
+    if bufsiz == 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let path = match read_cstr(process, pathname) {
+        Ok(path) => path,
+        Err(err) => return neg_errno(err),
+    };
+    let resolved_path = {
+        let table = process.fds.lock();
+        match resolve_dirfd_path(process, &table, dirfd as i32, path.as_str()) {
+            Ok(path) => path,
+            Err(err) => return neg_errno(err),
+        }
+    };
+    if let Some(target) = proc_exe_link_target(process, resolved_path.as_str()) {
+        let bytes = target.as_bytes();
+        let copy_len = cmp::min(bytes.len(), bufsiz);
+        let Some(dst) = user_bytes_mut(process, buf, copy_len, true) else {
+            return neg_errno(LinuxError::EFAULT);
+        };
+        dst.copy_from_slice(&bytes[..copy_len]);
+        return copy_len as isize;
+    }
+    match axfs::api::metadata(resolved_path.as_str()) {
+        Ok(_) => neg_errno(LinuxError::EINVAL),
+        Err(err) => neg_errno(LinuxError::from(err)),
+    }
+}
+
+fn sys_fsync(process: &UserProcess, fd: usize) -> isize {
+    match process.fds.lock().entry(fd as i32) {
+        Ok(_) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
+fn sys_fchdir(process: &UserProcess, fd: usize) -> isize {
+    let new_cwd = {
+        let table = process.fds.lock();
+        match table.entry(fd as i32) {
+            Ok(FdEntry::Directory(dir)) => dir.path.clone(),
+            Ok(_) => return neg_errno(LinuxError::ENOTDIR),
+            Err(err) => return neg_errno(err),
+        }
+    };
+    process.set_cwd(new_cwd);
+    0
+}
+
 fn sys_ioctl(process: &UserProcess, fd: usize, req: usize, arg: usize) -> isize {
     if req as u32 == RTC_RD_TIME && process.fds.lock().is_rtc(fd as i32) {
         let rtc = rtc_time_from_wall_time();
@@ -2961,19 +3968,58 @@ fn sys_gettimeofday(process: &UserProcess, tv: usize, tz: usize) -> isize {
     0
 }
 
-fn sys_setitimer(process: &UserProcess, which: i32, new_value: usize, old_value: usize) -> isize {
+fn sys_setitimer(
+    process: &Arc<UserProcess>,
+    which: i32,
+    new_value: usize,
+    old_value: usize,
+) -> isize {
     if which != general::ITIMER_REAL as i32 {
         return neg_errno(LinuxError::EINVAL);
     }
-    if new_value != 0 && read_user_value::<general::itimerval>(process, new_value).is_err() {
-        return neg_errno(LinuxError::EFAULT);
-    }
     if old_value != 0 {
-        let value: general::itimerval = unsafe { core::mem::zeroed() };
+        let value = current_real_itimer(process);
         let ret = write_user_value(process, old_value, &value);
         if ret != 0 {
             return ret;
         }
+    }
+
+    let new_timer = if new_value == 0 {
+        None
+    } else {
+        match read_user_value::<general::itimerval>(process, new_value) {
+            Ok(value) => Some(value),
+            Err(_) => return neg_errno(LinuxError::EFAULT),
+        }
+    };
+    let (first_us, interval_us) = match new_timer {
+        Some(value) => {
+            let first_us = match timeval_to_micros(value.it_value) {
+                Ok(micros) => micros,
+                Err(err) => return neg_errno(err),
+            };
+            let interval_us = match timeval_to_micros(value.it_interval) {
+                Ok(micros) => micros,
+                Err(err) => return neg_errno(err),
+            };
+            (first_us, interval_us)
+        }
+        None => (0, 0),
+    };
+
+    let generation = process.real_timer_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    process
+        .real_timer_interval_us
+        .store(interval_us, Ordering::Release);
+    if first_us == 0 {
+        process.real_timer_deadline_us.store(0, Ordering::Release);
+    } else {
+        process.real_timer_deadline_us.store(
+            monotonic_time_micros().saturating_add(first_us),
+            Ordering::Release,
+        );
+        arm_real_itimer(process.clone(), generation, first_us, interval_us);
     }
     0
 }
@@ -3136,7 +4182,7 @@ fn sys_nanosleep(process: &UserProcess, req: usize, rem: usize) -> isize {
         Ok(duration) => duration,
         Err(err) => return neg_errno(err),
     };
-    axtask::sleep(duration);
+    user_sleep_duration(duration);
     if rem != 0 {
         let zero = general::timespec {
             tv_sec: 0,
@@ -3170,11 +4216,21 @@ fn sys_clock_nanosleep(
             Err(err) => return neg_errno(err),
         };
         if let Some(delta) = duration.checked_sub(now) {
-            axtask::sleep(delta);
+            user_sleep_duration(delta);
         }
         return 0;
     }
     sys_nanosleep(process, req, rem)
+}
+
+fn user_sleep_duration(duration: core::time::Duration) {
+    if duration.as_nanos() == 0 {
+        return;
+    }
+    let deadline = axhal::time::wall_time() + duration;
+    while axhal::time::wall_time() < deadline {
+        axtask::yield_now();
+    }
 }
 
 fn read_timespec_duration(
@@ -3782,10 +4838,13 @@ fn sys_kill(process: &UserProcess, pid: i32, sig: i32) -> isize {
     if let Err(err) = validate_signal_target(sig) {
         return neg_errno(err);
     }
-    if pid == 0 || pid == process.pid() || pid == current_tid() {
+    if pid == 0 {
         return 0;
     }
-    if let Some(entry) = process.child_thread_entry_by_pid(pid) {
+    if pid == process.pid() || pid == current_tid() {
+        let Some(entry) = user_thread_entry_for_process(process) else {
+            return neg_errno(LinuxError::ESRCH);
+        };
         if sig == 0 {
             return 0;
         }
@@ -3794,7 +4853,19 @@ fn sys_kill(process: &UserProcess, pid: i32, sig: i32) -> isize {
         }
         return 0;
     }
-    neg_errno(LinuxError::ESRCH)
+    let Some(entry) = process
+        .child_thread_entry_by_pid(pid)
+        .or_else(|| user_thread_entry_by_process_pid(pid))
+    else {
+        return neg_errno(LinuxError::ESRCH);
+    };
+    if sig == 0 {
+        return 0;
+    }
+    if let Err(err) = deliver_user_signal(&entry, sig) {
+        return neg_errno(err);
+    }
+    0
 }
 
 fn sys_tkill(process: &UserProcess, tid: i32, sig: i32) -> isize {
@@ -4477,6 +5548,10 @@ fn neg_errno(err: LinuxError) -> isize {
     -(err.code() as isize)
 }
 
+fn neg_errno_code(code: u32) -> isize {
+    -(code as isize)
+}
+
 fn str_err(err: &'static str) -> String {
     err.into()
 }
@@ -4492,6 +5567,7 @@ impl FdEntry {
             Self::File(file) => Ok(Self::File(file.clone())),
             Self::Directory(dir) => Ok(Self::Directory(dir.clone())),
             Self::Pipe(pipe) => Ok(Self::Pipe(pipe.clone())),
+            Self::Socket(socket) => socket.duplicate().map(Self::Socket),
         }
     }
 }
@@ -4536,6 +5612,7 @@ impl FdTable {
                 FdEntry::Stdout | FdEntry::Stderr => false,
                 FdEntry::DevNull | FdEntry::Rtc | FdEntry::File(_) | FdEntry::Directory(_) => true,
                 FdEntry::Pipe(pipe) => pipe.poll().readable,
+                FdEntry::Socket(socket) => socket.poll(mode),
             },
             SelectMode::Write => match entry {
                 FdEntry::Stdin => false,
@@ -4543,6 +5620,7 @@ impl FdTable {
                 FdEntry::File(_) => true,
                 FdEntry::Directory(_) => false,
                 FdEntry::Pipe(pipe) => pipe.poll().writable,
+                FdEntry::Socket(socket) => socket.poll(mode),
             },
             SelectMode::Except => false,
         }
@@ -4556,6 +5634,7 @@ impl FdTable {
             FdEntry::File(file) => file.file.read(dst).map_err(LinuxError::from),
             FdEntry::Directory(_) => Err(LinuxError::EISDIR),
             FdEntry::Pipe(pipe) => pipe.read(dst),
+            FdEntry::Socket(socket) => socket.read(dst),
             _ => Err(LinuxError::EBADF),
         }
     }
@@ -4570,6 +5649,7 @@ impl FdTable {
             FdEntry::Rtc => Ok(src.len()),
             FdEntry::File(file) => file.file.write(src).map_err(LinuxError::from),
             FdEntry::Pipe(pipe) => pipe.write(src),
+            FdEntry::Socket(socket) => socket.write(src),
             _ => Err(LinuxError::EBADF),
         }
     }
@@ -4628,11 +5708,20 @@ impl FdTable {
         if !(0..self.entries.len() as i32).contains(&fd) || self.entries[fd as usize].is_none() {
             return Err(LinuxError::EBADF);
         }
-        if fd <= 2 {
-            return Ok(());
+        if let Some(FdEntry::Socket(socket)) = self.entries[fd as usize].as_ref() {
+            socket.close()?;
         }
         self.entries[fd as usize] = None;
         Ok(())
+    }
+
+    fn close_all(&mut self) {
+        for entry in &mut self.entries {
+            if let Some(FdEntry::Socket(socket)) = entry.as_ref() {
+                let _ = socket.close();
+            }
+            *entry = None;
+        }
     }
 
     fn stat(&mut self, fd: i32) -> Result<general::stat, LinuxError> {
@@ -4647,6 +5736,7 @@ impl FdTable {
             )),
             FdEntry::Directory(dir) => Ok(file_attr_to_stat(&dir.attr, Some(dir.path.as_str()))),
             FdEntry::Pipe(pipe) => Ok(pipe.stat()),
+            FdEntry::Socket(socket) => Ok(socket.stat()),
         }
     }
 
@@ -4657,6 +5747,7 @@ impl FdTable {
             FdEntry::File(file) => Some(file.path.as_str()),
             FdEntry::Directory(dir) => Some(dir.path.as_str()),
             FdEntry::Pipe(_) => Some("pipe:"),
+            FdEntry::Socket(_) => Some("socket:"),
             FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => None,
         };
         Ok(generic_statfs(path))
@@ -4694,6 +5785,7 @@ impl FdTable {
             Ok(FdEntry::DevNull) => Ok(generic_statfs(Some("/dev/null"))),
             Ok(FdEntry::Rtc) => Ok(generic_statfs(Some("/dev/misc/rtc"))),
             Ok(FdEntry::Pipe(_)) => Ok(generic_statfs(Some("pipe:"))),
+            Ok(FdEntry::Socket(_)) => Ok(generic_statfs(Some("socket:"))),
             Ok(_) => Ok(generic_statfs(None)),
             Err(err) => Err(err),
         }
@@ -4709,7 +5801,21 @@ impl FdTable {
     }
 
     fn fcntl(&mut self, fd: i32, cmd: u32, _arg: usize) -> Result<i32, LinuxError> {
-        let _ = self.entry(fd)?;
+        if let FdEntry::Socket(socket) = self.entry(fd)? {
+            let socket = *socket;
+            return match cmd {
+                general::F_DUPFD | general::F_DUPFD_CLOEXEC => {
+                    self.insert_min(FdEntry::Socket(socket.duplicate()?), _arg)
+                }
+                general::F_GETFD | general::F_SETFD => Ok(0),
+                general::F_GETFL | general::F_SETFL => posix_ret_i32(arceos_posix_api::sys_fcntl(
+                    socket.posix_fd,
+                    cmd as i32,
+                    _arg,
+                )),
+                _ => Ok(0),
+            };
+        }
         match cmd {
             general::F_DUPFD | general::F_DUPFD_CLOEXEC => self.dup_min(fd, _arg as i32),
             general::F_GETFD | general::F_SETFD | general::F_GETFL | general::F_SETFL => Ok(0),
@@ -4730,6 +5836,7 @@ impl FdTable {
             FdEntry::Rtc => Ok(0),
             FdEntry::Directory(_) => Err(LinuxError::EISDIR),
             FdEntry::Pipe(_) => Err(LinuxError::ESPIPE),
+            FdEntry::Socket(_) => Err(LinuxError::ESPIPE),
             _ => Err(LinuxError::ESPIPE),
         }
     }

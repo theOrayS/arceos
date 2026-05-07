@@ -2,8 +2,10 @@ mod addr;
 mod bench;
 mod dns;
 mod listen_table;
+mod loopback;
 mod tcp;
 mod udp;
+mod udp_loopback;
 
 use alloc::vec;
 use core::cell::RefCell;

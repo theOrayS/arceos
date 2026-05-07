@@ -2,6 +2,7 @@ use alloc::{sync::Arc, vec, vec::Vec};
 use core::ffi::{c_char, c_int, c_void};
 use core::mem::size_of;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::time::Duration;
 
 use axerrno::{LinuxError, LinuxResult};
 use axio::PollState;
@@ -11,6 +12,10 @@ use axsync::Mutex;
 use super::fd_ops::FileLike;
 use crate::ctypes;
 use crate::utils::char_ptr_to_str;
+
+const SHUT_RD: c_int = 0;
+const SHUT_WR: c_int = 1;
+const SHUT_RDWR: c_int = 2;
 
 pub enum Socket {
     Udp(Mutex<UdpSocket>),
@@ -111,7 +116,10 @@ impl Socket {
         }
     }
 
-    fn shutdown(&self) -> LinuxResult {
+    fn shutdown(&self, flag: c_int) -> LinuxResult {
+        if !matches!(flag, SHUT_RD | SHUT_WR | SHUT_RDWR) {
+            return Err(LinuxError::EINVAL);
+        }
         match self {
             Socket::Udp(udpsocket) => {
                 let udpsocket = udpsocket.lock();
@@ -123,11 +131,62 @@ impl Socket {
             Socket::Tcp(tcpsocket) => {
                 let tcpsocket = tcpsocket.lock();
                 tcpsocket.peer_addr()?;
-                tcpsocket.shutdown()?;
+                match flag {
+                    SHUT_RD => tcpsocket.shutdown_read()?,
+                    SHUT_WR => tcpsocket.shutdown_write()?,
+                    SHUT_RDWR => tcpsocket.shutdown()?,
+                    _ => unreachable!(),
+                }
                 Ok(())
             }
         }
     }
+
+    fn set_recv_timeout(&self, timeout: Option<Duration>) {
+        match self {
+            Socket::Udp(udpsocket) => udpsocket.lock().set_recv_timeout(timeout),
+            Socket::Tcp(tcpsocket) => tcpsocket.lock().set_recv_timeout(timeout),
+        }
+    }
+
+    fn recv_timeout(&self) -> Option<Duration> {
+        match self {
+            Socket::Udp(udpsocket) => udpsocket.lock().recv_timeout(),
+            Socket::Tcp(tcpsocket) => tcpsocket.lock().recv_timeout(),
+        }
+    }
+
+    fn set_send_timeout(&self, timeout: Option<Duration>) {
+        match self {
+            Socket::Udp(udpsocket) => udpsocket.lock().set_send_timeout(timeout),
+            Socket::Tcp(tcpsocket) => tcpsocket.lock().set_send_timeout(timeout),
+        }
+    }
+
+    fn send_timeout(&self) -> Option<Duration> {
+        match self {
+            Socket::Udp(udpsocket) => udpsocket.lock().send_timeout(),
+            Socket::Tcp(tcpsocket) => tcpsocket.lock().send_timeout(),
+        }
+    }
+}
+
+pub fn set_socket_recv_timeout(sockfd: c_int, timeout: Option<Duration>) -> LinuxResult {
+    Socket::from_fd(sockfd)?.set_recv_timeout(timeout);
+    Ok(())
+}
+
+pub fn socket_recv_timeout(sockfd: c_int) -> LinuxResult<Option<Duration>> {
+    Ok(Socket::from_fd(sockfd)?.recv_timeout())
+}
+
+pub fn set_socket_send_timeout(sockfd: c_int, timeout: Option<Duration>) -> LinuxResult {
+    Socket::from_fd(sockfd)?.set_send_timeout(timeout);
+    Ok(())
+}
+
+pub fn socket_send_timeout(sockfd: c_int) -> LinuxResult<Option<Duration>> {
+    Ok(Socket::from_fd(sockfd)?.send_timeout())
 }
 
 impl FileLike for Socket {
@@ -159,6 +218,18 @@ impl FileLike for Socket {
 
     fn poll(&self) -> LinuxResult<PollState> {
         self.poll()
+    }
+
+    fn status_flags(&self) -> LinuxResult<c_int> {
+        let nonblock = match self {
+            Socket::Udp(udpsocket) => udpsocket.lock().is_nonblocking(),
+            Socket::Tcp(tcpsocket) => tcpsocket.lock().is_nonblocking(),
+        };
+        Ok(if nonblock {
+            ctypes::O_NONBLOCK as c_int
+        } else {
+            0
+        })
     }
 
     fn set_nonblocking(&self, nonblock: bool) -> LinuxResult {
@@ -199,7 +270,7 @@ fn into_sockaddr(addr: SocketAddr) -> (ctypes::sockaddr, ctypes::socklen_t) {
     match addr {
         SocketAddr::V4(addr) => (
             unsafe { *(&ctypes::sockaddr_in::from(addr) as *const _ as *const ctypes::sockaddr) },
-            size_of::<ctypes::sockaddr>() as _,
+            size_of::<ctypes::sockaddr>() as ctypes::socklen_t,
         ),
         SocketAddr::V6(_) => panic!("IPv6 is not supported"),
     }
@@ -212,7 +283,7 @@ fn from_sockaddr(
     if addr.is_null() {
         return Err(LinuxError::EFAULT);
     }
-    if addrlen != size_of::<ctypes::sockaddr>() as _ {
+    if addrlen != size_of::<ctypes::sockaddr>() as ctypes::socklen_t {
         return Err(LinuxError::EINVAL);
     }
 
@@ -430,13 +501,10 @@ pub unsafe fn sys_accept(
 /// Shut down a full-duplex connection.
 ///
 /// Return 0 if success.
-pub fn sys_shutdown(
-    socket_fd: c_int,
-    flag: c_int, // currently not used
-) -> c_int {
+pub fn sys_shutdown(socket_fd: c_int, flag: c_int) -> c_int {
     debug!("sys_shutdown <= {} {}", socket_fd, flag);
     syscall_body!(sys_shutdown, {
-        Socket::from_fd(socket_fd)?.shutdown()?;
+        Socket::from_fd(socket_fd)?.shutdown(flag)?;
         Ok(0)
     })
 }

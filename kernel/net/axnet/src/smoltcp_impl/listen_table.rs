@@ -7,6 +7,7 @@ use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp::{self, State};
 use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
+use super::loopback::LoopbackTcpEndpoint;
 use super::{LISTEN_QUEUE_SIZE, SOCKET_SET, SocketSetWrapper};
 
 const PORT_NUM: usize = 65536;
@@ -14,6 +15,7 @@ const PORT_NUM: usize = 65536;
 struct ListenTableEntry {
     listen_endpoint: IpListenEndpoint,
     syn_queue: VecDeque<SocketHandle>,
+    loopback_queue: VecDeque<LoopbackTcpEndpoint>,
 }
 
 impl ListenTableEntry {
@@ -21,6 +23,7 @@ impl ListenTableEntry {
         Self {
             listen_endpoint,
             syn_queue: VecDeque::with_capacity(LISTEN_QUEUE_SIZE),
+            loopback_queue: VecDeque::with_capacity(LISTEN_QUEUE_SIZE),
         }
     }
 
@@ -35,6 +38,9 @@ impl ListenTableEntry {
 
 impl Drop for ListenTableEntry {
     fn drop(&mut self) {
+        for endpoint in self.loopback_queue.drain(..) {
+            endpoint.shutdown();
+        }
         for &handle in &self.syn_queue {
             SOCKET_SET.remove(handle);
         }
@@ -80,7 +86,31 @@ impl ListenTable {
 
     pub fn can_accept(&self, port: u16) -> AxResult<bool> {
         if let Some(entry) = self.tcp[port as usize].lock().deref() {
-            Ok(entry.syn_queue.iter().any(|&handle| is_connected(handle)))
+            Ok(!entry.loopback_queue.is_empty()
+                || entry.syn_queue.iter().any(|&handle| is_connected(handle)))
+        } else {
+            ax_err!(InvalidInput, "socket accept() failed: not listen")
+        }
+    }
+
+    pub fn connect_loopback(&self, remote: IpEndpoint, endpoint: LoopbackTcpEndpoint) -> AxResult {
+        if let Some(entry) = self.tcp[remote.port as usize].lock().deref_mut() {
+            if !entry.can_accept(remote.addr) {
+                return ax_err!(ConnectionRefused, "loopback socket connect() failed");
+            }
+            if entry.loopback_queue.len() >= LISTEN_QUEUE_SIZE {
+                return ax_err!(ConnectionRefused, "loopback socket connect() failed");
+            }
+            entry.loopback_queue.push_back(endpoint);
+            Ok(())
+        } else {
+            ax_err!(ConnectionRefused, "loopback socket connect() failed")
+        }
+    }
+
+    pub fn accept_loopback(&self, port: u16) -> AxResult<Option<LoopbackTcpEndpoint>> {
+        if let Some(entry) = self.tcp[port as usize].lock().deref_mut() {
+            Ok(entry.loopback_queue.pop_front())
         } else {
             ax_err!(InvalidInput, "socket accept() failed: not listen")
         }
