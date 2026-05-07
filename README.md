@@ -29,28 +29,52 @@ ArceOS was inspired a lot by [Unikraft](https://github.com/unikraft/unikraft).
 
 ### Build and Run through Docker
 
-Install [Docker](https://www.docker.com/) in your system.
+Install [Docker](https://www.docker.com/) in your system. The provided image
+contains the Rust toolchain selected by `rust-toolchain.toml`, the ArceOS cargo
+helpers, the QEMU targets used by this repository, and the musl cross toolchains
+used when C user apps need to be rebuilt.
 
-Then build all dependencies through provided dockerfile:
+Build the image with the provided Dockerfile:
 
 ```bash
 docker build -t arceos -f Dockerfile .
 ```
 
-Create a container and build/run app:
+Create a container and build/run apps:
 
 ```bash
-docker run -it -v $(pwd):/arceos -w /arceos arceos bash
+docker run --rm -it -v $(pwd):/arceos -w /arceos arceos bash
 
 # Now build/run app in the container
 make A=examples/helloworld ARCH=aarch64 run
 ```
 
+If evaluator images and `run-eval.sh` are provided in the repository directory,
+they can also be used inside the container. For local validation that must avoid
+Docker, use the direct-server instructions below.
+
 ### Manually Build and Run
 
 #### 1. Install Build Dependencies
 
-Install [cargo-binutils](https://github.com/rust-embedded/cargo-binutils) to use `rust-objcopy` and `rust-objdump` tools, and [axconfig-gen](https://github.com/arceos-org/axconfig-gen) for kernel configuration, and [cargo-axplat](https://github.com/arceos-org/axplat_crates/tree/dev/cargo-axplat) for platform configuration:
+Install the host packages needed to build and run ArceOS directly on
+Debian/Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential make git wget ca-certificates \
+    python3 python3-venv pkg-config libclang-dev qemu-system
+```
+
+The repository pins the Rust toolchain in `rust-toolchain.toml`
+(`nightly-2025-05-20` with `rust-src`, `llvm-tools`, `rustfmt`, and `clippy`).
+With `rustup` installed, entering the repository or invoking `cargo`/`make`
+will use that pinned toolchain and its configured targets.
+
+Install [cargo-binutils](https://github.com/rust-embedded/cargo-binutils) to use
+`rust-objcopy` and `rust-objdump` tools, [axconfig-gen](https://github.com/arceos-org/axconfig-gen)
+for kernel configuration, and [cargo-axplat](https://github.com/arceos-org/axplat_crates/tree/dev/cargo-axplat)
+for platform configuration:
 
 ```bash
 cargo install cargo-binutils axconfig-gen cargo-axplat
@@ -65,9 +89,19 @@ sudo apt-get install qemu-system
 brew install qemu
 ```
 
+The supplied RV/LA evaluator path has been validated on a direct server with
+QEMU available as `qemu-system-riscv64` and `qemu-system-loongarch64`. When the
+two evaluator images and `run-eval.sh` are present in the repository directory,
+run:
+
+```bash
+./run-eval.sh rv
+./run-eval.sh la
+```
+
 ##### Dependencies for building C apps (optional)
 
-Install `libclang-dev`:
+Install `libclang-dev` if it was not installed with the host packages above:
 
 ```bash
 sudo apt install libclang-dev

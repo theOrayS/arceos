@@ -14,20 +14,19 @@ Bounded command path:
 - The run reached the known `add_ipv6addr` timeout point after the early LTP
   fd/socket cases.
 
-Latest synthetic user database and EFAULT diagnostic summary:
+Latest access permission metadata diagnostic summary:
 
 - Run cases: 15
-- TPASS: 51
-- TFAIL: 4
+- TPASS: 57
+- TFAIL: 1
 - TBROK: 5
 - TCONF: 17
 - TWARN: 2
 
-Compared with the previous AF_UNIX diagnostic window, TPASS increased from 21
-to 51 and TBROK decreased from 6 to 5. TFAIL increased from 1 to 4 because the
-`access01` test now passes the previous `getpwnam("nobody")` setup blocker and
-reaches real file permission checks, where several permission semantics are
-still too permissive.
+Compared with the previous synthetic user database and EFAULT diagnostic
+window, TPASS increased from 54 to 57 and TFAIL decreased from 4 to 1. TBROK,
+TCONF, and TWARN did not increase. The run still reaches the known
+`add_ipv6addr` timeout point after the early LTP cases.
 
 ## Improved tests and behaviors
 
@@ -53,6 +52,10 @@ still too permissive.
 - `access03`: invalid user pointers now return `EFAULT` instead of allowing the
   kernel address-range helper to panic on overflow. The case now exits 0 and
   reports the expected EFAULT behavior for both root and nobody.
+- `access01`: files and directories created by the Linux compatibility layer now
+  keep their requested permission bits, and `chmod`/`fchmod` update that metadata.
+  This turns the `accessfile_x` executable-file checks and the `accessfile_r`
+  X_OK/W_OK denial checks into TPASS results under the bounded RV diagnostic.
 - `access04`/large sparse access path: ramfs now rejects oversized file growth
   with storage-full behavior instead of aborting the kernel on a very large
   allocation request.
@@ -74,6 +77,11 @@ still too permissive.
 - User pointer range validation now rejects overflowed ranges before asking the
   address-space helper to validate them, so invalid pointers such as `(void *)-1`
   are converted to `EFAULT`.
+- The Linux compatibility process state now records effective uid/gid and a
+  path permission overlay for files and directories created through the
+  userspace syscall path. `access`/`faccessat` uses the recorded mode bits plus
+  parent-directory search permission instead of treating every existing path as
+  readable, writable, and executable.
 - Bound TCP sockets can report their local address before listen/connect when
   the endpoint was already bound.
 - ramfs write/truncate paths reject growth beyond a bounded in-memory file size
@@ -81,11 +89,12 @@ still too permissive.
 
 ## Remaining gaps
 
-`accept03` and the EFAULT portion of `access03` now exit 0 in the bounded RV
-diagnostic. The remaining early LTP gaps are more specific: `accept4_01` still
-records the unsupported legacy socketcall variant on RISC-V, `access01` now
-reaches real permission checks but remains too permissive for some modes,
-`access02` needs symlink support, several acct/device cases still depend on
-kernel config or filesystem/device support, and the run still reaches the known
-`add_ipv6addr` timeout point. Future fixes should target those missing kernel or
-environment capabilities directly without modifying the evaluator or images.
+`accept03` and the EFAULT portion of `access03` still exit 0 in the bounded RV
+diagnostic. The remaining early LTP gaps are more specific: `access01` now
+passes the newly covered permission-bit checks but still exits 2 because the
+LTP harness reports "Test 12 haven't reported results" after a child-user
+permission check, `access02` needs symlink support, several acct/device cases
+still depend on kernel config or filesystem/device support, and the run still
+reaches the known `add_ipv6addr` timeout point. Future fixes should target those
+missing kernel or environment capabilities directly without modifying the
+evaluator or images.

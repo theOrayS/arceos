@@ -75,6 +75,7 @@ const ST_MODE_DIR: u32 = 0o040000;
 const ST_MODE_FILE: u32 = 0o100000;
 const ST_MODE_CHR: u32 = 0o020000;
 const ST_MODE_SOCKET: u32 = 0o140000;
+const ST_MODE_TYPE_MASK: u32 = 0o170000;
 const STATFS_BLOCK_SIZE: i64 = 4096;
 const STATFS_NAME_MAX: i64 = 255;
 const TMPFS_MAGIC: i64 = 0x0102_1994;
@@ -88,6 +89,11 @@ const ETC_PASSWD_PATH: &str = "/etc/passwd";
 const ETC_GROUP_PATH: &str = "/etc/group";
 const AF_UNIX_DOMAIN: i32 = 1;
 const LOCAL_SOCKET_INO_BASE: u64 = 0x5f00_0000;
+const LINUX_EACCES: u32 = 13;
+const ACCESS_X_OK: usize = 1;
+const ACCESS_W_OK: usize = 2;
+const ACCESS_R_OK: usize = 4;
+const ACCESS_MODE_MASK: usize = ACCESS_X_OK | ACCESS_W_OK | ACCESS_R_OK;
 const DEFAULT_PASSWD_CONTENT: &[u8] =
     b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n";
 const DEFAULT_GROUP_CONTENT: &[u8] = b"root:x:0:\nnogroup:x:65534:\n";
@@ -158,6 +164,9 @@ struct UserProcess {
     child_exit_wait: WaitQueue,
     rlimits: Mutex<BTreeMap<u32, UserRlimit>>,
     signal_actions: Mutex<BTreeMap<usize, general::kernel_sigaction>>,
+    path_modes: Mutex<BTreeMap<String, u32>>,
+    uid: AtomicU32,
+    gid: AtomicU32,
     real_timer_generation: AtomicU64,
     real_timer_deadline_us: AtomicU64,
     real_timer_interval_us: AtomicU64,
@@ -784,6 +793,9 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         child_exit_wait: WaitQueue::new(),
         rlimits: Mutex::new(BTreeMap::new()),
         signal_actions: Mutex::new(BTreeMap::new()),
+        path_modes: Mutex::new(BTreeMap::new()),
+        uid: AtomicU32::new(0),
+        gid: AtomicU32::new(0),
         real_timer_generation: AtomicU64::new(0),
         real_timer_deadline_us: AtomicU64::new(0),
         real_timer_interval_us: AtomicU64::new(0),
@@ -1521,6 +1533,32 @@ impl UserProcess {
         self.pid.store(pid, Ordering::Release);
     }
 
+    fn uid(&self) -> u32 {
+        self.uid.load(Ordering::Acquire)
+    }
+
+    fn gid(&self) -> u32 {
+        self.gid.load(Ordering::Acquire)
+    }
+
+    fn set_uid(&self, uid: u32) {
+        self.uid.store(uid, Ordering::Release);
+    }
+
+    fn set_gid(&self, gid: u32) {
+        self.gid.store(gid, Ordering::Release);
+    }
+
+    fn set_path_mode(&self, path: String, mode: u32) {
+        self.path_modes
+            .lock()
+            .insert(path, normalize_file_mode(mode));
+    }
+
+    fn path_mode(&self, path: &str) -> Option<u32> {
+        self.path_modes.lock().get(path).copied()
+    }
+
     fn real_timer_active(&self) -> bool {
         self.real_timer_deadline_us.load(Ordering::Acquire) != 0
     }
@@ -1592,6 +1630,9 @@ impl UserProcess {
             child_exit_wait: WaitQueue::new(),
             rlimits: Mutex::new(self.rlimits.lock().clone()),
             signal_actions: Mutex::new(self.signal_actions.lock().clone()),
+            path_modes: Mutex::new(self.path_modes.lock().clone()),
+            uid: AtomicU32::new(self.uid()),
+            gid: AtomicU32::new(self.gid()),
             real_timer_generation: AtomicU64::new(0),
             real_timer_deadline_us: AtomicU64::new(0),
             real_timer_interval_us: AtomicU64::new(0),
@@ -2388,12 +2429,12 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
             tf.arg4(),
             tf.arg5(),
         ),
-        general::__NR_getuid => 0,
-        general::__NR_geteuid => 0,
-        general::__NR_getgid => 0,
-        general::__NR_getegid => 0,
-        general::__NR_setuid => 0,
-        general::__NR_setgid => 0,
+        general::__NR_getuid => process.uid() as isize,
+        general::__NR_geteuid => process.uid() as isize,
+        general::__NR_getgid => process.gid() as isize,
+        general::__NR_getegid => process.gid() as isize,
+        general::__NR_setuid => sys_setuid(&process, tf.arg0()),
+        general::__NR_setgid => sys_setgid(&process, tf.arg0()),
         general::__NR_umask => 0,
         general::__NR_prctl => 0,
         general::__NR_setpgid => sys_setpgid(&process, tf.arg0(), tf.arg1()),
@@ -3018,23 +3059,25 @@ fn sys_openat(
     dirfd: usize,
     pathname: usize,
     flags: usize,
-    _mode: usize,
+    mode: usize,
 ) -> isize {
     let path = match read_cstr(process, pathname) {
         Ok(path) => path,
         Err(err) => return neg_errno(err),
     };
-    match process
-        .fds
-        .lock()
-        .open(process, dirfd as i32, path.as_str(), flags as u32)
-    {
+    match process.fds.lock().open(
+        process,
+        dirfd as i32,
+        path.as_str(),
+        flags as u32,
+        mode as u32,
+    ) {
         Ok(fd) => fd as isize,
         Err(err) => neg_errno(err),
     }
 }
 
-fn sys_mkdirat(process: &UserProcess, dirfd: usize, pathname: usize, _mode: usize) -> isize {
+fn sys_mkdirat(process: &UserProcess, dirfd: usize, pathname: usize, mode: usize) -> isize {
     let path = match read_cstr(process, pathname) {
         Ok(path) => path,
         Err(err) => return neg_errno(err),
@@ -3042,7 +3085,7 @@ fn sys_mkdirat(process: &UserProcess, dirfd: usize, pathname: usize, _mode: usiz
     match process
         .fds
         .lock()
-        .mkdirat(process, dirfd as i32, path.as_str())
+        .mkdirat(process, dirfd as i32, path.as_str(), mode as u32)
     {
         Ok(()) => 0,
         Err(err) => neg_errno(err),
@@ -3068,21 +3111,83 @@ fn sys_faccessat(
     process: &UserProcess,
     dirfd: usize,
     pathname: usize,
-    _mode: usize,
+    mode: usize,
     _flags: usize,
 ) -> isize {
+    if mode & !ACCESS_MODE_MASK != 0 {
+        return neg_errno(LinuxError::EINVAL);
+    }
     let path = match read_cstr(process, pathname) {
         Ok(path) => path,
         Err(err) => return neg_errno(err),
     };
-    match process
-        .fds
-        .lock()
-        .stat_path(process, dirfd as i32, path.as_str())
-    {
-        Ok(_) => 0,
-        Err(err) => neg_errno(err),
+    let mut fds = process.fds.lock();
+    let resolved_path = match fds.resolve_path(process, dirfd as i32, path.as_str()) {
+        Ok(path) => path,
+        Err(err) => return neg_errno(err),
+    };
+    let stat = match fds.stat_path(process, dirfd as i32, path.as_str()) {
+        Ok(stat) => stat,
+        Err(err) => return neg_errno(err),
+    };
+    let uid = process.uid();
+    let gid = process.gid();
+    let parents_searchable =
+        match fds.parent_dirs_searchable(process, resolved_path.as_str(), uid, gid) {
+            Ok(searchable) => searchable,
+            Err(err) => return neg_errno(err),
+        };
+    if parents_searchable && access_allowed(&stat, mode, uid, gid) {
+        0
+    } else {
+        neg_errno_code(LINUX_EACCES)
     }
+}
+
+fn sys_setuid(process: &UserProcess, uid: usize) -> isize {
+    let Ok(uid) = u32::try_from(uid) else {
+        return neg_errno(LinuxError::EINVAL);
+    };
+    process.set_uid(uid);
+    0
+}
+
+fn sys_setgid(process: &UserProcess, gid: usize) -> isize {
+    let Ok(gid) = u32::try_from(gid) else {
+        return neg_errno(LinuxError::EINVAL);
+    };
+    process.set_gid(gid);
+    0
+}
+
+fn access_allowed(st: &general::stat, mode: usize, uid: u32, gid: u32) -> bool {
+    if mode == 0 {
+        return true;
+    }
+
+    let permissions = (st.st_mode & 0o777) as u32;
+    if uid == 0 {
+        return (mode & ACCESS_X_OK == 0) || (permissions & 0o111 != 0);
+    }
+
+    let bits = if uid == st.st_uid as u32 {
+        (permissions >> 6) & 0o7
+    } else if gid == st.st_gid as u32 {
+        (permissions >> 3) & 0o7
+    } else {
+        permissions & 0o7
+    };
+
+    if mode & ACCESS_R_OK != 0 && bits & 0o4 == 0 {
+        return false;
+    }
+    if mode & ACCESS_W_OK != 0 && bits & 0o2 == 0 {
+        return false;
+    }
+    if mode & ACCESS_X_OK != 0 && bits & 0o1 == 0 {
+        return false;
+    }
+    true
 }
 
 fn sys_setpgid(process: &UserProcess, pid: usize, pgid: usize) -> isize {
@@ -3128,18 +3233,22 @@ fn sys_setsid(process: &UserProcess) -> isize {
     process.pid() as isize
 }
 
-fn sys_fchmod(process: &UserProcess, fd: usize, _mode: usize) -> isize {
-    match process.fds.lock().entry(fd as i32) {
-        Ok(_) => 0,
-        Err(err) => neg_errno(err),
+fn sys_fchmod(process: &UserProcess, fd: usize, mode: usize) -> isize {
+    let path = match process.fds.lock().entry(fd as i32) {
+        Ok(entry) => fd_entry_path(entry).map(ToString::to_string),
+        Err(err) => return neg_errno(err),
+    };
+    if let Some(path) = path {
+        process.set_path_mode(path, mode as u32);
     }
+    0
 }
 
 fn sys_fchmodat(
     process: &UserProcess,
     dirfd: usize,
     pathname: usize,
-    _mode: usize,
+    mode: usize,
     flags: usize,
 ) -> isize {
     let flags = flags as u32;
@@ -3152,28 +3261,42 @@ fn sys_fchmodat(
         Ok(path) => path,
         Err(err) => return neg_errno(err),
     };
+    let mode = mode as u32;
     if path.is_empty() {
         if flags & general::AT_EMPTY_PATH == 0 {
             return neg_errno(LinuxError::ENOENT);
         }
         if dirfd as i32 == general::AT_FDCWD {
-            return match axfs::api::metadata(process.cwd().as_str()) {
-                Ok(_) => 0,
+            let cwd = process.cwd();
+            return match axfs::api::metadata(cwd.as_str()) {
+                Ok(_) => {
+                    process.set_path_mode(cwd, mode);
+                    0
+                }
                 Err(err) => neg_errno(LinuxError::from(err)),
             };
         }
         return match process.fds.lock().entry(dirfd as i32) {
-            Ok(_) => 0,
+            Ok(entry) => {
+                if let Some(path) = fd_entry_path(entry) {
+                    process.set_path_mode(path.to_string(), mode);
+                }
+                0
+            }
             Err(err) => neg_errno(err),
         };
     }
 
-    match process
-        .fds
-        .lock()
-        .stat_path(process, dirfd as i32, path.as_str())
-    {
-        Ok(_) => 0,
+    let mut fds = process.fds.lock();
+    let resolved_path = match fds.resolve_path(process, dirfd as i32, path.as_str()) {
+        Ok(path) => path,
+        Err(err) => return neg_errno(err),
+    };
+    match fds.stat_path(process, dirfd as i32, path.as_str()) {
+        Ok(_) => {
+            process.set_path_mode(resolved_path, mode);
+            0
+        }
         Err(err) => neg_errno(err),
     }
 }
@@ -5795,6 +5918,35 @@ fn file_attr_to_stat(attr: &FileAttr, path: Option<&str>) -> general::stat {
     st
 }
 
+fn normalize_file_mode(mode: u32) -> u32 {
+    mode & 0o777
+}
+
+fn apply_recorded_path_mode(
+    process: &UserProcess,
+    path: &str,
+    mut st: general::stat,
+) -> general::stat {
+    if let Some(mode) = process.path_mode(path) {
+        st.st_mode = (st.st_mode & !0o777) | mode;
+    }
+    st
+}
+
+fn canonical_permission_path(path: String) -> String {
+    dev_shm_host_path(path.as_str()).unwrap_or(path)
+}
+
+fn fd_entry_path(entry: &FdEntry) -> Option<&str> {
+    match entry {
+        FdEntry::File(file) => Some(file.path.as_str()),
+        FdEntry::Directory(dir) => Some(dir.path.as_str()),
+        FdEntry::Path(path) => Some(path.path.as_str()),
+        FdEntry::MemoryFile(file) => Some(file.path.as_str()),
+        _ => None,
+    }
+}
+
 fn statfs_type_for_path(path: Option<&str>) -> i64 {
     match path {
         Some(path) if path == "/proc" || path.starts_with("/proc/") => PROC_SUPER_MAGIC,
@@ -6134,21 +6286,33 @@ impl FdTable {
         dirfd: i32,
         path: &str,
         flags: u32,
+        mode: u32,
     ) -> Result<i32, LinuxError> {
-        let entry = open_fd_entry(process, self, dirfd, path, flags)?;
+        let entry = open_fd_entry(process, self, dirfd, path, flags, mode)?;
         self.insert_with_flags(entry, fd_cloexec_flag(flags & general::O_CLOEXEC != 0))
     }
 
-    fn mkdirat(&mut self, process: &UserProcess, dirfd: i32, path: &str) -> Result<(), LinuxError> {
+    fn mkdirat(
+        &mut self,
+        process: &UserProcess,
+        dirfd: i32,
+        path: &str,
+        mode: u32,
+    ) -> Result<(), LinuxError> {
         if path.starts_with('/') || dirfd == general::AT_FDCWD {
             let cwd = process.cwd();
             let abs_path = resolve_host_path(cwd, path).map_err(|_| LinuxError::EINVAL)?;
-            return directory_create_dir(abs_path.as_str());
+            directory_create_dir(abs_path.as_str())?;
+            process.set_path_mode(abs_path, mode);
+            return Ok(());
         }
         let FdEntry::Directory(dir) = self.entry(dirfd)? else {
             return Err(LinuxError::ENOTDIR);
         };
-        dir.dir.create_dir(path).map_err(LinuxError::from)
+        let abs_path = normalize_path(dir.path.as_str(), path).ok_or(LinuxError::EINVAL)?;
+        dir.dir.create_dir(path).map_err(LinuxError::from)?;
+        process.set_path_mode(abs_path, mode);
+        Ok(())
     }
 
     fn unlinkat(
@@ -6260,20 +6424,87 @@ impl FdTable {
         dirfd: i32,
         path: &str,
     ) -> Result<general::stat, LinuxError> {
-        match open_fd_entry(process, self, dirfd, path, general::O_RDONLY) {
+        match open_fd_entry(process, self, dirfd, path, general::O_RDONLY, 0) {
             Ok(FdEntry::DevNull) | Ok(FdEntry::Rtc) => Ok(stdio_stat(false)),
-            Ok(FdEntry::File(file)) => Ok(file_attr_to_stat(
-                &file.file.get_attr().map_err(LinuxError::from)?,
-                Some(file.path.as_str()),
+            Ok(FdEntry::File(file)) => Ok(apply_recorded_path_mode(
+                process,
+                file.path.as_str(),
+                file_attr_to_stat(
+                    &file.file.get_attr().map_err(LinuxError::from)?,
+                    Some(file.path.as_str()),
+                ),
             )),
-            Ok(FdEntry::Directory(dir)) => {
-                Ok(file_attr_to_stat(&dir.attr, Some(dir.path.as_str())))
-            }
-            Ok(FdEntry::Path(path)) => Ok(path.stat()),
-            Ok(FdEntry::MemoryFile(file)) => Ok(file.stat()),
+            Ok(FdEntry::Directory(dir)) => Ok(apply_recorded_path_mode(
+                process,
+                dir.path.as_str(),
+                file_attr_to_stat(&dir.attr, Some(dir.path.as_str())),
+            )),
+            Ok(FdEntry::Path(path)) => Ok(apply_recorded_path_mode(
+                process,
+                path.path.as_str(),
+                path.stat(),
+            )),
+            Ok(FdEntry::MemoryFile(file)) => Ok(apply_recorded_path_mode(
+                process,
+                file.path.as_str(),
+                file.stat(),
+            )),
             Ok(_) => Err(LinuxError::EINVAL),
             Err(err) => Err(err),
         }
+    }
+
+    fn resolve_path(
+        &self,
+        process: &UserProcess,
+        dirfd: i32,
+        path: &str,
+    ) -> Result<String, LinuxError> {
+        if path.is_empty() {
+            return Err(LinuxError::ENOENT);
+        }
+        let normalized = if path.starts_with('/') {
+            normalize_path("/", path).ok_or(LinuxError::EINVAL)?
+        } else if dirfd == general::AT_FDCWD {
+            let cwd = process.cwd();
+            normalize_path(cwd.as_str(), path).ok_or(LinuxError::EINVAL)?
+        } else {
+            let base = match self.entry(dirfd)? {
+                FdEntry::Directory(dir) => dir.path.as_str(),
+                FdEntry::Path(path_entry) if path_entry.mode & ST_MODE_TYPE_MASK == ST_MODE_DIR => {
+                    path_entry.path.as_str()
+                }
+                _ => return Err(LinuxError::ENOTDIR),
+            };
+            normalize_path(base, path).ok_or(LinuxError::EINVAL)?
+        };
+        Ok(canonical_permission_path(normalized))
+    }
+
+    fn parent_dirs_searchable(
+        &mut self,
+        process: &UserProcess,
+        path: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<bool, LinuxError> {
+        if uid == 0 {
+            return Ok(true);
+        }
+        let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+        if components.len() <= 1 {
+            return Ok(true);
+        }
+        let mut parent = String::new();
+        for component in &components[..components.len() - 1] {
+            parent.push('/');
+            parent.push_str(component);
+            let st = self.stat_path(process, general::AT_FDCWD, parent.as_str())?;
+            if !access_allowed(&st, ACCESS_X_OK, uid, gid) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn statfs_path(
@@ -6282,7 +6513,7 @@ impl FdTable {
         dirfd: i32,
         path: &str,
     ) -> Result<general::statfs, LinuxError> {
-        match open_fd_entry(process, self, dirfd, path, general::O_RDONLY) {
+        match open_fd_entry(process, self, dirfd, path, general::O_RDONLY, 0) {
             Ok(FdEntry::File(file)) => Ok(generic_statfs(Some(file.path.as_str()))),
             Ok(FdEntry::Directory(dir)) => Ok(generic_statfs(Some(dir.path.as_str()))),
             Ok(FdEntry::Path(path)) => Ok(generic_statfs(Some(path.path.as_str()))),
@@ -6578,6 +6809,7 @@ fn open_fd_entry(
     dirfd: i32,
     path: &str,
     flags: u32,
+    mode: u32,
 ) -> Result<FdEntry, LinuxError> {
     let mut opts = OpenOptions::new();
     let access = flags & general::O_ACCMODE;
@@ -6614,7 +6846,7 @@ fn open_fd_entry(
                 return if path_only {
                     open_path_candidates(process, &[path], prefer_dir)
                 } else {
-                    open_fd_candidates(process, &[path], prefer_dir, &opts, flags)
+                    open_fd_candidates(process, &[path], prefer_dir, &opts, flags, mode)
                 };
             }
             runtime_absolute_path_candidates(exec_root.as_str(), path)
@@ -6633,7 +6865,7 @@ fn open_fd_entry(
         if path_only {
             open_path_candidates(process, &candidates, prefer_dir)
         } else {
-            open_fd_candidates(process, &candidates, prefer_dir, &opts, flags)
+            open_fd_candidates(process, &candidates, prefer_dir, &opts, flags, mode)
         }
     } else {
         let FdEntry::Directory(dir) = table.entry(dirfd)? else {
@@ -6647,7 +6879,7 @@ fn open_fd_entry(
         if path_only {
             open_path_candidates(process, &candidates, prefer_dir)
         } else {
-            open_fd_candidates(process, &candidates, prefer_dir, &opts, flags)
+            open_fd_candidates(process, &candidates, prefer_dir, &opts, flags, mode)
         }
     }
 }
@@ -6796,6 +7028,7 @@ fn open_fd_candidates(
     prefer_dir: bool,
     opts: &OpenOptions,
     flags: u32,
+    mode: u32,
 ) -> Result<FdEntry, LinuxError> {
     let mut last_err = LinuxError::ENOENT;
     for path in candidates {
@@ -6841,8 +7074,13 @@ fn open_fd_candidates(
             }
             continue;
         }
+        let created_by_this_open =
+            flags & general::O_CREAT != 0 && axfs::api::metadata(path.as_str()).is_err();
         match File::open(path.as_str(), opts) {
             Ok(file) => {
+                if created_by_this_open {
+                    process.set_path_mode(path.clone(), mode);
+                }
                 return Ok(FdEntry::File(FileEntry {
                     file,
                     path: path.clone(),
