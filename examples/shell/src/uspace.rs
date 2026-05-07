@@ -1,5 +1,5 @@
 use core::cmp;
-use core::ffi::{CStr, c_char, c_long, c_void};
+use core::ffi::{c_char, c_long, c_void, CStr};
 use core::mem::{offset_of, size_of};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -11,7 +11,7 @@ use axfs::fops::{self, Directory, File, FileAttr, FileType, OpenOptions};
 use axhal::context::{TrapFrame, UspaceContext};
 use axhal::paging::MappingFlags;
 use axhal::trap::{
-    PAGE_FAULT, PageFaultFlags, SYSCALL, register_trap_handler, register_user_return_handler,
+    register_trap_handler, register_user_return_handler, PageFaultFlags, PAGE_FAULT, SYSCALL,
 };
 use axio::{PollState, SeekFrom};
 use axmm::AddrSpace;
@@ -20,17 +20,17 @@ use axsync::Mutex;
 use axtask::{AxTaskRef, TaskInner, WaitQueue};
 use lazyinit::LazyInit;
 use linux_raw_sys::{auxvec, general, ioctl, system};
-use memory_addr::{PAGE_SIZE_4K, PageIter4K, VirtAddr};
+use memory_addr::{PageIter4K, VirtAddr, PAGE_SIZE_4K};
 use std::collections::BTreeMap;
 use std::string::{String, ToString};
 use std::sync::Arc;
 use std::vec::Vec;
-use xmas_elf::ElfFile;
 use xmas_elf::header::{Machine, Type as ElfType};
 use xmas_elf::program::{Flags as PhFlags, ProgramHeader, Type as PhType};
+use xmas_elf::ElfFile;
 
 #[cfg(target_arch = "riscv64")]
-use riscv::register::sstatus::{FS, Sstatus};
+use riscv::register::sstatus::{Sstatus, FS};
 
 const USER_ASPACE_BASE: usize = 0x1_0000;
 const USER_ASPACE_SIZE: usize = 0x20_0000_0000;
@@ -84,6 +84,8 @@ const DEVFS_MAGIC: i64 = 0x1373;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 const O_PATH_FLAG: u32 = 0o10000000;
 const PROC_SELF_MAPS_PATH: &str = "/proc/self/maps";
+const AF_UNIX_DOMAIN: i32 = 1;
+const LOCAL_SOCKET_INO_BASE: u64 = 0x5f00_0000;
 const RTC_RD_TIME: u32 = 0x8024_7009;
 const SOL_SOCKET_LEVEL: i32 = 1;
 const SO_REUSEADDR_OPT: i32 = 2;
@@ -187,6 +189,7 @@ enum FdEntry {
     MemoryFile(MemoryFileEntry),
     Pipe(PipeEndpoint),
     Socket(SocketEntry),
+    LocalSocket(LocalSocketEntry),
 }
 
 #[derive(Clone)]
@@ -262,6 +265,16 @@ struct SocketEntry {
     socktype: i32,
     options: Arc<Mutex<SocketOptions>>,
 }
+
+#[derive(Clone)]
+struct LocalSocketEntry {
+    id: usize,
+    socktype: i32,
+    nonblocking: bool,
+    options: Arc<Mutex<SocketOptions>>,
+}
+
+static NEXT_LOCAL_SOCKET_ID: AtomicUsize = AtomicUsize::new(1);
 
 struct LoadedProgram {
     process: Arc<UserProcess>,
@@ -627,6 +640,55 @@ impl SocketEntry {
     fn stat(&self) -> general::stat {
         let mut st: general::stat = unsafe { core::mem::zeroed() };
         st.st_ino = self.posix_fd as _;
+        st.st_mode = ST_MODE_SOCKET | 0o666;
+        st.st_nlink = 1;
+        st.st_blksize = 512;
+        st
+    }
+}
+
+impl LocalSocketEntry {
+    fn new(socktype: i32, flags: i32) -> Self {
+        Self {
+            id: NEXT_LOCAL_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
+            socktype,
+            nonblocking: flags & posix_ctypes::SOCK_NONBLOCK as i32 != 0,
+            options: Arc::new(Mutex::new(SocketOptions::default())),
+        }
+    }
+
+    fn duplicate(&self) -> Self {
+        Self {
+            id: self.id,
+            socktype: self.socktype,
+            nonblocking: self.nonblocking,
+            options: self.options.clone(),
+        }
+    }
+
+    fn read(&self, _dst: &mut [u8]) -> Result<usize, LinuxError> {
+        Err(LinuxError::EINVAL)
+    }
+
+    fn write(&self, _src: &[u8]) -> Result<usize, LinuxError> {
+        Err(LinuxError::EINVAL)
+    }
+
+    fn poll(&self, mode: SelectMode) -> bool {
+        matches!(mode, SelectMode::Write)
+    }
+
+    fn status_flags(&self) -> i32 {
+        let mut flags = self.socktype;
+        if self.nonblocking {
+            flags |= posix_ctypes::SOCK_NONBLOCK as i32;
+        }
+        flags
+    }
+
+    fn stat(&self) -> general::stat {
+        let mut st: general::stat = unsafe { core::mem::zeroed() };
+        st.st_ino = LOCAL_SOCKET_INO_BASE + self.id as u64;
         st.st_mode = ST_MODE_SOCKET | 0o666;
         st.st_nlink = 1;
         st.st_blksize = 512;
@@ -3432,6 +3494,21 @@ fn insert_socket_entry(process: &UserProcess, posix_fd: i32, socktype: i32, flag
     }
 }
 
+fn insert_local_socket_entry(process: &UserProcess, socktype: i32, flags: i32) -> isize {
+    match process.fds.lock().insert_with_flags(
+        FdEntry::LocalSocket(LocalSocketEntry::new(socktype, flags)),
+        fd_cloexec_flag(flags & posix_ctypes::SOCK_CLOEXEC as i32 != 0),
+    ) {
+        Ok(fd) => fd as isize,
+        Err(err) => neg_errno(err),
+    }
+}
+
+fn is_local_socket_fd(process: &UserProcess, fd: usize) -> Result<bool, LinuxError> {
+    let table = process.fds.lock();
+    Ok(matches!(table.entry(fd as i32)?, FdEntry::LocalSocket(_)))
+}
+
 fn sys_socket_bridge(
     process: &UserProcess,
     domain: usize,
@@ -3444,6 +3521,17 @@ fn sys_socket_bridge(
     let flag_mask = (posix_ctypes::SOCK_CLOEXEC | posix_ctypes::SOCK_NONBLOCK) as i32;
     let flags = raw_socktype & flag_mask;
     let base_socktype = raw_socktype & !flag_mask;
+    if domain == AF_UNIX_DOMAIN {
+        if protocol != 0 {
+            return neg_errno_code(LINUX_EPROTONOSUPPORT);
+        }
+        if base_socktype as u32 != posix_ctypes::SOCK_STREAM
+            && base_socktype as u32 != posix_ctypes::SOCK_DGRAM
+        {
+            return neg_errno_code(LINUX_ESOCKTNOSUPPORT);
+        }
+        return insert_local_socket_entry(process, base_socktype, flags);
+    }
     if domain as u32 != posix_ctypes::AF_INET {
         return neg_errno_code(LINUX_EAFNOSUPPORT);
     }
@@ -3511,6 +3599,11 @@ fn sys_accept_bridge(
     addrlen: usize,
     flags: usize,
 ) -> isize {
+    match is_local_socket_fd(process, fd) {
+        Ok(true) => return neg_errno(LinuxError::EINVAL),
+        Ok(false) => {}
+        Err(err) => return neg_errno(err),
+    }
     let socket = match socket_entry(process, fd) {
         Ok(socket) => socket,
         Err(err) => return neg_errno(err),
@@ -5819,7 +5912,11 @@ fn neg_errno_code(code: u32) -> isize {
 }
 
 fn fd_cloexec_flag(enabled: bool) -> u32 {
-    if enabled { general::FD_CLOEXEC } else { 0 }
+    if enabled {
+        general::FD_CLOEXEC
+    } else {
+        0
+    }
 }
 
 fn str_err(err: &'static str) -> String {
@@ -5909,6 +6006,7 @@ impl FdEntry {
             Self::MemoryFile(file) => Ok(Self::MemoryFile(file.clone())),
             Self::Pipe(pipe) => Ok(Self::Pipe(pipe.clone())),
             Self::Socket(socket) => socket.duplicate().map(Self::Socket),
+            Self::LocalSocket(socket) => Ok(Self::LocalSocket(socket.duplicate())),
         }
     }
 }
@@ -5966,6 +6064,7 @@ impl FdTable {
                 FdEntry::Path(_) => false,
                 FdEntry::Pipe(pipe) => pipe.poll().readable,
                 FdEntry::Socket(socket) => socket.poll(mode),
+                FdEntry::LocalSocket(socket) => socket.poll(mode),
             },
             SelectMode::Write => match entry {
                 FdEntry::Stdin => false,
@@ -5974,6 +6073,7 @@ impl FdTable {
                 FdEntry::Directory(_) | FdEntry::Path(_) | FdEntry::MemoryFile(_) => false,
                 FdEntry::Pipe(pipe) => pipe.poll().writable,
                 FdEntry::Socket(socket) => socket.poll(mode),
+                FdEntry::LocalSocket(socket) => socket.poll(mode),
             },
             SelectMode::Except => false,
         }
@@ -5989,6 +6089,7 @@ impl FdTable {
             FdEntry::Directory(_) => Err(LinuxError::EISDIR),
             FdEntry::Pipe(pipe) => pipe.read(dst),
             FdEntry::Socket(socket) => socket.read(dst),
+            FdEntry::LocalSocket(socket) => socket.read(dst),
             _ => Err(LinuxError::EBADF),
         }
     }
@@ -6004,6 +6105,7 @@ impl FdTable {
             FdEntry::File(file) => file.file.write(src).map_err(LinuxError::from),
             FdEntry::Pipe(pipe) => pipe.write(src),
             FdEntry::Socket(socket) => socket.write(src),
+            FdEntry::LocalSocket(socket) => socket.write(src),
             _ => Err(LinuxError::EBADF),
         }
     }
@@ -6114,6 +6216,7 @@ impl FdTable {
             FdEntry::MemoryFile(file) => Ok(file.stat()),
             FdEntry::Pipe(pipe) => Ok(pipe.stat()),
             FdEntry::Socket(socket) => Ok(socket.stat()),
+            FdEntry::LocalSocket(socket) => Ok(socket.stat()),
         }
     }
 
@@ -6127,6 +6230,7 @@ impl FdTable {
             FdEntry::MemoryFile(file) => Some(file.path.as_str()),
             FdEntry::Pipe(_) => Some("pipe:"),
             FdEntry::Socket(_) => Some("socket:"),
+            FdEntry::LocalSocket(_) => Some("socket:"),
             FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => None,
         };
         Ok(generic_statfs(path))
@@ -6169,6 +6273,7 @@ impl FdTable {
             Ok(FdEntry::Rtc) => Ok(generic_statfs(Some("/dev/misc/rtc"))),
             Ok(FdEntry::Pipe(_)) => Ok(generic_statfs(Some("pipe:"))),
             Ok(FdEntry::Socket(_)) => Ok(generic_statfs(Some("socket:"))),
+            Ok(FdEntry::LocalSocket(_)) => Ok(generic_statfs(Some("socket:"))),
             Ok(_) => Ok(generic_statfs(None)),
             Err(err) => Err(err),
         }
@@ -6192,6 +6297,27 @@ impl FdTable {
     fn fcntl(&mut self, fd: i32, cmd: u32, arg: usize) -> Result<i32, LinuxError> {
         if matches!(self.entry(fd)?, FdEntry::Path(_)) && cmd == general::F_GETFL {
             return Ok(O_PATH_FLAG as i32);
+        }
+        let local_socket = match self.entry(fd)? {
+            FdEntry::LocalSocket(socket) => Some(socket.clone()),
+            _ => None,
+        };
+        if let Some(socket) = local_socket {
+            return match cmd {
+                general::F_DUPFD => {
+                    self.insert_min_with_flags(FdEntry::LocalSocket(socket.duplicate()), arg, 0)
+                }
+                general::F_DUPFD_CLOEXEC => self.insert_min_with_flags(
+                    FdEntry::LocalSocket(socket.duplicate()),
+                    arg,
+                    general::FD_CLOEXEC,
+                ),
+                general::F_GETFD => self.get_fd_flags(fd),
+                general::F_SETFD => self.set_fd_flags(fd, arg as u32),
+                general::F_GETFL => Ok(socket.status_flags()),
+                general::F_SETFL => Ok(0),
+                _ => Ok(0),
+            };
         }
         let socket = match self.entry(fd)? {
             FdEntry::Socket(socket) => Some(socket.clone()),
@@ -6244,7 +6370,7 @@ impl FdTable {
             FdEntry::Path(_) => Err(LinuxError::EBADF),
             FdEntry::MemoryFile(file) => file.seek(pos),
             FdEntry::Pipe(_) => Err(LinuxError::ESPIPE),
-            FdEntry::Socket(_) => Err(LinuxError::ESPIPE),
+            FdEntry::Socket(_) | FdEntry::LocalSocket(_) => Err(LinuxError::ESPIPE),
             _ => Err(LinuxError::ESPIPE),
         }
     }
