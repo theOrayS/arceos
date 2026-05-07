@@ -77,6 +77,9 @@ const ST_MODE_CHR: u32 = 0o020000;
 const ST_MODE_SOCKET: u32 = 0o140000;
 const ST_MODE_TYPE_MASK: u32 = 0o170000;
 const FILE_MODE_PERMISSION_MASK: u32 = 0o7777;
+const FILE_MODE_SET_UID: u32 = 0o4000;
+const FILE_MODE_SET_GID: u32 = 0o2000;
+const FILE_MODE_GROUP_EXECUTE: u32 = 0o0010;
 const CHOWN_ID_UNCHANGED: u32 = u32::MAX;
 const STATFS_BLOCK_SIZE: i64 = 4096;
 const STATFS_NAME_MAX: i64 = 255;
@@ -1632,6 +1635,17 @@ impl UserProcess {
 
     fn path_owner(&self, path: &str) -> Option<(u32, u32)> {
         self.path_owners.lock().get(path).copied()
+    }
+
+    fn clear_path_chown_special_bits(&self, path: &str, current_mode: u32) {
+        let mode = self
+            .path_mode(path)
+            .unwrap_or(current_mode & FILE_MODE_PERMISSION_MASK);
+        let mut updated_mode = mode & !FILE_MODE_SET_UID;
+        if mode & FILE_MODE_GROUP_EXECUTE != 0 {
+            updated_mode &= !FILE_MODE_SET_GID;
+        }
+        self.set_path_mode(path.to_string(), updated_mode);
     }
 
     fn groups(&self) -> Vec<u32> {
@@ -3575,7 +3589,10 @@ fn sys_fchown(process: &UserProcess, fd: usize, owner: usize, group: usize) -> i
         return neg_errno(LinuxError::EPERM);
     }
     if let Some(path) = path {
-        process.set_path_owner(path, owner, group);
+        process.set_path_owner(path.clone(), owner, group);
+        if owner.is_some() || group.is_some() {
+            process.clear_path_chown_special_bits(path.as_str(), st.st_mode);
+        }
     }
     0
 }
@@ -3651,7 +3668,10 @@ fn sys_fchownat(
         return neg_errno(LinuxError::EPERM);
     }
     if let Some(path) = record_path {
-        process.set_path_owner(path, owner, group);
+        process.set_path_owner(path.clone(), owner, group);
+        if owner.is_some() || group.is_some() {
+            process.clear_path_chown_special_bits(path.as_str(), st.st_mode);
+        }
     }
     0
 }
@@ -7408,6 +7428,7 @@ fn open_fd_candidates(
             Ok(file) => {
                 if created_by_this_open {
                     process.set_path_mode(path.clone(), mode);
+                    process.set_path_owner(path.clone(), Some(process.uid()), Some(process.gid()));
                 }
                 return Ok(FdEntry::File(FileEntry {
                     file,
