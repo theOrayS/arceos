@@ -76,6 +76,8 @@ const ST_MODE_FILE: u32 = 0o100000;
 const ST_MODE_CHR: u32 = 0o020000;
 const ST_MODE_SOCKET: u32 = 0o140000;
 const ST_MODE_TYPE_MASK: u32 = 0o170000;
+const FILE_MODE_PERMISSION_MASK: u32 = 0o7777;
+const CHOWN_ID_UNCHANGED: u32 = u32::MAX;
 const STATFS_BLOCK_SIZE: i64 = 4096;
 const STATFS_NAME_MAX: i64 = 255;
 const TMPFS_MAGIC: i64 = 0x0102_1994;
@@ -165,8 +167,14 @@ struct UserProcess {
     rlimits: Mutex<BTreeMap<u32, UserRlimit>>,
     signal_actions: Mutex<BTreeMap<usize, general::kernel_sigaction>>,
     path_modes: Mutex<BTreeMap<String, u32>>,
+    path_owners: Mutex<BTreeMap<String, (u32, u32)>>,
+    real_uid: AtomicU32,
     uid: AtomicU32,
+    saved_uid: AtomicU32,
+    real_gid: AtomicU32,
     gid: AtomicU32,
+    saved_gid: AtomicU32,
+    groups: Mutex<Vec<u32>>,
     real_timer_generation: AtomicU64,
     real_timer_deadline_us: AtomicU64,
     real_timer_interval_us: AtomicU64,
@@ -794,8 +802,14 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         rlimits: Mutex::new(BTreeMap::new()),
         signal_actions: Mutex::new(BTreeMap::new()),
         path_modes: Mutex::new(BTreeMap::new()),
+        path_owners: Mutex::new(BTreeMap::new()),
+        real_uid: AtomicU32::new(0),
         uid: AtomicU32::new(0),
+        saved_uid: AtomicU32::new(0),
+        real_gid: AtomicU32::new(0),
         gid: AtomicU32::new(0),
+        saved_gid: AtomicU32::new(0),
+        groups: Mutex::new(Vec::new()),
         real_timer_generation: AtomicU64::new(0),
         real_timer_deadline_us: AtomicU64::new(0),
         real_timer_interval_us: AtomicU64::new(0),
@@ -1533,20 +1547,64 @@ impl UserProcess {
         self.pid.store(pid, Ordering::Release);
     }
 
+    fn real_uid(&self) -> u32 {
+        self.real_uid.load(Ordering::Acquire)
+    }
+
     fn uid(&self) -> u32 {
         self.uid.load(Ordering::Acquire)
+    }
+
+    fn saved_uid(&self) -> u32 {
+        self.saved_uid.load(Ordering::Acquire)
+    }
+
+    fn real_gid(&self) -> u32 {
+        self.real_gid.load(Ordering::Acquire)
     }
 
     fn gid(&self) -> u32 {
         self.gid.load(Ordering::Acquire)
     }
 
+    fn saved_gid(&self) -> u32 {
+        self.saved_gid.load(Ordering::Acquire)
+    }
+
     fn set_uid(&self, uid: u32) {
+        self.real_uid.store(uid, Ordering::Release);
         self.uid.store(uid, Ordering::Release);
+        self.saved_uid.store(uid, Ordering::Release);
     }
 
     fn set_gid(&self, gid: u32) {
+        self.real_gid.store(gid, Ordering::Release);
         self.gid.store(gid, Ordering::Release);
+        self.saved_gid.store(gid, Ordering::Release);
+    }
+
+    fn set_user_ids(&self, real: Option<u32>, effective: Option<u32>, saved: Option<u32>) {
+        if let Some(uid) = real {
+            self.real_uid.store(uid, Ordering::Release);
+        }
+        if let Some(uid) = effective {
+            self.uid.store(uid, Ordering::Release);
+        }
+        if let Some(uid) = saved {
+            self.saved_uid.store(uid, Ordering::Release);
+        }
+    }
+
+    fn set_group_ids(&self, real: Option<u32>, effective: Option<u32>, saved: Option<u32>) {
+        if let Some(gid) = real {
+            self.real_gid.store(gid, Ordering::Release);
+        }
+        if let Some(gid) = effective {
+            self.gid.store(gid, Ordering::Release);
+        }
+        if let Some(gid) = saved {
+            self.saved_gid.store(gid, Ordering::Release);
+        }
     }
 
     fn set_path_mode(&self, path: String, mode: u32) {
@@ -1557,6 +1615,35 @@ impl UserProcess {
 
     fn path_mode(&self, path: &str) -> Option<u32> {
         self.path_modes.lock().get(path).copied()
+    }
+
+    fn set_path_owner(&self, path: String, owner: Option<u32>, group: Option<u32>) {
+        let mut path_owners = self.path_owners.lock();
+        let (current_owner, current_group) =
+            path_owners.get(path.as_str()).copied().unwrap_or((0, 0));
+        path_owners.insert(
+            path,
+            (
+                owner.unwrap_or(current_owner),
+                group.unwrap_or(current_group),
+            ),
+        );
+    }
+
+    fn path_owner(&self, path: &str) -> Option<(u32, u32)> {
+        self.path_owners.lock().get(path).copied()
+    }
+
+    fn groups(&self) -> Vec<u32> {
+        self.groups.lock().clone()
+    }
+
+    fn set_groups(&self, groups: Vec<u32>) {
+        *self.groups.lock() = groups;
+    }
+
+    fn has_group(&self, gid: u32) -> bool {
+        self.gid() == gid || self.groups.lock().contains(&gid)
     }
 
     fn real_timer_active(&self) -> bool {
@@ -1631,8 +1718,14 @@ impl UserProcess {
             rlimits: Mutex::new(self.rlimits.lock().clone()),
             signal_actions: Mutex::new(self.signal_actions.lock().clone()),
             path_modes: Mutex::new(self.path_modes.lock().clone()),
+            path_owners: Mutex::new(self.path_owners.lock().clone()),
+            real_uid: AtomicU32::new(self.real_uid()),
             uid: AtomicU32::new(self.uid()),
+            saved_uid: AtomicU32::new(self.saved_uid()),
+            real_gid: AtomicU32::new(self.real_gid()),
             gid: AtomicU32::new(self.gid()),
+            saved_gid: AtomicU32::new(self.saved_gid()),
+            groups: Mutex::new(self.groups()),
             real_timer_generation: AtomicU64::new(0),
             real_timer_deadline_us: AtomicU64::new(0),
             real_timer_interval_us: AtomicU64::new(0),
@@ -2429,12 +2522,22 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
             tf.arg4(),
             tf.arg5(),
         ),
-        general::__NR_getuid => process.uid() as isize,
+        general::__NR_getuid => process.real_uid() as isize,
         general::__NR_geteuid => process.uid() as isize,
-        general::__NR_getgid => process.gid() as isize,
+        general::__NR_getgid => process.real_gid() as isize,
         general::__NR_getegid => process.gid() as isize,
         general::__NR_setuid => sys_setuid(&process, tf.arg0()),
         general::__NR_setgid => sys_setgid(&process, tf.arg0()),
+        general::__NR_setreuid => sys_setreuid(&process, tf.arg0(), tf.arg1()),
+        general::__NR_setregid => sys_setregid(&process, tf.arg0(), tf.arg1()),
+        general::__NR_setresuid => sys_setresuid(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_getresuid => sys_getresuid(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_setresgid => sys_setresgid(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_getresgid => sys_getresgid(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_setfsuid => sys_setfsuid(&process, tf.arg0()),
+        general::__NR_setfsgid => sys_setfsgid(&process, tf.arg0()),
+        general::__NR_getgroups => sys_getgroups(&process, tf.arg0(), tf.arg1()),
+        general::__NR_setgroups => sys_setgroups(&process, tf.arg0(), tf.arg1()),
         general::__NR_umask => 0,
         general::__NR_prctl => 0,
         general::__NR_setpgid => sys_setpgid(&process, tf.arg0(), tf.arg1()),
@@ -3160,6 +3263,149 @@ fn sys_setgid(process: &UserProcess, gid: usize) -> isize {
     0
 }
 
+fn id_arg_optional(id: usize) -> Result<Option<u32>, LinuxError> {
+    if id == usize::MAX || id == CHOWN_ID_UNCHANGED as usize {
+        return Ok(None);
+    }
+    u32::try_from(id).map(Some).map_err(|_| LinuxError::EINVAL)
+}
+
+fn sys_setreuid(process: &UserProcess, ruid: usize, euid: usize) -> isize {
+    let ruid = match id_arg_optional(ruid) {
+        Ok(uid) => uid,
+        Err(err) => return neg_errno(err),
+    };
+    let euid = match id_arg_optional(euid) {
+        Ok(uid) => uid,
+        Err(err) => return neg_errno(err),
+    };
+    let saved = euid.or(ruid);
+    process.set_user_ids(ruid, euid, saved);
+    0
+}
+
+fn sys_setregid(process: &UserProcess, rgid: usize, egid: usize) -> isize {
+    let rgid = match id_arg_optional(rgid) {
+        Ok(gid) => gid,
+        Err(err) => return neg_errno(err),
+    };
+    let egid = match id_arg_optional(egid) {
+        Ok(gid) => gid,
+        Err(err) => return neg_errno(err),
+    };
+    let saved = egid.or(rgid);
+    process.set_group_ids(rgid, egid, saved);
+    0
+}
+
+fn sys_setresuid(process: &UserProcess, ruid: usize, euid: usize, suid: usize) -> isize {
+    let ruid = match id_arg_optional(ruid) {
+        Ok(uid) => uid,
+        Err(err) => return neg_errno(err),
+    };
+    let euid = match id_arg_optional(euid) {
+        Ok(uid) => uid,
+        Err(err) => return neg_errno(err),
+    };
+    let suid = match id_arg_optional(suid) {
+        Ok(uid) => uid,
+        Err(err) => return neg_errno(err),
+    };
+    process.set_user_ids(ruid, euid, suid);
+    0
+}
+
+fn sys_setresgid(process: &UserProcess, rgid: usize, egid: usize, sgid: usize) -> isize {
+    let rgid = match id_arg_optional(rgid) {
+        Ok(gid) => gid,
+        Err(err) => return neg_errno(err),
+    };
+    let egid = match id_arg_optional(egid) {
+        Ok(gid) => gid,
+        Err(err) => return neg_errno(err),
+    };
+    let sgid = match id_arg_optional(sgid) {
+        Ok(gid) => gid,
+        Err(err) => return neg_errno(err),
+    };
+    process.set_group_ids(rgid, egid, sgid);
+    0
+}
+
+fn sys_getresuid(process: &UserProcess, ruid: usize, euid: usize, suid: usize) -> isize {
+    let values = [process.real_uid(), process.uid(), process.saved_uid()];
+    for (ptr, value) in [ruid, euid, suid].iter().copied().zip(values.iter()) {
+        let ret = write_user_value(process, ptr, value);
+        if ret != 0 {
+            return ret;
+        }
+    }
+    0
+}
+
+fn sys_getresgid(process: &UserProcess, rgid: usize, egid: usize, sgid: usize) -> isize {
+    let values = [process.real_gid(), process.gid(), process.saved_gid()];
+    for (ptr, value) in [rgid, egid, sgid].iter().copied().zip(values.iter()) {
+        let ret = write_user_value(process, ptr, value);
+        if ret != 0 {
+            return ret;
+        }
+    }
+    0
+}
+
+fn sys_setfsuid(process: &UserProcess, uid: usize) -> isize {
+    let old = process.uid();
+    if let Ok(Some(uid)) = id_arg_optional(uid) {
+        process.set_user_ids(None, Some(uid), None);
+    }
+    old as isize
+}
+
+fn sys_setfsgid(process: &UserProcess, gid: usize) -> isize {
+    let old = process.gid();
+    if let Ok(Some(gid)) = id_arg_optional(gid) {
+        process.set_group_ids(None, Some(gid), None);
+    }
+    old as isize
+}
+
+fn sys_getgroups(process: &UserProcess, size: usize, list: usize) -> isize {
+    let groups = process.groups();
+    if size == 0 {
+        return groups.len() as isize;
+    }
+    if size < groups.len() {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    for (idx, gid) in groups.iter().enumerate() {
+        let ret = write_user_value(process, list + idx * size_of::<u32>(), gid);
+        if ret != 0 {
+            return ret;
+        }
+    }
+    groups.len() as isize
+}
+
+fn sys_setgroups(process: &UserProcess, size: usize, list: usize) -> isize {
+    if process.uid() != 0 {
+        return neg_errno(LinuxError::EPERM);
+    }
+    if size > 65_536 {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let mut groups = Vec::new();
+    for idx in 0..size {
+        let gid = match read_user_value::<u32>(process, list + idx * size_of::<u32>()) {
+            Ok(gid) => gid,
+            Err(err) => return neg_errno(err),
+        };
+        groups.push(gid);
+    }
+    process.set_groups(groups);
+    0
+}
+
 fn access_allowed(st: &general::stat, mode: usize, uid: u32, gid: u32) -> bool {
     if mode == 0 {
         return true;
@@ -3302,13 +3548,36 @@ fn sys_fchmodat(
 }
 
 fn sys_fchown(process: &UserProcess, fd: usize, owner: usize, group: usize) -> isize {
-    if !is_supported_chown_request(owner, group) {
+    let owner = match id_arg_optional(owner) {
+        Ok(owner) => owner,
+        Err(err) => return neg_errno(err),
+    };
+    let group = match id_arg_optional(group) {
+        Ok(group) => group,
+        Err(err) => return neg_errno(err),
+    };
+    let (path, st) = {
+        let mut fds = process.fds.lock();
+        let path = match fds.entry(fd as i32) {
+            Ok(entry) => fd_entry_path(entry).map(ToString::to_string),
+            Err(err) => return neg_errno(err),
+        };
+        let st = match fds.stat(fd as i32) {
+            Ok(st) => match path.as_deref() {
+                Some(path) => apply_recorded_path_metadata(process, path, st),
+                None => st,
+            },
+            Err(err) => return neg_errno(err),
+        };
+        (path, st)
+    };
+    if !chown_allowed(process, &st, owner, group) {
         return neg_errno(LinuxError::EPERM);
     }
-    match process.fds.lock().entry(fd as i32) {
-        Ok(_) => 0,
-        Err(err) => neg_errno(err),
+    if let Some(path) = path {
+        process.set_path_owner(path, owner, group);
     }
+    0
 }
 
 fn sys_fchownat(
@@ -3324,46 +3593,89 @@ fn sys_fchownat(
     if flags & !supported_flags != 0 {
         return neg_errno(LinuxError::EINVAL);
     }
-    if !is_supported_chown_request(owner, group) {
-        return neg_errno(LinuxError::EPERM);
-    }
-
+    let owner = match id_arg_optional(owner) {
+        Ok(owner) => owner,
+        Err(err) => return neg_errno(err),
+    };
+    let group = match id_arg_optional(group) {
+        Ok(group) => group,
+        Err(err) => return neg_errno(err),
+    };
     let path = match read_cstr(process, pathname) {
         Ok(path) => path,
         Err(err) => return neg_errno(err),
     };
-    if path.is_empty() {
+    let (record_path, st) = if path.is_empty() {
         if flags & general::AT_EMPTY_PATH == 0 {
             return neg_errno(LinuxError::ENOENT);
         }
         if dirfd as i32 == general::AT_FDCWD {
-            return match axfs::api::metadata(process.cwd().as_str()) {
-                Ok(_) => 0,
-                Err(err) => neg_errno(LinuxError::from(err)),
+            let cwd = process.cwd();
+            let st = match process
+                .fds
+                .lock()
+                .stat_path(process, general::AT_FDCWD, ".")
+            {
+                Ok(st) => st,
+                Err(err) => return neg_errno(err),
             };
+            (Some(cwd), st)
+        } else {
+            let mut fds = process.fds.lock();
+            let record_path = match fds.entry(dirfd as i32) {
+                Ok(entry) => fd_entry_path(entry).map(ToString::to_string),
+                Err(err) => return neg_errno(err),
+            };
+            let st = match fds.stat(dirfd as i32) {
+                Ok(st) => match record_path.as_deref() {
+                    Some(path) => apply_recorded_path_metadata(process, path, st),
+                    None => st,
+                },
+                Err(err) => return neg_errno(err),
+            };
+            (record_path, st)
         }
-        return match process.fds.lock().entry(dirfd as i32) {
-            Ok(_) => 0,
-            Err(err) => neg_errno(err),
+    } else {
+        let mut fds = process.fds.lock();
+        let resolved_path = match fds.resolve_path(process, dirfd as i32, path.as_str()) {
+            Ok(path) => path,
+            Err(err) => return neg_errno(err),
         };
+        let st = match fds.stat_path(process, dirfd as i32, path.as_str()) {
+            Ok(st) => st,
+            Err(err) => return neg_errno(err),
+        };
+        (Some(resolved_path), st)
+    };
+    if !chown_allowed(process, &st, owner, group) {
+        return neg_errno(LinuxError::EPERM);
     }
-
-    match process
-        .fds
-        .lock()
-        .stat_path(process, dirfd as i32, path.as_str())
-    {
-        Ok(_) => 0,
-        Err(err) => neg_errno(err),
+    if let Some(path) = record_path {
+        process.set_path_owner(path, owner, group);
     }
+    0
 }
 
-fn is_supported_chown_request(owner: usize, group: usize) -> bool {
-    is_noop_chown_id(owner) && is_noop_chown_id(group)
-}
-
-fn is_noop_chown_id(id: usize) -> bool {
-    id == 0 || id == u32::MAX as usize || id == usize::MAX
+fn chown_allowed(
+    process: &UserProcess,
+    st: &general::stat,
+    owner: Option<u32>,
+    group: Option<u32>,
+) -> bool {
+    if process.uid() == 0 {
+        return true;
+    }
+    if let Some(owner) = owner {
+        if owner != st.st_uid || owner != process.uid() {
+            return false;
+        }
+    }
+    if let Some(group) = group {
+        if group != st.st_gid && !process.has_group(group) {
+            return false;
+        }
+    }
+    true
 }
 
 fn sys_ftruncate(process: &UserProcess, fd: usize, length: usize) -> isize {
@@ -3478,9 +3790,21 @@ fn sys_newfstatat(
 }
 
 fn sys_fstat(process: &UserProcess, fd: usize, statbuf: usize) -> isize {
-    let st = match process.fds.lock().stat(fd as i32) {
-        Ok(st) => st,
-        Err(err) => return neg_errno(err),
+    let (st, path) = {
+        let mut fds = process.fds.lock();
+        let path = match fds.entry(fd as i32) {
+            Ok(entry) => fd_entry_path(entry).map(ToString::to_string),
+            Err(err) => return neg_errno(err),
+        };
+        let st = match fds.stat(fd as i32) {
+            Ok(st) => st,
+            Err(err) => return neg_errno(err),
+        };
+        (st, path)
+    };
+    let st = match path.as_deref() {
+        Some(path) => apply_recorded_path_metadata(process, path, st),
+        None => st,
     };
     write_user_value(process, statbuf, &st)
 }
@@ -5919,16 +6243,20 @@ fn file_attr_to_stat(attr: &FileAttr, path: Option<&str>) -> general::stat {
 }
 
 fn normalize_file_mode(mode: u32) -> u32 {
-    mode & 0o777
+    mode & FILE_MODE_PERMISSION_MASK
 }
 
-fn apply_recorded_path_mode(
+fn apply_recorded_path_metadata(
     process: &UserProcess,
     path: &str,
     mut st: general::stat,
 ) -> general::stat {
     if let Some(mode) = process.path_mode(path) {
-        st.st_mode = (st.st_mode & !0o777) | mode;
+        st.st_mode = (st.st_mode & !FILE_MODE_PERMISSION_MASK) | mode;
+    }
+    if let Some((uid, gid)) = process.path_owner(path) {
+        st.st_uid = uid;
+        st.st_gid = gid;
     }
     st
 }
@@ -6426,7 +6754,7 @@ impl FdTable {
     ) -> Result<general::stat, LinuxError> {
         match open_fd_entry(process, self, dirfd, path, general::O_RDONLY, 0) {
             Ok(FdEntry::DevNull) | Ok(FdEntry::Rtc) => Ok(stdio_stat(false)),
-            Ok(FdEntry::File(file)) => Ok(apply_recorded_path_mode(
+            Ok(FdEntry::File(file)) => Ok(apply_recorded_path_metadata(
                 process,
                 file.path.as_str(),
                 file_attr_to_stat(
@@ -6434,17 +6762,17 @@ impl FdTable {
                     Some(file.path.as_str()),
                 ),
             )),
-            Ok(FdEntry::Directory(dir)) => Ok(apply_recorded_path_mode(
+            Ok(FdEntry::Directory(dir)) => Ok(apply_recorded_path_metadata(
                 process,
                 dir.path.as_str(),
                 file_attr_to_stat(&dir.attr, Some(dir.path.as_str())),
             )),
-            Ok(FdEntry::Path(path)) => Ok(apply_recorded_path_mode(
+            Ok(FdEntry::Path(path)) => Ok(apply_recorded_path_metadata(
                 process,
                 path.path.as_str(),
                 path.stat(),
             )),
-            Ok(FdEntry::MemoryFile(file)) => Ok(apply_recorded_path_mode(
+            Ok(FdEntry::MemoryFile(file)) => Ok(apply_recorded_path_metadata(
                 process,
                 file.path.as_str(),
                 file.stat(),

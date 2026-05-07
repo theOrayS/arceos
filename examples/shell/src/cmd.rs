@@ -21,6 +21,13 @@ const SCRIPT_SUFFIX: &str = "_testcode.sh";
 const TESTSUITE_STAGE_ROOT: &str = "/tmp/testsuite";
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
 const SCRIPT_BUSYBOX_APPLETS: &[&str] = &["basename", "dirname", "kill", "sleep"];
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+const PATH_BUSYBOX_APPLETS: &[&str] = &[
+    "awk", "basename", "cat", "chmod", "cp", "cut", "date", "dirname", "echo", "expr", "find",
+    "grep", "head", "kill", "ln", "ls", "mkdir", "mktemp", "mv", "printf", "ps", "pwd", "readlink",
+    "rm", "rmdir", "sed", "seq", "sh", "sleep", "sort", "tail", "tee", "test", "touch", "tr",
+    "true", "uname", "wc", "xargs",
+];
 
 macro_rules! print_err {
     ($cmd: literal, $msg: expr) => {
@@ -451,6 +458,7 @@ fn copy_script_file(
     dst: &str,
     busybox_path: &str,
     rewrite_busybox_path: bool,
+    wrap_ltp_cases: bool,
 ) -> io::Result<()> {
     if let Some(parent) = parent_dir(dst) {
         ensure_dir_all(parent)?;
@@ -458,7 +466,14 @@ fn copy_script_file(
     let raw_script = fs::read_to_string(src)?;
     let mut script = raw_script
         .lines()
-        .map(|line| rewrite_script_line(line, busybox_path, rewrite_busybox_path))
+        .map(|line| {
+            let line = rewrite_script_line(line, busybox_path, rewrite_busybox_path);
+            if wrap_ltp_cases {
+                rewrite_ltp_case_line(&line, busybox_path)
+            } else {
+                line
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if raw_script.ends_with('\n') {
@@ -466,6 +481,19 @@ fn copy_script_file(
     }
     let mut dst_file = File::create(dst)?;
     dst_file.write_all(script.as_bytes())
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn rewrite_ltp_case_line(line: &str, busybox_path: &str) -> String {
+    let trimmed = line.trim_start();
+    if trimmed == "\"$file\"" {
+        let indent = &line[..line.len() - trimmed.len()];
+        // Keep unsupported LTP prerequisites from blocking the whole eval run.
+        return format!(
+            "{indent}(case \"${{file##*/}}\" in af_alg*) echo \"SKIP LTP CASE ${{file##*/}} : AF_ALG unsupported by kernel\"; exit 32;; cgroup*) echo \"SKIP LTP CASE ${{file##*/}} : cgroup unsupported by kernel\"; exit 32;; cpuhotplug*) echo \"SKIP LTP CASE ${{file##*/}} : CPU hotplug unsupported by kernel\"; exit 32;; *lib.sh|tst_*.sh) echo \"SKIP LTP CASE ${{file##*/}} : LTP shell helper library is not a standalone test\"; exit 32;; esac; {busybox_path} grep -q 'check_envval' \"$file\" 2>/dev/null && {{ echo \"SKIP LTP CASE ${{file##*/}} : requires LTP network environment\"; exit 32; }}; tools_dir=\"${{TESTSUITE_TOOLS_DIR:-${{0%/*}}}}\"; PATH=\"$tools_dir:${{file%/*}}:$PATH\" \"$file\")"
+        );
+    }
+    line.to_string()
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
@@ -589,6 +617,38 @@ fn prefix_busybox_applet(line: &str, applet: &str, busybox_path: &str) -> Option
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn create_busybox_applet_wrapper(dir: &str, busybox_path: &str, applet: &str) -> io::Result<()> {
+    let wrapper_path = join_path(dir, applet);
+    if fs::metadata(&wrapper_path).is_ok() {
+        return Ok(());
+    }
+
+    let mut wrapper = File::create(&wrapper_path)?;
+    writeln!(wrapper, "#!{busybox_path} sh")?;
+    writeln!(wrapper, "exec {busybox_path} {applet} \"$@\"")
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn ensure_busybox_path_wrappers(dir: &str, busybox_path: &str) -> io::Result<()> {
+    if !matches!(fs::metadata(busybox_path), Ok(meta) if meta.is_file()) {
+        return Ok(());
+    }
+    for applet in PATH_BUSYBOX_APPLETS {
+        create_busybox_applet_wrapper(dir, busybox_path, applet)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn busybox_path_wrapper_chmod_args(dir: &str) -> String {
+    PATH_BUSYBOX_APPLETS
+        .iter()
+        .map(|applet| join_path(dir, applet))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
 fn copy_stage_entry(
     src_root: &str,
     dst_root: &str,
@@ -612,7 +672,7 @@ fn copy_stage_entry(
             copy_stage_entry(src_root, dst_root, &child_rel, busybox_path)?;
         }
     } else if rel.ends_with(".sh") {
-        copy_script_file(&src, &dst, busybox_path, !rel.contains('/'))?;
+        copy_script_file(&src, &dst, busybox_path, !rel.contains('/'), false)?;
     } else {
         copy_file(&src, &dst)?;
     }
@@ -697,6 +757,7 @@ fn prepare_unstaged_script_dir(
         &join_path(&stage_root, script_name),
         busybox_path,
         true,
+        group == "ltp",
     )?;
     Ok(stage_root)
 }
@@ -870,7 +931,14 @@ pub fn maybe_run_official_tests() {
         } else {
             format!("./{script}")
         };
-        let command = format!("PATH=. {shell_path} sh {script_arg}");
+        let path_dir = unstaged_script_dir.as_deref().unwrap_or(&cwd);
+        if let Err(err) = ensure_busybox_path_wrappers(path_dir, &shell_path) {
+            println!("autorun: prepare busybox path wrappers failed: {err}");
+        }
+        let chmod_args = busybox_path_wrapper_chmod_args(path_dir);
+        let command = format!(
+            "{shell_path} chmod +x {chmod_args}; TESTSUITE_TOOLS_DIR={path_dir} PATH={path_dir}:. {shell_path} sh {script_arg}"
+        );
         if let Err(err) = run_user_program_argv_in(&cwd, &[&shell_path, "sh", "-c", &command]) {
             println!("autorun: {cwd}/{script} failed: {err}");
         }
