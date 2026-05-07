@@ -104,13 +104,13 @@ impl TcpSocket {
         }
     }
 
-    /// Returns the local address and port, or
-    /// [`Err(NotConnected)`](AxError::NotConnected) if not connected.
+    /// Returns the bound local address and port, or
+    /// [`Err(NotConnected)`](AxError::NotConnected) if not bound or connected.
     pub fn local_addr(&self) -> AxResult<SocketAddr> {
-        match self.get_state() {
-            STATE_CONNECTED | STATE_LISTENING => {
-                Ok(SocketAddr::from(unsafe { self.local_addr.get().read() }))
-            }
+        let local_addr = unsafe { self.local_addr.get().read() };
+        match (self.get_state(), local_addr) {
+            (STATE_CONNECTED | STATE_LISTENING, _) => Ok(SocketAddr::from(local_addr)),
+            (_, endpoint) if endpoint != UNSPECIFIED_ENDPOINT => Ok(SocketAddr::from(endpoint)),
             _ => Err(AxError::NotConnected),
         }
     }
