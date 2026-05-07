@@ -38,13 +38,30 @@ pub(crate) fn procfs() -> VfsResult<Arc<fs::ramfs::RamFileSystem>> {
     let meminfo = proc_meminfo();
     file_meminfo.write_at(0, meminfo.as_bytes())?;
 
-    // Create /proc/sys/net/core/somaxconn
+    proc_root.create("cpuinfo", VfsNodeType::File)?;
+    let file_cpuinfo = proc_root.clone().lookup("./cpuinfo")?;
+    file_cpuinfo.write_at(0, proc_cpuinfo().as_bytes())?;
+
     proc_root.create("sys", VfsNodeType::Dir)?;
+    proc_root.create("sys/kernel", VfsNodeType::Dir)?;
+    proc_root.create("sys/kernel/tainted", VfsNodeType::File)?;
+    let file_tainted = proc_root.clone().lookup("./sys/kernel/tainted")?;
+    file_tainted.write_at(0, b"0\n")?;
+    proc_root.create("sys/kernel/pid_max", VfsNodeType::File)?;
+    let file_pid_max = proc_root.clone().lookup("./sys/kernel/pid_max")?;
+    file_pid_max.write_at(0, b"4194304\n")?;
+
     proc_root.create("sys/net", VfsNodeType::Dir)?;
     proc_root.create("sys/net/core", VfsNodeType::Dir)?;
     proc_root.create("sys/net/core/somaxconn", VfsNodeType::File)?;
     let file_somaxconn = proc_root.clone().lookup("./sys/net/core/somaxconn")?;
     file_somaxconn.write_at(0, b"4096\n")?;
+    proc_root.create("sys/net/ipv4", VfsNodeType::Dir)?;
+    proc_root.create("sys/net/ipv4/conf", VfsNodeType::Dir)?;
+    proc_root.create("sys/net/ipv4/conf/lo", VfsNodeType::Dir)?;
+    proc_root.create("sys/net/ipv4/conf/lo/tag", VfsNodeType::File)?;
+    let file_lo_tag = proc_root.clone().lookup("./sys/net/ipv4/conf/lo/tag")?;
+    file_lo_tag.write_at(0, b"0\n")?;
 
     // Create /proc/sys/vm/overcommit_memory
     proc_root.create("sys/vm", VfsNodeType::Dir)?;
@@ -52,9 +69,13 @@ pub(crate) fn procfs() -> VfsResult<Arc<fs::ramfs::RamFileSystem>> {
     let file_over = proc_root.clone().lookup("./sys/vm/overcommit_memory")?;
     file_over.write_at(0, b"0\n")?;
 
-    // Create /proc/self/stat
     proc_root.create("self", VfsNodeType::Dir)?;
+    proc_root.create("self/mounts", VfsNodeType::File)?;
+    let file_self_mounts = proc_root.clone().lookup("./self/mounts")?;
+    file_self_mounts.write_at(0, proc_mounts().as_bytes())?;
     proc_root.create("self/stat", VfsNodeType::File)?;
+    let file_self_stat = proc_root.clone().lookup("./self/stat")?;
+    file_self_stat.write_at(0, proc_self_stat().as_bytes())?;
 
     Ok(Arc::new(procfs))
 }
@@ -67,6 +88,29 @@ fn proc_mounts() -> &'static str {
      tmpfs /var tmpfs rw 0 0\n\
      proc /proc proc rw 0 0\n\
      sysfs /sys sysfs rw 0 0\n"
+}
+
+#[cfg(feature = "procfs")]
+fn proc_cpuinfo() -> &'static str {
+    if cfg!(target_arch = "riscv64") {
+        "processor\t: 0\n\
+         hart\t\t: 0\n\
+         isa\t\t: rv64imac\n\
+         mmu\t\t: sv39\n\
+         uarch\t\t: arceos\n"
+    } else if cfg!(target_arch = "loongarch64") {
+        "processor\t: 0\n\
+         model name\t: ArceOS LoongArch64 virtual CPU\n\
+         CPU Family\t: Loongson-64bit\n"
+    } else {
+        "processor\t: 0\n\
+         model name\t: ArceOS virtual CPU\n"
+    }
+}
+
+#[cfg(feature = "procfs")]
+fn proc_self_stat() -> &'static str {
+    "1 (arceos) R 0 1 1 0 -1 4194560 0 0 0 0 1 0 0 0 20 0 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
 }
 
 #[cfg(feature = "procfs")]
