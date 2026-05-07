@@ -84,8 +84,13 @@ const DEVFS_MAGIC: i64 = 0x1373;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
 const O_PATH_FLAG: u32 = 0o10000000;
 const PROC_SELF_MAPS_PATH: &str = "/proc/self/maps";
+const ETC_PASSWD_PATH: &str = "/etc/passwd";
+const ETC_GROUP_PATH: &str = "/etc/group";
 const AF_UNIX_DOMAIN: i32 = 1;
 const LOCAL_SOCKET_INO_BASE: u64 = 0x5f00_0000;
+const DEFAULT_PASSWD_CONTENT: &[u8] =
+    b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n";
+const DEFAULT_GROUP_CONTENT: &[u8] = b"root:x:0:\nnogroup:x:65534:\n";
 const RTC_RD_TIME: u32 = 0x8024_7009;
 const SOL_SOCKET_LEVEL: i32 = 1;
 const SO_REUSEADDR_OPT: i32 = 2;
@@ -5365,9 +5370,16 @@ fn with_writable_slice(
     }
 }
 
+fn user_range_fits(ptr: usize, len: usize) -> bool {
+    len == 0 || ptr.checked_add(len).is_some()
+}
+
 fn user_bytes<'a>(process: &UserProcess, ptr: usize, len: usize, write: bool) -> Option<&'a [u8]> {
     if len == 0 {
         return Some(&[]);
+    }
+    if !user_range_fits(ptr, len) {
+        return None;
     }
     let flags = if write {
         MappingFlags::READ | MappingFlags::WRITE
@@ -5392,6 +5404,9 @@ fn user_bytes_mut<'a>(
 ) -> Option<&'a mut [u8]> {
     if len == 0 {
         return Some(&mut []);
+    }
+    if !user_range_fits(ptr, len) {
+        return None;
     }
     let flags = if write {
         MappingFlags::READ | MappingFlags::WRITE
@@ -5431,6 +5446,9 @@ fn read_user_value<T: Copy>(process: &UserProcess, ptr: usize) -> Result<T, Linu
 
 fn read_cstr(process: &UserProcess, ptr: usize) -> Result<String, LinuxError> {
     if ptr == 0 {
+        return Err(LinuxError::EFAULT);
+    }
+    if !user_range_fits(ptr, 1) {
         return Err(LinuxError::EFAULT);
     }
     if !process
@@ -6655,11 +6673,15 @@ fn is_proc_self_maps_path(path: &str) -> bool {
     normalize_path("/", path).as_deref() == Some(PROC_SELF_MAPS_PATH)
 }
 
-fn proc_self_maps_is_writable_open(flags: u32) -> bool {
+fn synthetic_file_is_writable_open(flags: u32) -> bool {
     let access = flags & general::O_ACCMODE;
     access == general::O_WRONLY
         || access == general::O_RDWR
         || flags & (general::O_TRUNC | general::O_CREAT) != 0
+}
+
+fn proc_self_maps_is_writable_open(flags: u32) -> bool {
+    synthetic_file_is_writable_open(flags)
 }
 
 fn proc_self_maps_fd_entry(process: &UserProcess) -> FdEntry {
@@ -6673,6 +6695,26 @@ fn proc_self_maps_fd_entry(process: &UserProcess) -> FdEntry {
 fn proc_self_maps_path_entry(process: &UserProcess) -> FdEntry {
     let content_len = proc_self_maps_content(process).len();
     FdEntry::Path(PathEntry::synthetic_file(PROC_SELF_MAPS_PATH, content_len))
+}
+
+fn synthetic_userdb_content(path: &str) -> Option<(&'static str, &'static [u8])> {
+    match normalize_path("/", path).as_deref() {
+        Some(ETC_PASSWD_PATH) => Some((ETC_PASSWD_PATH, DEFAULT_PASSWD_CONTENT)),
+        Some(ETC_GROUP_PATH) => Some((ETC_GROUP_PATH, DEFAULT_GROUP_CONTENT)),
+        _ => None,
+    }
+}
+
+fn synthetic_userdb_fd_entry(path: &'static str, data: &'static [u8]) -> FdEntry {
+    FdEntry::MemoryFile(MemoryFileEntry {
+        path: path.into(),
+        data: Arc::new(data.to_vec()),
+        offset: 0,
+    })
+}
+
+fn synthetic_userdb_path_entry(path: &'static str, data: &'static [u8]) -> FdEntry {
+    FdEntry::Path(PathEntry::synthetic_file(path, data.len()))
 }
 
 fn path_entry_from_directory(dir: DirectoryEntry) -> FdEntry {
@@ -6693,6 +6735,12 @@ fn open_path_candidates(
                 return Err(LinuxError::ENOTDIR);
             }
             return Ok(proc_self_maps_path_entry(process));
+        }
+        if let Some((synthetic_path, data)) = synthetic_userdb_content(path.as_str()) {
+            if prefer_dir {
+                return Err(LinuxError::ENOTDIR);
+            }
+            return Ok(synthetic_userdb_path_entry(synthetic_path, data));
         }
         if path == "/dev/null" {
             if prefer_dir {
@@ -6759,6 +6807,15 @@ fn open_fd_candidates(
                 return Err(LinuxError::EPERM);
             }
             return Ok(proc_self_maps_fd_entry(process));
+        }
+        if let Some((synthetic_path, data)) = synthetic_userdb_content(path.as_str()) {
+            if prefer_dir {
+                return Err(LinuxError::ENOTDIR);
+            }
+            if synthetic_file_is_writable_open(flags) {
+                return Err(LinuxError::EPERM);
+            }
+            return Ok(synthetic_userdb_fd_entry(synthetic_path, data));
         }
         if path == "/dev/null" {
             if prefer_dir {
