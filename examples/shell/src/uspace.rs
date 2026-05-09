@@ -130,6 +130,9 @@ const MCAST_JOIN_GROUP_OPT: i32 = 42;
 const MCAST_LEAVE_GROUP_OPT: i32 = 45;
 const TCP_NODELAY_OPT: i32 = 1;
 const TCP_MAXSEG_OPT: i32 = 2;
+const TCP_INFO_OPT: i32 = 11;
+const DEFAULT_TCP_MAXSEG: i32 = 1460;
+const TCP_INFO_COMPAT_SIZE: usize = 256;
 const DEFAULT_SOCKET_BUFFER_SIZE: i32 = 64 * 1024;
 const INTERRUPTIBLE_SOCKET_RECV_QUANTUM: core::time::Duration =
     core::time::Duration::from_millis(20);
@@ -4657,6 +4660,18 @@ fn sys_getsockopt_bridge(
     };
     let level = level as i32;
     let optname = optname as i32;
+    if level == posix_ctypes::IPPROTO_TCP as i32 && optname == TCP_INFO_OPT {
+        if len == 0 {
+            return neg_errno(LinuxError::EINVAL);
+        }
+        let out_len = len.min(TCP_INFO_COMPAT_SIZE);
+        let Some(dst) = user_bytes_mut(process, optval, out_len, true) else {
+            return neg_errno(LinuxError::EFAULT);
+        };
+        dst.fill(0);
+        let out_len = out_len as posix_ctypes::socklen_t;
+        return write_user_value(process, optlen, &out_len);
+    }
     if level == SOL_SOCKET_LEVEL && matches!(optname, SO_RCVTIMEO_OPT | SO_SNDTIMEO_OPT) {
         if len < size_of::<general::timeval>() {
             return neg_errno(LinuxError::EINVAL);
@@ -4695,7 +4710,10 @@ fn sys_getsockopt_bridge(
             _ => return neg_errno(LinuxError::EINVAL),
         }
     } else if level == posix_ctypes::IPPROTO_TCP as i32 && socket_option_supported(level, optname) {
-        0
+        match optname {
+            TCP_MAXSEG_OPT => DEFAULT_TCP_MAXSEG,
+            _ => 0,
+        }
     } else if level == IPPROTO_IP_LEVEL && socket_option_supported(level, optname) {
         0
     } else {
