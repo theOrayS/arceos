@@ -35,10 +35,12 @@ use riscv::register::sstatus::{FS, Sstatus};
 
 mod fd_pipe;
 mod fd_socket;
+mod fd_table;
 mod linux_abi;
 
 use fd_pipe::PipeEndpoint;
 use fd_socket::{LocalSocketEntry, SocketEntry};
+use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, MemoryFileEntry, PathEntry};
 use linux_abi::*;
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -104,54 +106,6 @@ struct BrkState {
     end: usize,
     limit: usize,
     next_mmap: usize,
-}
-
-struct FdTable {
-    entries: Vec<Option<FdEntry>>,
-    fd_flags: Vec<u32>,
-}
-
-enum FdEntry {
-    Stdin,
-    Stdout,
-    Stderr,
-    DevNull,
-    Rtc,
-    File(FileEntry),
-    Directory(DirectoryEntry),
-    Path(PathEntry),
-    MemoryFile(MemoryFileEntry),
-    Pipe(PipeEndpoint),
-    Socket(SocketEntry),
-    LocalSocket(LocalSocketEntry),
-}
-
-#[derive(Clone)]
-struct FileEntry {
-    file: File,
-    path: String,
-}
-
-#[derive(Clone)]
-struct DirectoryEntry {
-    dir: Directory,
-    attr: FileAttr,
-    path: String,
-}
-
-#[derive(Clone)]
-struct PathEntry {
-    path: String,
-    mode: u32,
-    size: u64,
-    blocks: u64,
-}
-
-#[derive(Clone)]
-struct MemoryFileEntry {
-    path: String,
-    data: Arc<Vec<u8>>,
-    offset: usize,
 }
 
 #[derive(Clone)]
