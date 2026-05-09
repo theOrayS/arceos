@@ -14,7 +14,7 @@ use axhal::paging::MappingFlags;
 use axhal::trap::{
     PAGE_FAULT, PageFaultFlags, SYSCALL, register_trap_handler, register_user_return_handler,
 };
-use axio::{PollState, SeekFrom};
+use axio::SeekFrom;
 use axmm::AddrSpace;
 use axns::AxNamespace;
 use axsync::Mutex;
@@ -33,120 +33,11 @@ use xmas_elf::program::{Flags as PhFlags, ProgramHeader, Type as PhType};
 #[cfg(target_arch = "riscv64")]
 use riscv::register::sstatus::{FS, Sstatus};
 
-const USER_ASPACE_BASE: usize = 0x1_0000;
-const USER_ASPACE_SIZE: usize = 0x20_0000_0000;
-const USER_STACK_SIZE: usize = 8 * 1024 * 1024;
-const USER_STACK_GUARD: usize = 0x1_0000;
-const USER_STACK_TOP: usize = USER_ASPACE_BASE + USER_ASPACE_SIZE - USER_STACK_GUARD;
-const USER_MMAP_BASE: usize = 0x10_0000_0000;
-const USER_BRK_GROW_SIZE: usize = 64 * 1024 * 1024;
-const MAX_IN_MEMORY_FILE_SIZE: u64 = 128 * 1024 * 1024;
-const USER_PIE_LOAD_BASE: usize = USER_ASPACE_BASE;
-const MAX_SCRIPT_INTERPRETER_DEPTH: usize = 4;
-const TESTSUITE_STAGE_ROOT: &str = "/tmp/testsuite";
-const AUX_CLOCK_TICKS: usize = 100;
-const SIGCHLD_NUM: isize = 17;
-const SIGKILL_NUM: i32 = 9;
-const SIGALRM_NUM: i32 = 14;
-const SIGCANCEL_NUM: i32 = 33;
-#[cfg(target_arch = "riscv64")]
-const SI_TKILL_CODE: i32 = -6;
-#[cfg(target_arch = "riscv64")]
-const SA_NODEFER_FLAG: u64 = 0x4000_0000;
-const KERNEL_SIGSET_BYTES: usize = size_of::<u64>();
-const SIG_BLOCK_HOW: usize = 0;
-const SIG_UNBLOCK_HOW: usize = 1;
-const SIG_SETMASK_HOW: usize = 2;
-const RLIMIT_STACK_RESOURCE: u32 = 3;
-const RLIMIT_NOFILE_RESOURCE: u32 = 7;
-const DEFAULT_NOFILE_LIMIT: u64 = 1024;
-const FD_SETSIZE: usize = 1024;
-const BITS_PER_USIZE: usize = usize::BITS as usize;
-const FD_SET_WORDS: usize = FD_SETSIZE.div_ceil(BITS_PER_USIZE);
-#[cfg(target_arch = "riscv64")]
-const RISCV_SIGNAL_SIGSET_RESERVED_BYTES: usize = 120;
-#[cfg(target_arch = "riscv64")]
-const RISCV_SIGNAL_FPSTATE_BYTES: usize = 528;
-#[cfg(target_arch = "riscv64")]
-const SS_DISABLE: i32 = 2;
-#[cfg(target_arch = "riscv64")]
-const RISCV_SIGTRAMP_CODE: [u32; 3] = [0x08b0_0893, 0x0000_0073, 0x0010_0073];
+mod fd_pipe;
+mod linux_abi;
 
-const ST_MODE_DIR: u32 = 0o040000;
-const ST_MODE_FILE: u32 = 0o100000;
-const ST_MODE_CHR: u32 = 0o020000;
-const ST_MODE_SOCKET: u32 = 0o140000;
-const ST_MODE_TYPE_MASK: u32 = 0o170000;
-const FILE_MODE_PERMISSION_MASK: u32 = 0o7777;
-const FILE_MODE_SET_UID: u32 = 0o4000;
-const FILE_MODE_SET_GID: u32 = 0o2000;
-const FILE_MODE_GROUP_EXECUTE: u32 = 0o0010;
-const CHOWN_ID_UNCHANGED: u32 = u32::MAX;
-const STATFS_BLOCK_SIZE: i64 = 4096;
-const STATFS_NAME_MAX: i64 = 255;
-const TMPFS_MAGIC: i64 = 0x0102_1994;
-const PROC_SUPER_MAGIC: i64 = 0x9fa0;
-const SYSFS_MAGIC: i64 = 0x6265_6572;
-const DEVFS_MAGIC: i64 = 0x1373;
-const PIPEFS_MAGIC: i64 = 0x5049_5045;
-const SYSV_IPC_PRIVATE: i32 = 0;
-const SYSV_IPC_CREAT: i32 = 0o1000;
-const SYSV_IPC_EXCL: i32 = 0o2000;
-const SYSV_IPC_RMID: i32 = 0;
-const SYSV_IPC_SET: i32 = 1;
-const SYSV_IPC_STAT: i32 = 2;
-const SYSV_SHM_RDONLY: i32 = 0o10000;
-const SYSV_SHM_MAX_SIZE: usize = 16 * 1024 * 1024;
-const O_PATH_FLAG: u32 = 0o10000000;
-const PROC_SELF_MAPS_PATH: &str = "/proc/self/maps";
-const ETC_PASSWD_PATH: &str = "/etc/passwd";
-const ETC_GROUP_PATH: &str = "/etc/group";
-const AF_UNIX_DOMAIN: i32 = 1;
-const LOCAL_SOCKET_INO_BASE: u64 = 0x5f00_0000;
-const LINUX_EACCES: u32 = 13;
-const ACCESS_X_OK: usize = 1;
-const ACCESS_W_OK: usize = 2;
-const ACCESS_R_OK: usize = 4;
-const ACCESS_MODE_MASK: usize = ACCESS_X_OK | ACCESS_W_OK | ACCESS_R_OK;
-const DEFAULT_PASSWD_CONTENT: &[u8] =
-    b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n";
-const DEFAULT_GROUP_CONTENT: &[u8] = b"root:x:0:\nnogroup:x:65534:\n";
-const RTC_RD_TIME: u32 = 0x8024_7009;
-const SOL_SOCKET_LEVEL: i32 = 1;
-const SO_REUSEADDR_OPT: i32 = 2;
-const SO_TYPE_OPT: i32 = 3;
-const SO_ERROR_OPT: i32 = 4;
-const SO_DONTROUTE_OPT: i32 = 5;
-const SO_BROADCAST_OPT: i32 = 6;
-const SO_SNDBUF_OPT: i32 = 7;
-const SO_RCVBUF_OPT: i32 = 8;
-const SO_KEEPALIVE_OPT: i32 = 9;
-const SO_REUSEPORT_OPT: i32 = 15;
-const SO_RCVTIMEO_OPT: i32 = 20;
-const SO_SNDTIMEO_OPT: i32 = 21;
-const IPPROTO_IP_LEVEL: i32 = 0;
-const IP_RECVERR_OPT: i32 = 11;
-const MCAST_JOIN_GROUP_OPT: i32 = 42;
-const MCAST_LEAVE_GROUP_OPT: i32 = 45;
-const TCP_NODELAY_OPT: i32 = 1;
-const TCP_MAXSEG_OPT: i32 = 2;
-const TCP_INFO_OPT: i32 = 11;
-const DEFAULT_TCP_MAXSEG: i32 = 1460;
-const TCP_INFO_COMPAT_SIZE: usize = 256;
-const DEFAULT_SOCKET_BUFFER_SIZE: i32 = 64 * 1024;
-const INTERRUPTIBLE_SOCKET_RECV_QUANTUM: core::time::Duration =
-    core::time::Duration::from_millis(20);
-// Linux UAPI socket errno values used by both RV64 and LA64 targets here.
-const LINUX_EPROTONOSUPPORT: u32 = 93;
-const LINUX_ESOCKTNOSUPPORT: u32 = 94;
-const LINUX_EAFNOSUPPORT: u32 = 97;
-const LINUX_PERSONALITY_QUERY: usize = 0xffff_ffff;
-const LINUX_PERSONALITY_MASK: usize = 0xffff_ffff;
-
-#[cfg(target_arch = "riscv64")]
-const AUX_PLATFORM: &str = "riscv64";
-#[cfg(target_arch = "loongarch64")]
-const AUX_PLATFORM: &str = "loongarch64";
+use fd_pipe::PipeEndpoint;
+use linux_abi::*;
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
 
@@ -278,28 +169,6 @@ struct ChildTask {
 struct UserThreadEntry {
     task: AxTaskRef,
     process: Arc<UserProcess>,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum RingBufferStatus {
-    Full,
-    Empty,
-    Normal,
-}
-
-const PIPE_BUF_SIZE: usize = 256;
-
-struct PipeRingBuffer {
-    data: [u8; PIPE_BUF_SIZE],
-    head: usize,
-    tail: usize,
-    status: RingBufferStatus,
-}
-
-#[derive(Clone)]
-struct PipeEndpoint {
-    readable: bool,
-    buffer: Arc<Mutex<PipeRingBuffer>>,
 }
 
 #[derive(Default)]
@@ -479,149 +348,6 @@ struct UserSchedParam {
 }
 
 const NO_EXIT_GROUP_CODE: i32 = i32::MIN;
-
-impl PipeRingBuffer {
-    const fn new() -> Self {
-        Self {
-            data: [0; PIPE_BUF_SIZE],
-            head: 0,
-            tail: 0,
-            status: RingBufferStatus::Empty,
-        }
-    }
-
-    fn write_byte(&mut self, byte: u8) {
-        self.status = RingBufferStatus::Normal;
-        self.data[self.tail] = byte;
-        self.tail = (self.tail + 1) % PIPE_BUF_SIZE;
-        if self.tail == self.head {
-            self.status = RingBufferStatus::Full;
-        }
-    }
-
-    fn read_byte(&mut self) -> u8 {
-        self.status = RingBufferStatus::Normal;
-        let byte = self.data[self.head];
-        self.head = (self.head + 1) % PIPE_BUF_SIZE;
-        if self.head == self.tail {
-            self.status = RingBufferStatus::Empty;
-        }
-        byte
-    }
-
-    const fn available_read(&self) -> usize {
-        if matches!(self.status, RingBufferStatus::Empty) {
-            0
-        } else if self.tail > self.head {
-            self.tail - self.head
-        } else {
-            self.tail + PIPE_BUF_SIZE - self.head
-        }
-    }
-
-    const fn available_write(&self) -> usize {
-        if matches!(self.status, RingBufferStatus::Full) {
-            0
-        } else {
-            PIPE_BUF_SIZE - self.available_read()
-        }
-    }
-}
-
-impl PipeEndpoint {
-    fn new_pair() -> (Self, Self) {
-        let buffer = Arc::new(Mutex::new(PipeRingBuffer::new()));
-        (
-            Self {
-                readable: true,
-                buffer: buffer.clone(),
-            },
-            Self {
-                readable: false,
-                buffer,
-            },
-        )
-    }
-
-    const fn writable(&self) -> bool {
-        !self.readable
-    }
-
-    fn peer_closed(&self) -> bool {
-        Arc::strong_count(&self.buffer) == 1
-    }
-
-    fn read(&self, dst: &mut [u8]) -> Result<usize, LinuxError> {
-        if !self.readable {
-            return Err(LinuxError::EBADF);
-        }
-        let mut read_len = 0usize;
-        while read_len < dst.len() {
-            let mut ring = self.buffer.lock();
-            let available = ring.available_read();
-            if available == 0 {
-                if read_len > 0 || self.peer_closed() {
-                    return Ok(read_len);
-                }
-                drop(ring);
-                axtask::yield_now();
-                continue;
-            }
-            for _ in 0..available {
-                if read_len == dst.len() {
-                    return Ok(read_len);
-                }
-                dst[read_len] = ring.read_byte();
-                read_len += 1;
-            }
-            if read_len > 0 {
-                return Ok(read_len);
-            }
-        }
-        Ok(read_len)
-    }
-
-    fn write(&self, src: &[u8]) -> Result<usize, LinuxError> {
-        if !self.writable() {
-            return Err(LinuxError::EBADF);
-        }
-        let mut written = 0usize;
-        while written < src.len() {
-            let mut ring = self.buffer.lock();
-            let available = ring.available_write();
-            if available == 0 {
-                drop(ring);
-                axtask::yield_now();
-                continue;
-            }
-            for _ in 0..available {
-                if written == src.len() {
-                    return Ok(written);
-                }
-                ring.write_byte(src[written]);
-                written += 1;
-            }
-        }
-        Ok(written)
-    }
-
-    fn stat(&self) -> general::stat {
-        let mut st: general::stat = unsafe { core::mem::zeroed() };
-        st.st_ino = 1;
-        st.st_mode = 0o010000 | 0o600;
-        st.st_nlink = 1;
-        st.st_blksize = PIPE_BUF_SIZE as _;
-        st
-    }
-
-    fn poll(&self) -> PollState {
-        let ring = self.buffer.lock();
-        PollState {
-            readable: self.readable && (ring.available_read() > 0 || self.peer_closed()),
-            writable: self.writable() && (ring.available_write() > 0 || self.peer_closed()),
-        }
-    }
-}
 
 fn posix_errno_from_ret(ret: isize) -> LinuxError {
     LinuxError::try_from((-ret) as i32).unwrap_or(LinuxError::EIO)
