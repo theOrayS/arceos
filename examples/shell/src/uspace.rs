@@ -34,9 +34,11 @@ use xmas_elf::program::{Flags as PhFlags, ProgramHeader, Type as PhType};
 use riscv::register::sstatus::{FS, Sstatus};
 
 mod fd_pipe;
+mod fd_socket;
 mod linux_abi;
 
 use fd_pipe::PipeEndpoint;
+use fd_socket::{LocalSocketEntry, SocketEntry};
 use linux_abi::*;
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -171,27 +173,6 @@ struct UserThreadEntry {
     process: Arc<UserProcess>,
 }
 
-#[derive(Default)]
-struct SocketOptions {
-    ip_mcast_joined: bool,
-}
-
-#[derive(Clone)]
-struct SocketEntry {
-    posix_fd: i32,
-    socktype: i32,
-    options: Arc<Mutex<SocketOptions>>,
-}
-
-#[derive(Clone)]
-struct LocalSocketEntry {
-    id: usize,
-    socktype: i32,
-    nonblocking: bool,
-    options: Arc<Mutex<SocketOptions>>,
-}
-
-static NEXT_LOCAL_SOCKET_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_SYSV_SHM_ID: AtomicI32 = AtomicI32::new(1);
 
 struct LoadedProgram {
@@ -366,108 +347,6 @@ fn posix_ret_i32(ret: i32) -> Result<i32, LinuxError> {
         Err(posix_errno_from_ret(ret as isize))
     } else {
         Ok(ret)
-    }
-}
-
-impl SocketEntry {
-    fn duplicate(&self) -> Result<Self, LinuxError> {
-        let posix_fd = posix_ret_i32(arceos_posix_api::sys_dup(self.posix_fd))?;
-        Ok(Self {
-            posix_fd,
-            socktype: self.socktype,
-            options: self.options.clone(),
-        })
-    }
-
-    fn read(&self, dst: &mut [u8]) -> Result<usize, LinuxError> {
-        posix_ret_usize(arceos_posix_api::sys_recv(
-            self.posix_fd,
-            dst.as_mut_ptr() as *mut c_void,
-            dst.len(),
-            0,
-        ))
-    }
-
-    fn write(&self, src: &[u8]) -> Result<usize, LinuxError> {
-        posix_ret_usize(arceos_posix_api::sys_send(
-            self.posix_fd,
-            src.as_ptr() as *const c_void,
-            src.len(),
-            0,
-        ))
-    }
-
-    fn close(&self) -> Result<(), LinuxError> {
-        posix_ret_i32(arceos_posix_api::sys_close(self.posix_fd)).map(|_| ())
-    }
-
-    fn poll(&self, mode: SelectMode) -> bool {
-        match arceos_posix_api::poll_file_like(self.posix_fd) {
-            Ok(state) => match mode {
-                SelectMode::Read => state.readable,
-                SelectMode::Write => state.writable,
-                SelectMode::Except => false,
-            },
-            Err(_) => matches!(mode, SelectMode::Except),
-        }
-    }
-
-    fn stat(&self) -> general::stat {
-        let mut st: general::stat = unsafe { core::mem::zeroed() };
-        st.st_ino = self.posix_fd as _;
-        st.st_mode = ST_MODE_SOCKET | 0o666;
-        st.st_nlink = 1;
-        st.st_blksize = 512;
-        st
-    }
-}
-
-impl LocalSocketEntry {
-    fn new(socktype: i32, flags: i32) -> Self {
-        Self {
-            id: NEXT_LOCAL_SOCKET_ID.fetch_add(1, Ordering::Relaxed),
-            socktype,
-            nonblocking: flags & posix_ctypes::SOCK_NONBLOCK as i32 != 0,
-            options: Arc::new(Mutex::new(SocketOptions::default())),
-        }
-    }
-
-    fn duplicate(&self) -> Self {
-        Self {
-            id: self.id,
-            socktype: self.socktype,
-            nonblocking: self.nonblocking,
-            options: self.options.clone(),
-        }
-    }
-
-    fn read(&self, _dst: &mut [u8]) -> Result<usize, LinuxError> {
-        Err(LinuxError::EINVAL)
-    }
-
-    fn write(&self, _src: &[u8]) -> Result<usize, LinuxError> {
-        Err(LinuxError::EINVAL)
-    }
-
-    fn poll(&self, mode: SelectMode) -> bool {
-        matches!(mode, SelectMode::Write)
-    }
-
-    fn status_flags(&self) -> i32 {
-        let mut flags = self.socktype;
-        if self.nonblocking {
-            flags |= posix_ctypes::SOCK_NONBLOCK as i32;
-        }
-        flags
-    }
-
-    fn stat(&self) -> general::stat {
-        let mut st: general::stat = unsafe { core::mem::zeroed() };
-        st.st_ino = LOCAL_SOCKET_INO_BASE + self.id as u64;
-        st.st_mode = ST_MODE_SOCKET | 0o666;
-        st.st_nlink = 1;
-        st.st_blksize = 512;
-        st
     }
 }
 
@@ -3745,11 +3624,7 @@ fn insert_socket_entry(process: &UserProcess, posix_fd: i32, socktype: i32, flag
         }
     }
     match process.fds.lock().insert_with_flags(
-        FdEntry::Socket(SocketEntry {
-            posix_fd,
-            socktype,
-            options: Arc::new(Mutex::new(SocketOptions::default())),
-        }),
+        FdEntry::Socket(SocketEntry::new(posix_fd, socktype)),
         fd_cloexec_flag(flags & posix_ctypes::SOCK_CLOEXEC as i32 != 0),
     ) {
         Ok(fd) => fd as isize,
