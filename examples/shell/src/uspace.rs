@@ -9,6 +9,7 @@ use axalloc::global_allocator;
 use axerrno::LinuxError;
 use axfs::fops::{self, Directory, File, FileAttr, FileType, OpenOptions};
 use axhal::context::{TrapFrame, UspaceContext};
+use axhal::mem::virt_to_phys;
 use axhal::paging::MappingFlags;
 use axhal::trap::{
     PAGE_FAULT, PageFaultFlags, SYSCALL, register_trap_handler, register_user_return_handler,
@@ -88,6 +89,14 @@ const PROC_SUPER_MAGIC: i64 = 0x9fa0;
 const SYSFS_MAGIC: i64 = 0x6265_6572;
 const DEVFS_MAGIC: i64 = 0x1373;
 const PIPEFS_MAGIC: i64 = 0x5049_5045;
+const SYSV_IPC_PRIVATE: i32 = 0;
+const SYSV_IPC_CREAT: i32 = 0o1000;
+const SYSV_IPC_EXCL: i32 = 0o2000;
+const SYSV_IPC_RMID: i32 = 0;
+const SYSV_IPC_SET: i32 = 1;
+const SYSV_IPC_STAT: i32 = 2;
+const SYSV_SHM_RDONLY: i32 = 0o10000;
+const SYSV_SHM_MAX_SIZE: usize = 16 * 1024 * 1024;
 const O_PATH_FLAG: u32 = 0o10000000;
 const PROC_SELF_MAPS_PATH: &str = "/proc/self/maps";
 const ETC_PASSWD_PATH: &str = "/etc/passwd";
@@ -173,6 +182,7 @@ struct UserProcess {
     signal_actions: Mutex<BTreeMap<usize, general::kernel_sigaction>>,
     path_modes: Mutex<BTreeMap<String, u32>>,
     path_owners: Mutex<BTreeMap<String, (u32, u32)>>,
+    shm_attachments: Mutex<BTreeMap<usize, (i32, usize)>>,
     real_uid: AtomicU32,
     uid: AtomicU32,
     saved_uid: AtomicU32,
@@ -248,6 +258,13 @@ struct MemoryFileEntry {
     offset: usize,
 }
 
+#[derive(Clone)]
+struct SysvShmSegment {
+    key: i32,
+    size: usize,
+    backing_vaddr: usize,
+}
+
 struct ChildTask {
     pid: i32,
     task: AxTaskRef,
@@ -303,6 +320,7 @@ struct LocalSocketEntry {
 }
 
 static NEXT_LOCAL_SOCKET_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_SYSV_SHM_ID: AtomicI32 = AtomicI32::new(1);
 
 struct LoadedProgram {
     process: Arc<UserProcess>,
@@ -809,6 +827,7 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         signal_actions: Mutex::new(BTreeMap::new()),
         path_modes: Mutex::new(BTreeMap::new()),
         path_owners: Mutex::new(BTreeMap::new()),
+        shm_attachments: Mutex::new(BTreeMap::new()),
         real_uid: AtomicU32::new(0),
         uid: AtomicU32::new(0),
         saved_uid: AtomicU32::new(0),
@@ -1746,6 +1765,7 @@ impl UserProcess {
             signal_actions: Mutex::new(self.signal_actions.lock().clone()),
             path_modes: Mutex::new(self.path_modes.lock().clone()),
             path_owners: Mutex::new(self.path_owners.lock().clone()),
+            shm_attachments: Mutex::new(self.shm_attachments.lock().clone()),
             real_uid: AtomicU32::new(self.real_uid()),
             uid: AtomicU32::new(self.uid()),
             saved_uid: AtomicU32::new(self.saved_uid()),
@@ -1888,6 +1908,14 @@ fn user_thread_table() -> &'static Mutex<BTreeMap<i32, UserThreadEntry>> {
         USER_THREADS.init_once(Mutex::new(BTreeMap::new()));
     }
     &USER_THREADS
+}
+
+fn sysv_shm_table() -> &'static Mutex<BTreeMap<i32, SysvShmSegment>> {
+    static SYSV_SHM: LazyInit<Mutex<BTreeMap<i32, SysvShmSegment>>> = LazyInit::new();
+    if !SYSV_SHM.is_inited() {
+        SYSV_SHM.init_once(Mutex::new(BTreeMap::new()));
+    }
+    &SYSV_SHM
 }
 
 fn register_user_task(task: AxTaskRef, process: Arc<UserProcess>) {
@@ -2361,6 +2389,9 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         general::__NR_read => sys_read(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_pread64 => sys_pread64(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3()),
         general::__NR_write => sys_write(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_pwrite64 => {
+            sys_pwrite64(&process, tf.arg0(), tf.arg1(), tf.arg2(), tf.arg3())
+        }
         general::__NR_writev => sys_writev(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_readv => sys_readv(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_statfs => sys_statfs(&process, tf.arg0(), tf.arg1()),
@@ -2502,6 +2533,10 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         general::__NR_syslog => sys_syslog(&process, tf.arg0() as i32, tf.arg1(), tf.arg2()),
         general::__NR_gettid => axtask::current().id().as_u64() as isize,
         general::__NR_brk => sys_brk(&process, tf.arg0()),
+        general::__NR_shmget => sys_shmget(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_shmat => sys_shmat(&process, tf.arg0(), tf.arg1(), tf.arg2()),
+        general::__NR_shmdt => sys_shmdt(&process, tf, tf.arg0()),
+        general::__NR_shmctl => sys_shmctl(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_mmap => sys_mmap(
             &process,
             tf.arg0(),
@@ -2658,6 +2693,21 @@ fn sys_pread64(process: &UserProcess, fd: usize, buf: usize, count: usize, offse
 fn sys_write(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize {
     with_readable_slice(process, buf, count, |src| {
         process.fds.lock().write(fd as i32, src)
+    })
+}
+
+fn sys_pwrite64(
+    process: &UserProcess,
+    fd: usize,
+    buf: usize,
+    count: usize,
+    offset: usize,
+) -> isize {
+    with_readable_slice(process, buf, count, |src| {
+        process
+            .fds
+            .lock()
+            .write_file_at(fd as i32, offset as u64, src)
     })
 }
 
@@ -5240,6 +5290,128 @@ fn sys_brk(process: &UserProcess, addr: usize) -> isize {
     brk.end as isize
 }
 
+fn sys_shmget(_process: &UserProcess, key: usize, size: usize, shmflg: usize) -> isize {
+    let key = key as i32;
+    let flags = shmflg as i32;
+    let mut table = sysv_shm_table().lock();
+    if key != SYSV_IPC_PRIVATE {
+        if let Some((shmid, segment)) = table.iter().find(|(_, segment)| segment.key == key) {
+            if flags & SYSV_IPC_CREAT != 0 && flags & SYSV_IPC_EXCL != 0 {
+                return neg_errno(LinuxError::EINVAL);
+            }
+            if size > segment.size {
+                return neg_errno(LinuxError::EINVAL);
+            }
+            return *shmid as isize;
+        }
+        if flags & SYSV_IPC_CREAT == 0 {
+            return neg_errno(LinuxError::ENOENT);
+        }
+    }
+
+    let size = align_up(size.max(1), PAGE_SIZE_4K);
+    if size > SYSV_SHM_MAX_SIZE {
+        return neg_errno(LinuxError::ENOMEM);
+    }
+    let pages = size / PAGE_SIZE_4K;
+    let backing_vaddr = match global_allocator().alloc_pages(pages, PAGE_SIZE_4K) {
+        Ok(vaddr) => vaddr,
+        Err(_) => return neg_errno(LinuxError::ENOMEM),
+    };
+    unsafe {
+        core::ptr::write_bytes(backing_vaddr as *mut u8, 0, size);
+    }
+    let shmid = NEXT_SYSV_SHM_ID.fetch_add(1, Ordering::Relaxed);
+    table.insert(
+        shmid,
+        SysvShmSegment {
+            key,
+            size,
+            backing_vaddr,
+        },
+    );
+    shmid as isize
+}
+
+fn sys_shmat(process: &UserProcess, shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
+    let shmid = shmid as i32;
+    let (size, backing_vaddr) = {
+        let table = sysv_shm_table().lock();
+        let Some(segment) = table.get(&shmid) else {
+            return neg_errno(LinuxError::EINVAL);
+        };
+        (segment.size, segment.backing_vaddr)
+    };
+    let map_flags = if shmflg as i32 & SYSV_SHM_RDONLY != 0 {
+        user_mapping_flags(true, false, false)
+    } else {
+        user_mapping_flags(true, true, false)
+    };
+    let target = {
+        let mut brk = process.brk.lock();
+        let start = if shmaddr == 0 {
+            let start = align_up(brk.next_mmap, PAGE_SIZE_4K);
+            brk.next_mmap = start + size + PAGE_SIZE_4K;
+            start
+        } else {
+            align_down(shmaddr, PAGE_SIZE_4K)
+        };
+        let Some(end) = start.checked_add(size) else {
+            return neg_errno(LinuxError::ENOMEM);
+        };
+        if start < USER_MMAP_BASE || end >= USER_STACK_TOP - USER_STACK_SIZE {
+            return neg_errno(LinuxError::ENOMEM);
+        }
+        start
+    };
+    let paddr = virt_to_phys(VirtAddr::from(backing_vaddr));
+    let map_result = {
+        let mut aspace = process.aspace.lock();
+        if shmaddr != 0 {
+            let _ = aspace.unmap(VirtAddr::from(target), size);
+        }
+        aspace.map_linear(VirtAddr::from(target), paddr, size, map_flags)
+    };
+    if let Err(err) = map_result {
+        return neg_errno(LinuxError::from(err));
+    }
+    process.shm_attachments.lock().insert(target, (shmid, size));
+    target as isize
+}
+
+fn sys_shmdt(process: &UserProcess, tf: &TrapFrame, shmaddr: usize) -> isize {
+    let Some((_shmid, size)) = process.shm_attachments.lock().remove(&shmaddr) else {
+        return neg_errno(LinuxError::EINVAL);
+    };
+    sys_munmap(process, tf, shmaddr, size)
+}
+
+fn sys_shmctl(process: &UserProcess, shmid: usize, cmd: usize, buf: usize) -> isize {
+    let shmid = shmid as i32;
+    let cmd = cmd as i32;
+    let mut table = sysv_shm_table().lock();
+    if !table.contains_key(&shmid) {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    match cmd {
+        SYSV_IPC_RMID => {
+            table.remove(&shmid);
+            0
+        }
+        SYSV_IPC_STAT => {
+            if buf != 0 {
+                let Some(dst) = user_bytes_mut(process, buf, size_of::<usize>() * 16, true) else {
+                    return neg_errno(LinuxError::EFAULT);
+                };
+                dst.fill(0);
+            }
+            0
+        }
+        SYSV_IPC_SET => 0,
+        _ => neg_errno(LinuxError::EINVAL),
+    }
+}
+
 fn sys_mmap(
     process: &UserProcess,
     addr: usize,
@@ -6645,6 +6817,24 @@ impl FdTable {
             FdEntry::LocalSocket(socket) => socket.write(src),
             _ => Err(LinuxError::EBADF),
         }
+    }
+
+    fn write_file_at(&mut self, fd: i32, offset: u64, src: &[u8]) -> Result<usize, LinuxError> {
+        let FdEntry::File(file) = self.entry_mut(fd)? else {
+            return Err(LinuxError::EBADF);
+        };
+        let mut written = 0usize;
+        while written < src.len() {
+            let count = file
+                .file
+                .write_at(offset + written as u64, &src[written..])
+                .map_err(LinuxError::from)?;
+            if count == 0 {
+                break;
+            }
+            written += count;
+        }
+        Ok(written)
     }
 
     fn open(
