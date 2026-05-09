@@ -38,6 +38,7 @@ mod fd_socket;
 mod fd_table;
 mod linux_abi;
 mod signal_abi;
+mod sysv_shm;
 
 use fd_pipe::PipeEndpoint;
 use fd_socket::{LocalSocketEntry, SocketEntry};
@@ -114,13 +115,6 @@ struct BrkState {
     next_mmap: usize,
 }
 
-#[derive(Clone)]
-struct SysvShmSegment {
-    key: i32,
-    size: usize,
-    backing_vaddr: usize,
-}
-
 struct ChildTask {
     pid: i32,
     task: AxTaskRef,
@@ -132,8 +126,6 @@ struct UserThreadEntry {
     task: AxTaskRef,
     process: Arc<UserProcess>,
 }
-
-static NEXT_SYSV_SHM_ID: AtomicI32 = AtomicI32::new(1);
 
 struct LoadedProgram {
     process: Arc<UserProcess>,
@@ -1407,14 +1399,6 @@ fn user_thread_table() -> &'static Mutex<BTreeMap<i32, UserThreadEntry>> {
         USER_THREADS.init_once(Mutex::new(BTreeMap::new()));
     }
     &USER_THREADS
-}
-
-fn sysv_shm_table() -> &'static Mutex<BTreeMap<i32, SysvShmSegment>> {
-    static SYSV_SHM: LazyInit<Mutex<BTreeMap<i32, SysvShmSegment>>> = LazyInit::new();
-    if !SYSV_SHM.is_inited() {
-        SYSV_SHM.init_once(Mutex::new(BTreeMap::new()));
-    }
-    &SYSV_SHM
 }
 
 fn register_user_task(task: AxTaskRef, process: Arc<UserProcess>) {
@@ -4801,56 +4785,16 @@ fn sys_brk(process: &UserProcess, addr: usize) -> isize {
 }
 
 fn sys_shmget(_process: &UserProcess, key: usize, size: usize, shmflg: usize) -> isize {
-    let key = key as i32;
-    let flags = shmflg as i32;
-    let mut table = sysv_shm_table().lock();
-    if key != SYSV_IPC_PRIVATE {
-        if let Some((shmid, segment)) = table.iter().find(|(_, segment)| segment.key == key) {
-            if flags & SYSV_IPC_CREAT != 0 && flags & SYSV_IPC_EXCL != 0 {
-                return neg_errno(LinuxError::EINVAL);
-            }
-            if size > segment.size {
-                return neg_errno(LinuxError::EINVAL);
-            }
-            return *shmid as isize;
-        }
-        if flags & SYSV_IPC_CREAT == 0 {
-            return neg_errno(LinuxError::ENOENT);
-        }
+    match sysv_shm::get_or_create(key, size, shmflg) {
+        Ok(shmid) => shmid as isize,
+        Err(err) => neg_errno(err),
     }
-
-    let size = align_up(size.max(1), PAGE_SIZE_4K);
-    if size > SYSV_SHM_MAX_SIZE {
-        return neg_errno(LinuxError::ENOMEM);
-    }
-    let pages = size / PAGE_SIZE_4K;
-    let backing_vaddr = match global_allocator().alloc_pages(pages, PAGE_SIZE_4K) {
-        Ok(vaddr) => vaddr,
-        Err(_) => return neg_errno(LinuxError::ENOMEM),
-    };
-    unsafe {
-        core::ptr::write_bytes(backing_vaddr as *mut u8, 0, size);
-    }
-    let shmid = NEXT_SYSV_SHM_ID.fetch_add(1, Ordering::Relaxed);
-    table.insert(
-        shmid,
-        SysvShmSegment {
-            key,
-            size,
-            backing_vaddr,
-        },
-    );
-    shmid as isize
 }
 
 fn sys_shmat(process: &UserProcess, shmid: usize, shmaddr: usize, shmflg: usize) -> isize {
     let shmid = shmid as i32;
-    let (size, backing_vaddr) = {
-        let table = sysv_shm_table().lock();
-        let Some(segment) = table.get(&shmid) else {
-            return neg_errno(LinuxError::EINVAL);
-        };
-        (segment.size, segment.backing_vaddr)
+    let Some((size, backing_vaddr)) = sysv_shm::lookup(shmid) else {
+        return neg_errno(LinuxError::EINVAL);
     };
     let map_flags = if shmflg as i32 & SYSV_SHM_RDONLY != 0 {
         user_mapping_flags(true, false, false)
@@ -4899,13 +4843,12 @@ fn sys_shmdt(process: &UserProcess, tf: &TrapFrame, shmaddr: usize) -> isize {
 fn sys_shmctl(process: &UserProcess, shmid: usize, cmd: usize, buf: usize) -> isize {
     let shmid = shmid as i32;
     let cmd = cmd as i32;
-    let mut table = sysv_shm_table().lock();
-    if !table.contains_key(&shmid) {
+    if !sysv_shm::contains(shmid) {
         return neg_errno(LinuxError::EINVAL);
     }
     match cmd {
         SYSV_IPC_RMID => {
-            table.remove(&shmid);
+            sysv_shm::remove(shmid);
             0
         }
         SYSV_IPC_STAT => {
