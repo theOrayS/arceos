@@ -1,5 +1,5 @@
 use core::cmp;
-use core::ffi::{c_char, c_long, c_void, CStr};
+use core::ffi::{CStr, c_char, c_long, c_void};
 use core::mem::{offset_of, size_of};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -11,7 +11,7 @@ use axfs::fops::{self, Directory, File, FileAttr, FileType, OpenOptions};
 use axhal::context::{TrapFrame, UspaceContext};
 use axhal::paging::MappingFlags;
 use axhal::trap::{
-    register_trap_handler, register_user_return_handler, PageFaultFlags, PAGE_FAULT, SYSCALL,
+    PAGE_FAULT, PageFaultFlags, SYSCALL, register_trap_handler, register_user_return_handler,
 };
 use axio::{PollState, SeekFrom};
 use axmm::AddrSpace;
@@ -20,17 +20,17 @@ use axsync::Mutex;
 use axtask::{AxTaskRef, TaskInner, WaitQueue};
 use lazyinit::LazyInit;
 use linux_raw_sys::{auxvec, general, ioctl, system};
-use memory_addr::{PageIter4K, VirtAddr, PAGE_SIZE_4K};
+use memory_addr::{PAGE_SIZE_4K, PageIter4K, VirtAddr};
 use std::collections::BTreeMap;
 use std::string::{String, ToString};
 use std::sync::Arc;
 use std::vec::Vec;
+use xmas_elf::ElfFile;
 use xmas_elf::header::{Machine, Type as ElfType};
 use xmas_elf::program::{Flags as PhFlags, ProgramHeader, Type as PhType};
-use xmas_elf::ElfFile;
 
 #[cfg(target_arch = "riscv64")]
-use riscv::register::sstatus::{Sstatus, FS};
+use riscv::register::sstatus::{FS, Sstatus};
 
 const USER_ASPACE_BASE: usize = 0x1_0000;
 const USER_ASPACE_SIZE: usize = 0x20_0000_0000;
@@ -128,6 +128,8 @@ const INTERRUPTIBLE_SOCKET_RECV_QUANTUM: core::time::Duration =
 const LINUX_EPROTONOSUPPORT: u32 = 93;
 const LINUX_ESOCKTNOSUPPORT: u32 = 94;
 const LINUX_EAFNOSUPPORT: u32 = 97;
+const LINUX_PERSONALITY_QUERY: usize = 0xffff_ffff;
+const LINUX_PERSONALITY_MASK: usize = 0xffff_ffff;
 
 #[cfg(target_arch = "riscv64")]
 const AUX_PLATFORM: &str = "riscv64";
@@ -178,6 +180,7 @@ struct UserProcess {
     gid: AtomicU32,
     saved_gid: AtomicU32,
     groups: Mutex<Vec<u32>>,
+    personality: AtomicUsize,
     real_timer_generation: AtomicU64,
     real_timer_deadline_us: AtomicU64,
     real_timer_interval_us: AtomicU64,
@@ -813,6 +816,7 @@ fn load_program(cwd: &str, argv: &[&str]) -> Result<LoadedProgram, String> {
         gid: AtomicU32::new(0),
         saved_gid: AtomicU32::new(0),
         groups: Mutex::new(Vec::new()),
+        personality: AtomicUsize::new(0),
         real_timer_generation: AtomicU64::new(0),
         real_timer_deadline_us: AtomicU64::new(0),
         real_timer_interval_us: AtomicU64::new(0),
@@ -1586,6 +1590,15 @@ impl UserProcess {
         self.saved_gid.store(gid, Ordering::Release);
     }
 
+    fn personality(&self) -> usize {
+        self.personality.load(Ordering::Acquire)
+    }
+
+    fn set_personality(&self, persona: usize) {
+        self.personality
+            .store(persona & LINUX_PERSONALITY_MASK, Ordering::Release);
+    }
+
     fn set_user_ids(&self, real: Option<u32>, effective: Option<u32>, saved: Option<u32>) {
         if let Some(uid) = real {
             self.real_uid.store(uid, Ordering::Release);
@@ -1740,6 +1753,7 @@ impl UserProcess {
             gid: AtomicU32::new(self.gid()),
             saved_gid: AtomicU32::new(self.saved_gid()),
             groups: Mutex::new(self.groups()),
+            personality: AtomicUsize::new(self.personality()),
             real_timer_generation: AtomicU64::new(0),
             real_timer_deadline_us: AtomicU64::new(0),
             real_timer_interval_us: AtomicU64::new(0),
@@ -2553,6 +2567,7 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         general::__NR_getgroups => sys_getgroups(&process, tf.arg0(), tf.arg1()),
         general::__NR_setgroups => sys_setgroups(&process, tf.arg0(), tf.arg1()),
         general::__NR_umask => 0,
+        general::__NR_personality => sys_personality(&process, tf.arg0()),
         general::__NR_prctl => 0,
         general::__NR_setpgid => sys_setpgid(&process, tf.arg0(), tf.arg1()),
         general::__NR_getpgid => sys_getpgid(&process, tf.arg0()),
@@ -5385,6 +5400,14 @@ fn sys_set_tid_address(_tf: &TrapFrame, _tidptr: usize) -> isize {
     axtask::current().id().as_u64() as isize
 }
 
+fn sys_personality(process: &UserProcess, persona: usize) -> isize {
+    let old = process.personality();
+    if persona != LINUX_PERSONALITY_QUERY {
+        process.set_personality(persona);
+    }
+    old as isize
+}
+
 fn sys_set_robust_list(head: usize, len: usize) -> isize {
     let Some(ext) = current_task_ext() else {
         return neg_errno(LinuxError::EINVAL);
@@ -6430,11 +6453,7 @@ fn neg_errno_code(code: u32) -> isize {
 }
 
 fn fd_cloexec_flag(enabled: bool) -> u32 {
-    if enabled {
-        general::FD_CLOEXEC
-    } else {
-        0
-    }
+    if enabled { general::FD_CLOEXEC } else { 0 }
 }
 
 fn str_err(err: &'static str) -> String {
