@@ -37,11 +37,17 @@ mod fd_pipe;
 mod fd_socket;
 mod fd_table;
 mod linux_abi;
+mod signal_abi;
 
 use fd_pipe::PipeEndpoint;
 use fd_socket::{LocalSocketEntry, SocketEntry};
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, MemoryFileEntry, PathEntry};
 use linux_abi::*;
+#[cfg(target_arch = "riscv64")]
+use signal_abi::{
+    RiscvKernelSigset, RiscvSignalFpState, RiscvSignalFrame, RiscvSignalInfo,
+    RiscvSignalSigcontext, RiscvSignalStack, RiscvSignalUcontext,
+};
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
 
@@ -200,75 +206,6 @@ struct UserRlimit {
     rlim_cur: u64,
     rlim_max: u64,
 }
-
-#[cfg(target_arch = "riscv64")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RiscvSignalInfo {
-    bytes: [u8; 128],
-}
-
-#[cfg(target_arch = "riscv64")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RiscvSignalStack {
-    sp: usize,
-    stack_flags: i32,
-    stack_pad: i32,
-    size: usize,
-}
-
-#[cfg(target_arch = "riscv64")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RiscvKernelSigset {
-    sig: [u64; 1],
-    reserved: [u8; RISCV_SIGNAL_SIGSET_RESERVED_BYTES],
-}
-
-#[cfg(target_arch = "riscv64")]
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-struct RiscvSignalFpState {
-    bytes: [u8; RISCV_SIGNAL_FPSTATE_BYTES],
-}
-
-#[cfg(target_arch = "riscv64")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RiscvSignalSigcontext {
-    gregs: [usize; 32],
-    fpstate: RiscvSignalFpState,
-}
-
-#[cfg(target_arch = "riscv64")]
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RiscvSignalUcontext {
-    flags: usize,
-    link: usize,
-    stack: RiscvSignalStack,
-    sigmask: RiscvKernelSigset,
-    mcontext: RiscvSignalSigcontext,
-}
-
-#[cfg(target_arch = "riscv64")]
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-struct RiscvSignalFrame {
-    info: RiscvSignalInfo,
-    ucontext: RiscvSignalUcontext,
-    trampoline: [u32; 3],
-}
-
-#[cfg(target_arch = "riscv64")]
-const _: [(); RISCV_SIGNAL_FPSTATE_BYTES] = [(); size_of::<RiscvSignalFpState>()];
-#[cfg(target_arch = "riscv64")]
-const _: [(); 784] = [(); size_of::<RiscvSignalSigcontext>()];
-#[cfg(target_arch = "riscv64")]
-const _: [(); 960] = [(); size_of::<RiscvSignalUcontext>()];
-#[cfg(target_arch = "riscv64")]
-const _: [(); 1104] = [(); size_of::<RiscvSignalFrame>()];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
