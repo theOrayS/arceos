@@ -5810,8 +5810,6 @@ fn open_fd_entry(
         opts.create_new(true);
     }
 
-    let prefer_dir = flags & general::O_DIRECTORY != 0;
-    let path_only = flags & O_PATH_FLAG != 0;
     let absolute = path.starts_with('/');
     let exec_root = process.exec_root();
 
@@ -5819,11 +5817,7 @@ fn open_fd_entry(
         let candidates = if absolute {
             if let Some(path) = dev_shm_host_path(path) {
                 ensure_dev_shm_dir()?;
-                return if path_only {
-                    open_path_candidates(process, &[path], prefer_dir)
-                } else {
-                    open_fd_candidates(process, &[path], prefer_dir, &opts, flags, mode)
-                };
+                return open_candidates(process, &[path], &opts, flags, mode);
             }
             runtime_absolute_path_candidates(exec_root.as_str(), path)
         } else {
@@ -5838,11 +5832,7 @@ fn open_fd_entry(
         if candidates.is_empty() {
             return Err(LinuxError::EINVAL);
         }
-        if path_only {
-            open_path_candidates(process, &candidates, prefer_dir)
-        } else {
-            open_fd_candidates(process, &candidates, prefer_dir, &opts, flags, mode)
-        }
+        open_candidates(process, &candidates, &opts, flags, mode)
     } else {
         let FdEntry::Directory(dir) = table.entry(dirfd)? else {
             return Err(LinuxError::ENOTDIR);
@@ -5852,142 +5842,91 @@ fn open_fd_entry(
         for extra in runtime_library_name_candidates(exec_root.as_str(), path) {
             push_runtime_candidate(&mut candidates, Some(extra));
         }
-        if path_only {
-            open_path_candidates(process, &candidates, prefer_dir)
-        } else {
-            open_fd_candidates(process, &candidates, prefer_dir, &opts, flags, mode)
-        }
+        open_candidates(process, &candidates, &opts, flags, mode)
     }
 }
 
-fn path_entry_from_directory(dir: DirectoryEntry) -> FdEntry {
-    FdEntry::Path(PathEntry::from_attr(dir.path.as_str(), &dir.attr))
-}
-
-fn record_missing_candidate(last_err: &mut LinuxError, err: LinuxError) -> Result<(), LinuxError> {
-    *last_err = err;
-    if err == LinuxError::ENOENT {
-        Ok(())
-    } else {
-        Err(err)
-    }
-}
-
-fn open_path_candidates(
+fn open_candidates(
     process: &UserProcess,
     candidates: &[String],
-    prefer_dir: bool,
-) -> Result<FdEntry, LinuxError> {
-    let mut opts = OpenOptions::new();
-    opts.read(true);
-    let mut last_err = LinuxError::ENOENT;
-    for path in candidates {
-        if is_proc_self_maps_path(path.as_str()) {
-            if prefer_dir {
-                return Err(LinuxError::ENOTDIR);
-            }
-            return Ok(proc_self_maps_path_entry(process));
-        }
-        if let Some((synthetic_path, data)) = synthetic_userdb_content(path.as_str()) {
-            if prefer_dir {
-                return Err(LinuxError::ENOTDIR);
-            }
-            return Ok(synthetic_userdb_path_entry(synthetic_path, data));
-        }
-        if path == "/dev/null" {
-            if prefer_dir {
-                return Err(LinuxError::ENOTDIR);
-            }
-            return Ok(FdEntry::Path(PathEntry::synthetic_char("/dev/null")));
-        }
-        if path == "/dev/misc/rtc" || path == "/dev/rtc" {
-            if prefer_dir {
-                return Err(LinuxError::ENOTDIR);
-            }
-            return Ok(FdEntry::Path(PathEntry::synthetic_char(path.as_str())));
-        }
-        if prefer_dir {
-            match open_dir_entry(path.as_str()) {
-                Ok(FdEntry::Directory(dir)) => return Ok(path_entry_from_directory(dir)),
-                Ok(_) => return Err(LinuxError::EINVAL),
-                Err(err) => {
-                    record_missing_candidate(&mut last_err, err)?;
-                }
-            }
-            continue;
-        }
-        match File::open(path.as_str(), &opts) {
-            Ok(file) => {
-                let attr = file.get_attr().map_err(LinuxError::from)?;
-                return Ok(FdEntry::Path(PathEntry::from_attr(path.as_str(), &attr)));
-            }
-            Err(err) => {
-                let err = LinuxError::from(err);
-                if err == LinuxError::EISDIR {
-                    return match open_dir_entry(path.as_str())? {
-                        FdEntry::Directory(dir) => Ok(path_entry_from_directory(dir)),
-                        _ => Err(LinuxError::EINVAL),
-                    };
-                }
-                record_missing_candidate(&mut last_err, err)?;
-            }
-        }
-    }
-    Err(last_err)
-}
-
-fn open_fd_candidates(
-    process: &UserProcess,
-    candidates: &[String],
-    prefer_dir: bool,
     opts: &OpenOptions,
     flags: u32,
     mode: u32,
 ) -> Result<FdEntry, LinuxError> {
+    let prefer_dir = flags & general::O_DIRECTORY != 0;
+    let path_only = flags & O_PATH_FLAG != 0;
+    let mut path_opts = OpenOptions::new();
+    if path_only {
+        path_opts.read(true);
+    }
+    let file_opts = if path_only { &path_opts } else { opts };
     let mut last_err = LinuxError::ENOENT;
     for path in candidates {
         if is_proc_self_maps_path(path.as_str()) {
             if prefer_dir {
                 return Err(LinuxError::ENOTDIR);
             }
-            if proc_self_maps_is_writable_open(flags) {
+            if !path_only && proc_self_maps_is_writable_open(flags) {
                 return Err(LinuxError::EPERM);
             }
-            return Ok(proc_self_maps_fd_entry(process));
+            return Ok(if path_only {
+                proc_self_maps_path_entry(process)
+            } else {
+                proc_self_maps_fd_entry(process)
+            });
         }
         if let Some((synthetic_path, data)) = synthetic_userdb_content(path.as_str()) {
             if prefer_dir {
                 return Err(LinuxError::ENOTDIR);
             }
-            if synthetic_file_is_writable_open(flags) {
+            if !path_only && synthetic_file_is_writable_open(flags) {
                 return Err(LinuxError::EPERM);
             }
-            return Ok(synthetic_userdb_fd_entry(synthetic_path, data));
+            return Ok(if path_only {
+                synthetic_userdb_path_entry(synthetic_path, data)
+            } else {
+                synthetic_userdb_fd_entry(synthetic_path, data)
+            });
         }
         if path == "/dev/null" {
             if prefer_dir {
                 return Err(LinuxError::ENOTDIR);
             }
-            return Ok(FdEntry::DevNull);
+            return Ok(if path_only {
+                FdEntry::Path(PathEntry::synthetic_char("/dev/null"))
+            } else {
+                FdEntry::DevNull
+            });
         }
         if path == "/dev/misc/rtc" || path == "/dev/rtc" {
             if prefer_dir {
                 return Err(LinuxError::ENOTDIR);
             }
-            return Ok(FdEntry::Rtc);
+            return Ok(if path_only {
+                FdEntry::Path(PathEntry::synthetic_char(path.as_str()))
+            } else {
+                FdEntry::Rtc
+            });
         }
         if prefer_dir {
             match open_dir_entry(path.as_str()) {
-                Ok(entry) => return Ok(entry),
-                Err(err) => {
-                    record_missing_candidate(&mut last_err, err)?;
+                Ok(FdEntry::Directory(dir)) if path_only => {
+                    return Ok(path_entry_from_directory(dir));
                 }
+                Ok(entry) if !path_only => return Ok(entry),
+                Ok(_) => return Err(LinuxError::EINVAL),
+                Err(err) => record_missing_candidate(&mut last_err, err)?,
             }
             continue;
         }
-        let created_by_this_open =
-            flags & general::O_CREAT != 0 && axfs::api::metadata(path.as_str()).is_err();
-        match File::open(path.as_str(), opts) {
+        let created_by_this_open = !path_only
+            && flags & general::O_CREAT != 0
+            && axfs::api::metadata(path.as_str()).is_err();
+        match File::open(path.as_str(), file_opts) {
+            Ok(file) if path_only => {
+                let attr = file.get_attr().map_err(LinuxError::from)?;
+                return Ok(FdEntry::Path(PathEntry::from_attr(path.as_str(), &attr)));
+            }
             Ok(file) => {
                 if created_by_this_open {
                     process.set_path_mode(path.clone(), mode);
@@ -6001,13 +5940,30 @@ fn open_fd_candidates(
             Err(err) => {
                 let err = LinuxError::from(err);
                 if err == LinuxError::EISDIR {
-                    return open_dir_entry(path.as_str());
+                    return match open_dir_entry(path.as_str())? {
+                        FdEntry::Directory(dir) if path_only => Ok(path_entry_from_directory(dir)),
+                        entry if !path_only => Ok(entry),
+                        _ => Err(LinuxError::EINVAL),
+                    };
                 }
                 record_missing_candidate(&mut last_err, err)?;
             }
         }
     }
     Err(last_err)
+}
+
+fn path_entry_from_directory(dir: DirectoryEntry) -> FdEntry {
+    FdEntry::Path(PathEntry::from_attr(dir.path.as_str(), &dir.attr))
+}
+
+fn record_missing_candidate(last_err: &mut LinuxError, err: LinuxError) -> Result<(), LinuxError> {
+    *last_err = err;
+    if err == LinuxError::ENOENT {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 fn open_dir_entry(path: &str) -> Result<FdEntry, LinuxError> {
