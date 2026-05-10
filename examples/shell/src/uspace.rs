@@ -2274,12 +2274,8 @@ fn sys_faccessat(
     }
     let path = read_cstr_or_return!(process, pathname);
     let mut fds = process.fds.lock();
-    let resolved_path = match fds.resolve_path(process, dirfd as i32, path.as_str()) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
-    let stat = match fds.stat_path(process, dirfd as i32, path.as_str()) {
-        Ok(stat) => stat,
+    let (resolved_path, stat) = match fds.path_stat(process, dirfd as i32, path.as_str()) {
+        Ok(result) => result,
         Err(err) => return neg_errno(err),
     };
     let uid = process.uid();
@@ -2583,12 +2579,8 @@ fn sys_fchmodat(
     }
 
     let mut fds = process.fds.lock();
-    let resolved_path = match fds.resolve_path(process, dirfd as i32, path.as_str()) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
-    match fds.stat_path(process, dirfd as i32, path.as_str()) {
-        Ok(_) => {
+    match fds.path_stat(process, dirfd as i32, path.as_str()) {
+        Ok((resolved_path, _)) => {
             process.set_path_mode(resolved_path, mode);
             0
         }
@@ -2657,12 +2649,8 @@ fn sys_fchownat(
         }
     } else {
         let mut fds = process.fds.lock();
-        let resolved_path = match fds.resolve_path(process, dirfd as i32, path.as_str()) {
-            Ok(path) => path,
-            Err(err) => return neg_errno(err),
-        };
-        let st = match fds.stat_path(process, dirfd as i32, path.as_str()) {
-            Ok(st) => st,
+        let (resolved_path, st) = match fds.path_stat(process, dirfd as i32, path.as_str()) {
+            Ok(result) => result,
             Err(err) => return neg_errno(err),
         };
         (Some(resolved_path), st)
@@ -5458,6 +5446,17 @@ impl FdTable {
             Ok(_) => Err(LinuxError::EINVAL),
             Err(err) => Err(err),
         }
+    }
+
+    fn path_stat(
+        &mut self,
+        process: &UserProcess,
+        dirfd: i32,
+        path: &str,
+    ) -> Result<(String, general::stat), LinuxError> {
+        let resolved_path = self.resolve_path(process, dirfd, path)?;
+        let st = self.stat_path(process, dirfd, path)?;
+        Ok((resolved_path, st))
     }
 
     fn resolve_path(
