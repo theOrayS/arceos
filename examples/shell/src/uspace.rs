@@ -1644,19 +1644,22 @@ fn sys_pread64(process: &UserProcess, fd: usize, buf: usize, count: usize, offse
         let FdEntry::File(file) = table.entry_mut(fd as i32)? else {
             return Err(LinuxError::EBADF);
         };
-        let mut filled = 0usize;
-        while filled < dst.len() {
-            let read = file
-                .file
-                .read_at(offset as u64 + filled as u64, &mut dst[filled..])
-                .map_err(LinuxError::from)?;
-            if read == 0 {
-                break;
-            }
-            filled += read;
-        }
-        Ok(filled)
+        read_file_at_into(&file.file, offset as u64, dst)
     })
+}
+
+fn read_file_at_into(file: &File, offset: u64, dst: &mut [u8]) -> Result<usize, LinuxError> {
+    let mut filled = 0usize;
+    while filled < dst.len() {
+        let read = file
+            .read_at(offset + filled as u64, &mut dst[filled..])
+            .map_err(LinuxError::from)?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
 }
 
 fn sys_write(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize {
@@ -2943,20 +2946,28 @@ fn sys_fcntl(process: &UserProcess, fd: usize, cmd: usize, arg: usize) -> isize 
 }
 
 fn validate_user_read(process: &UserProcess, ptr: usize, len: usize) -> Result<(), LinuxError> {
-    if len == 0 {
-        return Ok(());
-    }
-    if ptr == 0 || user_bytes(process, ptr, len, false).is_none() {
-        return Err(LinuxError::EFAULT);
-    }
-    Ok(())
+    validate_user_access(process, ptr, len, false)
 }
 
 fn validate_user_write(process: &UserProcess, ptr: usize, len: usize) -> Result<(), LinuxError> {
+    validate_user_access(process, ptr, len, true)
+}
+
+fn validate_user_access(
+    process: &UserProcess,
+    ptr: usize,
+    len: usize,
+    write: bool,
+) -> Result<(), LinuxError> {
     if len == 0 {
         return Ok(());
     }
-    if ptr == 0 || user_bytes_mut(process, ptr, len, true).is_none() {
+    let valid = if write {
+        user_bytes_mut(process, ptr, len, true).is_some()
+    } else {
+        user_bytes(process, ptr, len, false).is_some()
+    };
+    if ptr == 0 || !valid {
         return Err(LinuxError::EFAULT);
     }
     Ok(())
@@ -5488,29 +5499,27 @@ impl FdTable {
         }
     }
 
-    fn close(&mut self, fd: i32) -> Result<(), LinuxError> {
-        if !(0..self.entries.len() as i32).contains(&fd) || self.entries[fd as usize].is_none() {
-            return Err(LinuxError::EBADF);
-        }
-        if let Some(FdEntry::Socket(socket)) = self.entries[fd as usize].as_ref() {
+    fn close_slot(&mut self, idx: usize) -> Result<(), LinuxError> {
+        if let Some(FdEntry::Socket(socket)) = self.entries[idx].as_ref() {
             socket.close()?;
         }
-        self.entries[fd as usize] = None;
-        if let Some(flags) = self.fd_flags.get_mut(fd as usize) {
+        self.entries[idx] = None;
+        if let Some(flags) = self.fd_flags.get_mut(idx) {
             *flags = 0;
         }
         Ok(())
     }
 
+    fn close(&mut self, fd: i32) -> Result<(), LinuxError> {
+        if !(0..self.entries.len() as i32).contains(&fd) || self.entries[fd as usize].is_none() {
+            return Err(LinuxError::EBADF);
+        }
+        self.close_slot(fd as usize)
+    }
+
     fn close_all(&mut self) {
-        for (idx, entry) in self.entries.iter_mut().enumerate() {
-            if let Some(FdEntry::Socket(socket)) = entry.as_ref() {
-                let _ = socket.close();
-            }
-            *entry = None;
-            if let Some(flags) = self.fd_flags.get_mut(idx) {
-                *flags = 0;
-            }
+        for idx in 0..self.entries.len() {
+            let _ = self.close_slot(idx);
         }
     }
 
@@ -5519,13 +5528,7 @@ impl FdTable {
             if self.fd_flags.get(idx).copied().unwrap_or(0) & general::FD_CLOEXEC == 0 {
                 continue;
             }
-            if let Some(FdEntry::Socket(socket)) = self.entries[idx].as_ref() {
-                let _ = socket.close();
-            }
-            self.entries[idx] = None;
-            if let Some(flags) = self.fd_flags.get_mut(idx) {
-                *flags = 0;
-            }
+            let _ = self.close_slot(idx);
         }
     }
 
@@ -5840,17 +5843,7 @@ impl FdTable {
             return Err(LinuxError::EBADF);
         };
         let mut buf = vec![0u8; len];
-        let mut filled = 0usize;
-        while filled < buf.len() {
-            let read = file
-                .file
-                .read_at(offset + filled as u64, &mut buf[filled..])
-                .map_err(LinuxError::from)?;
-            if read == 0 {
-                break;
-            }
-            filled += read;
-        }
+        let filled = read_file_at_into(&file.file, offset, &mut buf)?;
         buf.truncate(filled);
         Ok(buf)
     }
