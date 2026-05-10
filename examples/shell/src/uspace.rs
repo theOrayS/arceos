@@ -104,6 +104,15 @@ macro_rules! return_errno_if {
     };
 }
 
+macro_rules! return_on_fd_set_write_error {
+    ($process:expr, $ptr:expr, $bits:expr) => {
+        let ret = write_fd_set($process, $ptr, $bits);
+        if ret != 0 {
+            return ret;
+        }
+    };
+}
+
 struct UserTaskExt {
     process: Arc<UserProcess>,
     clear_child_tid: AtomicUsize,
@@ -1867,18 +1876,9 @@ fn sys_pselect6(
             count
         };
         if ready > 0 {
-            let ret = write_fd_set(process, readfds, &ready_read);
-            if ret != 0 {
-                return ret;
-            }
-            let ret = write_fd_set(process, writefds, &ready_write);
-            if ret != 0 {
-                return ret;
-            }
-            let ret = write_fd_set(process, exceptfds, &ready_except);
-            if ret != 0 {
-                return ret;
-            }
+            return_on_fd_set_write_error!(process, readfds, &ready_read);
+            return_on_fd_set_write_error!(process, writefds, &ready_write);
+            return_on_fd_set_write_error!(process, exceptfds, &ready_except);
             // In this cooperative single-core environment, a hot readiness loop
             // can otherwise starve the peer process that would consume the event.
             axtask::yield_now();
@@ -1886,18 +1886,9 @@ fn sys_pselect6(
         }
         if deadline.is_some_and(|ddl| axhal::time::wall_time() >= ddl) {
             axtask::yield_now();
-            let ret = write_fd_set(process, readfds, &[0; FD_SET_WORDS]);
-            if ret != 0 {
-                return ret;
-            }
-            let ret = write_fd_set(process, writefds, &[0; FD_SET_WORDS]);
-            if ret != 0 {
-                return ret;
-            }
-            let ret = write_fd_set(process, exceptfds, &[0; FD_SET_WORDS]);
-            if ret != 0 {
-                return ret;
-            }
+            return_on_fd_set_write_error!(process, readfds, &[0; FD_SET_WORDS]);
+            return_on_fd_set_write_error!(process, writefds, &[0; FD_SET_WORDS]);
+            return_on_fd_set_write_error!(process, exceptfds, &[0; FD_SET_WORDS]);
             return 0;
         }
         axtask::yield_now();
