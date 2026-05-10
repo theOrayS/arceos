@@ -5996,6 +5996,15 @@ fn path_entry_from_directory(dir: DirectoryEntry) -> FdEntry {
     FdEntry::Path(PathEntry::from_attr(dir.path.as_str(), &dir.attr))
 }
 
+fn record_missing_candidate(last_err: &mut LinuxError, err: LinuxError) -> Result<(), LinuxError> {
+    *last_err = err;
+    if err == LinuxError::ENOENT {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
 fn open_path_candidates(
     process: &UserProcess,
     candidates: &[String],
@@ -6034,10 +6043,7 @@ fn open_path_candidates(
                 Ok(FdEntry::Directory(dir)) => return Ok(path_entry_from_directory(dir)),
                 Ok(_) => return Err(LinuxError::EINVAL),
                 Err(err) => {
-                    last_err = err;
-                    if err != LinuxError::ENOENT {
-                        return Err(err);
-                    }
+                    record_missing_candidate(&mut last_err, err)?;
                 }
             }
             continue;
@@ -6055,10 +6061,7 @@ fn open_path_candidates(
                         _ => Err(LinuxError::EINVAL),
                     };
                 }
-                last_err = err;
-                if err != LinuxError::ENOENT {
-                    return Err(err);
-                }
+                record_missing_candidate(&mut last_err, err)?;
             }
         }
     }
@@ -6109,10 +6112,7 @@ fn open_fd_candidates(
             match open_dir_entry(path.as_str()) {
                 Ok(entry) => return Ok(entry),
                 Err(err) => {
-                    last_err = err;
-                    if err != LinuxError::ENOENT {
-                        return Err(err);
-                    }
+                    record_missing_candidate(&mut last_err, err)?;
                 }
             }
             continue;
@@ -6135,10 +6135,7 @@ fn open_fd_candidates(
                 if err == LinuxError::EISDIR {
                     return open_dir_entry(path.as_str());
                 }
-                last_err = err;
-                if err != LinuxError::ENOENT {
-                    return Err(err);
-                }
+                record_missing_candidate(&mut last_err, err)?;
             }
         }
     }
