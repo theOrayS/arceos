@@ -69,6 +69,15 @@ macro_rules! user_trace {
     ($($arg:tt)*) => {};
 }
 
+macro_rules! return_on_user_write_error {
+    ($process:expr, $ptr:expr, $value:expr) => {
+        let ret = write_user_value($process, $ptr, $value);
+        if ret != 0 {
+            return ret;
+        }
+    };
+}
+
 struct UserTaskExt {
     process: Arc<UserProcess>,
     clear_child_tid: AtomicUsize,
@@ -1722,10 +1731,7 @@ fn sys_get_mempolicy(
 ) -> isize {
     if mode != 0 {
         let default_mode = 0i32;
-        let ret = write_user_value(process, mode, &default_mode);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, mode, &default_mode);
     }
     let mask_len = nodemask_len(maxnode);
     if nodemask != 0 && mask_len != 0 {
@@ -2189,10 +2195,7 @@ fn sys_wait4(
     user_trace!("user-wait4: requested pid={pid}, child={child_pid}, exit={exit_code}");
     if status != 0 {
         let wait_status = (exit_code & 0xff) << 8;
-        let ret = write_user_value(process, status, &wait_status);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, status, &wait_status);
     }
     child_pid as isize
 }
@@ -2375,10 +2378,7 @@ where
 
 fn write_id_triplet(process: &UserProcess, ptrs: [usize; 3], values: [u32; 3]) -> isize {
     for (ptr, value) in ptrs.into_iter().zip(values.into_iter()) {
-        let ret = write_user_value(process, ptr, &value);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, ptr, &value);
     }
     0
 }
@@ -2432,10 +2432,7 @@ fn sys_getgroups(process: &UserProcess, size: usize, list: usize) -> isize {
         return neg_errno(LinuxError::EINVAL);
     }
     for (idx, gid) in groups.iter().enumerate() {
-        let ret = write_user_value(process, list + idx * size_of::<u32>(), gid);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, list + idx * size_of::<u32>(), gid);
     }
     groups.len() as isize
 }
@@ -3659,10 +3656,7 @@ fn sys_getsockopt_bridge(
             Ok(timeout) => socket_duration_to_timeval(timeout),
             Err(err) => return neg_errno(err),
         };
-        let ret = write_user_value(process, optval, &value);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, optval, &value);
         let out_len = size_of::<general::timeval>() as posix_ctypes::socklen_t;
         return write_user_value(process, optlen, &out_len);
     }
@@ -3690,10 +3684,7 @@ fn sys_getsockopt_bridge(
     } else {
         return neg_errno(LinuxError::EINVAL);
     };
-    let ret = write_user_value(process, optval, &value);
-    if ret != 0 {
-        return ret;
-    }
+    return_on_user_write_error!(process, optval, &value);
     let out_len = size_of::<i32>() as posix_ctypes::socklen_t;
     write_user_value(process, optlen, &out_len)
 }
@@ -3834,20 +3825,14 @@ fn sys_gettimeofday(process: &UserProcess, tv: usize, tz: usize) -> isize {
             tv_sec: now.as_secs() as _,
             tv_usec: now.subsec_micros() as _,
         };
-        let ret = write_user_value(process, tv, &value);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, tv, &value);
     }
     if tz != 0 {
         let value = general::timezone {
             tz_minuteswest: 0,
             tz_dsttime: 0,
         };
-        let ret = write_user_value(process, tz, &value);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, tz, &value);
     }
     0
 }
@@ -3863,10 +3848,7 @@ fn sys_setitimer(
     }
     if old_value != 0 {
         let value = current_real_itimer(process);
-        let ret = write_user_value(process, old_value, &value);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, old_value, &value);
     }
 
     let new_timer = if new_value == 0 {
@@ -3915,10 +3897,7 @@ fn sys_times(process: &UserProcess, buf: usize) -> isize {
         tms_cutime: 0,
         tms_cstime: 0,
     };
-    let ret = write_user_value(process, buf, &tms);
-    if ret != 0 {
-        return ret;
-    }
+    return_on_user_write_error!(process, buf, &tms);
     axhal::time::monotonic_time().as_millis() as isize
 }
 
@@ -4072,10 +4051,7 @@ fn sys_nanosleep(process: &UserProcess, req: usize, rem: usize) -> isize {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        let ret = write_user_value(process, rem, &zero);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, rem, &zero);
     }
     0
 }
@@ -4550,10 +4526,7 @@ fn sys_get_robust_list(process: &UserProcess, pid: i32, head_ptr: usize, len_ptr
     };
     let head = ext.robust_list_head.load(Ordering::Acquire);
     let len = ext.robust_list_len.load(Ordering::Acquire);
-    let ret = write_user_value(process, head_ptr, &head);
-    if ret != 0 {
-        return ret;
-    }
+    return_on_user_write_error!(process, head_ptr, &head);
     write_user_value(process, len_ptr, &len)
 }
 
@@ -4666,10 +4639,7 @@ fn sys_rt_sigaction(
             .get(&signum)
             .copied()
             .unwrap_or_else(|| unsafe { core::mem::zeroed() });
-        let ret = write_user_value(process, oldact, &old);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, oldact, &old);
     }
 
     if let Some(new_action) = new_action {
@@ -4905,10 +4875,7 @@ fn sys_prlimit64(
 
     if old_limit != 0 {
         let current = process.get_rlimit(resource);
-        let ret = write_user_value(process, old_limit, &current);
-        if ret != 0 {
-            return ret;
-        }
+        return_on_user_write_error!(process, old_limit, &current);
     }
 
     if new_limit != 0 {
