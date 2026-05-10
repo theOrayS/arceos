@@ -2598,12 +2598,8 @@ fn sys_fchmodat(
 }
 
 fn sys_fchown(process: &UserProcess, fd: usize, owner: usize, group: usize) -> isize {
-    let owner = match id_arg_optional(owner) {
-        Ok(owner) => owner,
-        Err(err) => return neg_errno(err),
-    };
-    let group = match id_arg_optional(group) {
-        Ok(group) => group,
+    let (owner, group) = match chown_ids(owner, group) {
+        Ok(ids) => ids,
         Err(err) => return neg_errno(err),
     };
     let (path, st) = {
@@ -2621,16 +2617,7 @@ fn sys_fchown(process: &UserProcess, fd: usize, owner: usize, group: usize) -> i
         };
         (path, st)
     };
-    if !chown_allowed(process, &st, owner, group) {
-        return neg_errno(LinuxError::EPERM);
-    }
-    if let Some(path) = path {
-        process.set_path_owner(path.clone(), owner, group);
-        if owner.is_some() || group.is_some() {
-            process.clear_path_chown_special_bits(path.as_str(), st.st_mode);
-        }
-    }
-    0
+    apply_chown_metadata(process, path, &st, owner, group)
 }
 
 fn sys_fchownat(
@@ -2646,12 +2633,8 @@ fn sys_fchownat(
     if flags & !supported_flags != 0 {
         return neg_errno(LinuxError::EINVAL);
     }
-    let owner = match id_arg_optional(owner) {
-        Ok(owner) => owner,
-        Err(err) => return neg_errno(err),
-    };
-    let group = match id_arg_optional(group) {
-        Ok(group) => group,
+    let (owner, group) = match chown_ids(owner, group) {
+        Ok(ids) => ids,
         Err(err) => return neg_errno(err),
     };
     let path = match read_cstr(process, pathname) {
@@ -2700,10 +2683,24 @@ fn sys_fchownat(
         };
         (Some(resolved_path), st)
     };
-    if !chown_allowed(process, &st, owner, group) {
+    apply_chown_metadata(process, record_path, &st, owner, group)
+}
+
+fn chown_ids(owner: usize, group: usize) -> Result<(Option<u32>, Option<u32>), LinuxError> {
+    Ok((id_arg_optional(owner)?, id_arg_optional(group)?))
+}
+
+fn apply_chown_metadata(
+    process: &UserProcess,
+    path: Option<String>,
+    st: &general::stat,
+    owner: Option<u32>,
+    group: Option<u32>,
+) -> isize {
+    if !chown_allowed(process, st, owner, group) {
         return neg_errno(LinuxError::EPERM);
     }
-    if let Some(path) = record_path {
+    if let Some(path) = path {
         process.set_path_owner(path.clone(), owner, group);
         if owner.is_some() || group.is_some() {
             process.clear_path_chown_special_bits(path.as_str(), st.st_mode);
