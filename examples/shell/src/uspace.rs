@@ -982,6 +982,13 @@ fn deliver_user_signal(entry: &UserThreadEntry, sig: i32) -> Result<(), LinuxErr
     Ok(())
 }
 
+fn deliver_user_signal_result(entry: &UserThreadEntry, sig: i32) -> isize {
+    match deliver_user_signal(entry, sig) {
+        Ok(()) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
 fn futex_state(uaddr: usize) -> Arc<FutexState> {
     let mut table = futex_table().lock();
     table
@@ -4734,13 +4741,7 @@ fn sys_kill(process: &UserProcess, pid: i32, sig: i32) -> isize {
         let Some(entry) = user_thread_entry_for_process(process) else {
             return neg_errno(LinuxError::ESRCH);
         };
-        if sig == 0 {
-            return 0;
-        }
-        if let Err(err) = deliver_user_signal(&entry, sig) {
-            return neg_errno(err);
-        }
-        return 0;
+        return deliver_user_signal_result(&entry, sig);
     }
     let Some(entry) = process
         .child_thread_entry_by_pid(pid)
@@ -4748,13 +4749,7 @@ fn sys_kill(process: &UserProcess, pid: i32, sig: i32) -> isize {
     else {
         return neg_errno(LinuxError::ESRCH);
     };
-    if sig == 0 {
-        return 0;
-    }
-    if let Err(err) = deliver_user_signal(&entry, sig) {
-        return neg_errno(err);
-    }
-    0
+    deliver_user_signal_result(&entry, sig)
 }
 
 fn sys_tkill(process: &UserProcess, tid: i32, sig: i32) -> isize {
@@ -4777,10 +4772,7 @@ fn sys_tkill(process: &UserProcess, tid: i32, sig: i32) -> isize {
             current_tid()
         );
     }
-    if let Err(err) = deliver_user_signal(&entry, sig) {
-        return neg_errno(err);
-    }
-    0
+    deliver_user_signal_result(&entry, sig)
 }
 
 fn sys_tgkill(process: &UserProcess, tgid: i32, tid: i32, sig: i32) -> isize {
@@ -4801,10 +4793,7 @@ fn sys_tgkill(process: &UserProcess, tgid: i32, tid: i32, sig: i32) -> isize {
             tgid,
         );
     }
-    if let Err(err) = deliver_user_signal(&entry, sig) {
-        return neg_errno(err);
-    }
-    0
+    deliver_user_signal_result(&entry, sig)
 }
 
 fn sys_prlimit64(
