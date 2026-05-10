@@ -45,8 +45,8 @@ use fd_socket::{LocalSocketEntry, SocketEntry};
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, MemoryFileEntry, PathEntry};
 use linux_abi::*;
 use metadata::{
-    apply_recorded_path_metadata, canonical_permission_path, fd_entry_path, file_attr_to_stat,
-    file_type_mode, generic_statfs, normalize_file_mode, path_inode,
+    apply_recorded_path_metadata, canonical_permission_path, fd_entry_path, fd_entry_statfs_path,
+    file_attr_to_stat, file_type_mode, generic_statfs, normalize_file_mode, path_inode,
 };
 use program_loader::load_program_image;
 use runtime_paths::{
@@ -5561,19 +5561,7 @@ impl FdTable {
     }
 
     fn statfs(&self, fd: i32) -> Result<general::statfs, LinuxError> {
-        let path = match self.entry(fd)? {
-            FdEntry::DevNull => Some("/dev/null"),
-            FdEntry::Rtc => Some("/dev/misc/rtc"),
-            FdEntry::File(file) => Some(file.path.as_str()),
-            FdEntry::Directory(dir) => Some(dir.path.as_str()),
-            FdEntry::Path(path) => Some(path.path.as_str()),
-            FdEntry::MemoryFile(file) => Some(file.path.as_str()),
-            FdEntry::Pipe(_) => Some("pipe:"),
-            FdEntry::Socket(_) => Some("socket:"),
-            FdEntry::LocalSocket(_) => Some("socket:"),
-            FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => None,
-        };
-        Ok(generic_statfs(path))
+        Ok(generic_statfs(fd_entry_statfs_path(self.entry(fd)?)))
     }
 
     fn stat_path(
@@ -5671,19 +5659,8 @@ impl FdTable {
         dirfd: i32,
         path: &str,
     ) -> Result<general::statfs, LinuxError> {
-        match open_fd_entry(process, self, dirfd, path, general::O_RDONLY, 0) {
-            Ok(FdEntry::File(file)) => Ok(generic_statfs(Some(file.path.as_str()))),
-            Ok(FdEntry::Directory(dir)) => Ok(generic_statfs(Some(dir.path.as_str()))),
-            Ok(FdEntry::Path(path)) => Ok(generic_statfs(Some(path.path.as_str()))),
-            Ok(FdEntry::MemoryFile(file)) => Ok(generic_statfs(Some(file.path.as_str()))),
-            Ok(FdEntry::DevNull) => Ok(generic_statfs(Some("/dev/null"))),
-            Ok(FdEntry::Rtc) => Ok(generic_statfs(Some("/dev/misc/rtc"))),
-            Ok(FdEntry::Pipe(_)) => Ok(generic_statfs(Some("pipe:"))),
-            Ok(FdEntry::Socket(_)) => Ok(generic_statfs(Some("socket:"))),
-            Ok(FdEntry::LocalSocket(_)) => Ok(generic_statfs(Some("socket:"))),
-            Ok(_) => Ok(generic_statfs(None)),
-            Err(err) => Err(err),
-        }
+        let entry = open_fd_entry(process, self, dirfd, path, general::O_RDONLY, 0)?;
+        Ok(generic_statfs(fd_entry_statfs_path(&entry)))
     }
 
     fn truncate(&mut self, fd: i32, size: u64) -> Result<(), LinuxError> {

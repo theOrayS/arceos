@@ -57,6 +57,16 @@ pub(super) fn fd_entry_path(entry: &FdEntry) -> Option<&str> {
     }
 }
 
+pub(super) fn fd_entry_statfs_path(entry: &FdEntry) -> Option<&str> {
+    match entry {
+        FdEntry::DevNull => Some("/dev/null"),
+        FdEntry::Rtc => Some("/dev/misc/rtc"),
+        FdEntry::Pipe(_) => Some("pipe:"),
+        FdEntry::Socket(_) | FdEntry::LocalSocket(_) => Some("socket:"),
+        _ => fd_entry_path(entry),
+    }
+}
+
 fn statfs_type_for_path(path: Option<&str>) -> i64 {
     match path {
         Some(path) if path == "/proc" || path.starts_with("/proc/") => PROC_SUPER_MAGIC,
