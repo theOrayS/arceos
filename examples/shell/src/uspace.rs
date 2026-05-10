@@ -78,6 +78,15 @@ macro_rules! return_on_user_write_error {
     };
 }
 
+macro_rules! read_cstr_or_return {
+    ($process:expr, $ptr:expr) => {
+        match read_cstr($process, $ptr) {
+            Ok(path) => path,
+            Err(err) => return neg_errno(err),
+        }
+    };
+}
+
 struct UserTaskExt {
     process: Arc<UserProcess>,
     clear_child_tid: AtomicUsize,
@@ -1951,10 +1960,7 @@ fn sys_getcwd(process: &UserProcess, buf: usize, size: usize) -> isize {
 }
 
 fn sys_chdir(process: &UserProcess, pathname: usize) -> isize {
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     let cwd = process.cwd();
     let abs_path = match resolve_host_path(cwd, path.as_str()) {
         Ok(path) => path,
@@ -1974,10 +1980,7 @@ fn sys_execve(
     argv: usize,
     _envp: usize,
 ) -> isize {
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     let argv = match read_execve_argv(process, argv, path.as_str()) {
         Ok(argv) => argv,
         Err(err) => return neg_errno(err),
@@ -2207,10 +2210,7 @@ fn sys_openat(
     flags: usize,
     mode: usize,
 ) -> isize {
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     match process.fds.lock().open(
         process,
         dirfd as i32,
@@ -2224,10 +2224,7 @@ fn sys_openat(
 }
 
 fn sys_mkdirat(process: &UserProcess, dirfd: usize, pathname: usize, mode: usize) -> isize {
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     match process
         .fds
         .lock()
@@ -2239,10 +2236,7 @@ fn sys_mkdirat(process: &UserProcess, dirfd: usize, pathname: usize, mode: usize
 }
 
 fn sys_unlinkat(process: &UserProcess, dirfd: usize, pathname: usize, flags: usize) -> isize {
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     match process
         .fds
         .lock()
@@ -2263,10 +2257,7 @@ fn sys_faccessat(
     if mode & !ACCESS_MODE_MASK != 0 {
         return neg_errno(LinuxError::EINVAL);
     }
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     let mut fds = process.fds.lock();
     let resolved_path = match fds.resolve_path(process, dirfd as i32, path.as_str()) {
         Ok(path) => path,
@@ -2549,10 +2540,7 @@ fn sys_fchmodat(
         return neg_errno(LinuxError::EINVAL);
     }
 
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     let mode = mode as u32;
     if path.is_empty() {
         if flags & general::AT_EMPTY_PATH == 0 {
@@ -2633,10 +2621,7 @@ fn sys_fchownat(
         Ok(ids) => ids,
         Err(err) => return neg_errno(err),
     };
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     let (record_path, st) = if path.is_empty() {
         if flags & general::AT_EMPTY_PATH == 0 {
             return neg_errno(LinuxError::ENOENT);
@@ -2753,10 +2738,7 @@ fn sys_utimensat(
             neg_errno(LinuxError::EBADF)
         };
     }
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     let abs_path = {
         let table = process.fds.lock();
         match resolve_dirfd_path(process, &table, dirfd as i32, path.as_str()) {
@@ -2781,14 +2763,8 @@ fn sys_renameat2(
     if flags != 0 {
         return neg_errno(LinuxError::EINVAL);
     }
-    let old_path = match read_cstr(process, oldpath) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
-    let new_path = match read_cstr(process, newpath) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let old_path = read_cstr_or_return!(process, oldpath);
+    let new_path = read_cstr_or_return!(process, newpath);
     let (old_abs_path, new_abs_path) = {
         let table = process.fds.lock();
         let old_abs = match resolve_dirfd_path(process, &table, olddirfd as i32, old_path.as_str())
@@ -2823,10 +2799,7 @@ fn sys_newfstatat(
     statbuf: usize,
     _flags: usize,
 ) -> isize {
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     let st = match process
         .fds
         .lock()
@@ -2862,10 +2835,7 @@ fn sys_statfs(process: &UserProcess, pathname: usize, statfsbuf: usize) -> isize
     if statfsbuf == 0 {
         return neg_errno(LinuxError::EFAULT);
     }
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     let cwd = process.cwd();
     let Some(abs_path) = normalize_path(cwd.as_str(), path.as_str()) else {
         return neg_errno(LinuxError::EINVAL);
@@ -3723,10 +3693,7 @@ fn sys_readlinkat(
     if bufsiz == 0 {
         return neg_errno(LinuxError::EINVAL);
     }
-    let path = match read_cstr(process, pathname) {
-        Ok(path) => path,
-        Err(err) => return neg_errno(err),
-    };
+    let path = read_cstr_or_return!(process, pathname);
     let resolved_path = {
         let table = process.fds.lock();
         match resolve_dirfd_path(process, &table, dirfd as i32, path.as_str()) {
