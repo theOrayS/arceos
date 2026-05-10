@@ -83,6 +83,24 @@ struct UserTaskExt {
     pending_sigreturn: Mutex<Option<TrapFrame>>,
 }
 
+impl UserTaskExt {
+    fn new(process: Arc<UserProcess>, clear_child_tid: usize, signal_mask: u64) -> Self {
+        Self {
+            process,
+            clear_child_tid: AtomicUsize::new(clear_child_tid),
+            pending_signal: AtomicI32::new(0),
+            signal_mask: AtomicU64::new(signal_mask),
+            futex_wait: AtomicUsize::new(0),
+            robust_list_head: AtomicUsize::new(0),
+            robust_list_len: AtomicUsize::new(0),
+            deferred_unmap_start: AtomicUsize::new(0),
+            deferred_unmap_len: AtomicUsize::new(0),
+            signal_frame: AtomicUsize::new(0),
+            pending_sigreturn: Mutex::new(None),
+        }
+    }
+}
+
 axtask::def_task_ext!(UserTaskExt);
 
 struct AxNamespaceImpl;
@@ -238,19 +256,7 @@ pub fn run_user_program_in(cwd: &str, argv: &[&str]) -> Result<i32, String> {
     );
     let root = loaded.process.aspace.lock().page_table_root();
     task.ctx_mut().set_page_table_root(root);
-    task.init_task_ext(UserTaskExt {
-        process: loaded.process.clone(),
-        clear_child_tid: AtomicUsize::new(0),
-        pending_signal: AtomicI32::new(0),
-        signal_mask: AtomicU64::new(0),
-        futex_wait: AtomicUsize::new(0),
-        robust_list_head: AtomicUsize::new(0),
-        robust_list_len: AtomicUsize::new(0),
-        deferred_unmap_start: AtomicUsize::new(0),
-        deferred_unmap_len: AtomicUsize::new(0),
-        signal_frame: AtomicUsize::new(0),
-        pending_sigreturn: Mutex::new(None),
-    });
+    task.init_task_ext(UserTaskExt::new(loaded.process.clone(), 0, 0));
     let task = axtask::spawn_task(task);
     process.set_pid(task.id().as_u64() as i32);
     register_user_task(task.clone(), process.clone());
@@ -1857,12 +1863,9 @@ fn sys_pselect6(
 }
 
 fn sys_writev(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isize {
-    if iovcnt > 1024 {
-        return neg_errno(LinuxError::EINVAL);
-    }
-    let Some(iov_bytes) = user_bytes(process, iov, iovcnt * size_of::<general::iovec>(), false)
-    else {
-        return neg_errno(LinuxError::EFAULT);
+    let iov_bytes = match read_iovec_array(process, iov, iovcnt) {
+        Ok(iov_bytes) => iov_bytes,
+        Err(err) => return neg_errno(err),
     };
     let mut written = 0isize;
     for chunk in iov_bytes.chunks_exact(size_of::<general::iovec>()) {
@@ -1887,12 +1890,9 @@ fn sys_writev(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> is
 }
 
 fn sys_readv(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isize {
-    if iovcnt > 1024 {
-        return neg_errno(LinuxError::EINVAL);
-    }
-    let Some(iov_bytes) = user_bytes(process, iov, iovcnt * size_of::<general::iovec>(), false)
-    else {
-        return neg_errno(LinuxError::EFAULT);
+    let iov_bytes = match read_iovec_array(process, iov, iovcnt) {
+        Ok(iov_bytes) => iov_bytes,
+        Err(err) => return neg_errno(err),
     };
     let mut total = 0isize;
     for chunk in iov_bytes.chunks_exact(size_of::<general::iovec>()) {
@@ -1914,6 +1914,17 @@ fn sys_readv(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isi
         }
     }
     total
+}
+
+fn read_iovec_array<'a>(
+    process: &UserProcess,
+    iov: usize,
+    iovcnt: usize,
+) -> Result<&'a [u8], LinuxError> {
+    if iovcnt > IOV_MAX {
+        return Err(LinuxError::EINVAL);
+    }
+    user_bytes(process, iov, iovcnt * size_of::<general::iovec>(), false).ok_or(LinuxError::EFAULT)
 }
 
 fn sys_getcwd(process: &UserProcess, buf: usize, size: usize) -> isize {
@@ -2059,19 +2070,11 @@ fn sys_clone(
         };
         let root = child_process.aspace.lock().page_table_root();
         task.ctx_mut().set_page_table_root(root);
-        task.init_task_ext(UserTaskExt {
-            process: child_process.clone(),
-            clear_child_tid: AtomicUsize::new(child_clear_tid),
-            pending_signal: AtomicI32::new(0),
-            signal_mask: AtomicU64::new(inherited_signal_mask),
-            futex_wait: AtomicUsize::new(0),
-            robust_list_head: AtomicUsize::new(0),
-            robust_list_len: AtomicUsize::new(0),
-            deferred_unmap_start: AtomicUsize::new(0),
-            deferred_unmap_len: AtomicUsize::new(0),
-            signal_frame: AtomicUsize::new(0),
-            pending_sigreturn: Mutex::new(None),
-        });
+        task.init_task_ext(UserTaskExt::new(
+            child_process.clone(),
+            child_clear_tid,
+            inherited_signal_mask,
+        ));
         let task = axtask::spawn_task(task);
         register_user_task(task.clone(), child_process.clone());
         process.add_child(task, child_process);
@@ -2136,19 +2139,11 @@ fn sys_clone(
     let tid = task.id().as_u64() as i32;
     let root = process.aspace.lock().page_table_root();
     task.ctx_mut().set_page_table_root(root);
-    task.init_task_ext(UserTaskExt {
-        process: process.clone(),
-        clear_child_tid: AtomicUsize::new(child_clear_tid),
-        pending_signal: AtomicI32::new(0),
-        signal_mask: AtomicU64::new(inherited_signal_mask),
-        futex_wait: AtomicUsize::new(0),
-        robust_list_head: AtomicUsize::new(0),
-        robust_list_len: AtomicUsize::new(0),
-        deferred_unmap_start: AtomicUsize::new(0),
-        deferred_unmap_len: AtomicUsize::new(0),
-        signal_frame: AtomicUsize::new(0),
-        pending_sigreturn: Mutex::new(None),
-    });
+    task.init_task_ext(UserTaskExt::new(
+        process.clone(),
+        child_clear_tid,
+        inherited_signal_mask,
+    ));
 
     if clone_flags & general::CLONE_PARENT_SETTID as usize != 0 {
         let ret = write_user_value(process.as_ref(), ptid, &tid);
@@ -3294,33 +3289,35 @@ fn sys_shutdown_bridge(process: &UserProcess, fd: usize, how: usize) -> isize {
 }
 
 fn sys_getsockname_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize) -> isize {
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
-    if let Err(err) = validate_user_write(process, addrlen, size_of::<posix_ctypes::socklen_t>()) {
-        return neg_errno(err);
-    }
-    let len = match read_user_value::<posix_ctypes::socklen_t>(process, addrlen) {
-        Ok(len) => len as usize,
-        Err(err) => return neg_errno(err),
-    };
-    if let Err(err) = validate_user_write(process, addr, len) {
-        return neg_errno(err);
-    }
-    match posix_ret_i32(unsafe {
-        arceos_posix_api::sys_getsockname(
-            socket.posix_fd,
-            addr as *mut posix_ctypes::sockaddr,
-            addrlen as *mut posix_ctypes::socklen_t,
-        )
-    }) {
-        Ok(_) => 0,
-        Err(err) => neg_errno(err),
-    }
+    socket_name_bridge(
+        process,
+        fd,
+        addr,
+        addrlen,
+        arceos_posix_api::sys_getsockname,
+    )
 }
 
 fn sys_getpeername_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize) -> isize {
+    socket_name_bridge(
+        process,
+        fd,
+        addr,
+        addrlen,
+        arceos_posix_api::sys_getpeername,
+    )
+}
+
+type SocketNameOp =
+    unsafe fn(i32, *mut posix_ctypes::sockaddr, *mut posix_ctypes::socklen_t) -> i32;
+
+fn socket_name_bridge(
+    process: &UserProcess,
+    fd: usize,
+    addr: usize,
+    addrlen: usize,
+    op: SocketNameOp,
+) -> isize {
     let socket = match socket_entry(process, fd) {
         Ok(socket) => socket,
         Err(err) => return neg_errno(err),
@@ -3336,7 +3333,7 @@ fn sys_getpeername_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen
         return neg_errno(err);
     }
     match posix_ret_i32(unsafe {
-        arceos_posix_api::sys_getpeername(
+        op(
             socket.posix_fd,
             addr as *mut posix_ctypes::sockaddr,
             addrlen as *mut posix_ctypes::socklen_t,

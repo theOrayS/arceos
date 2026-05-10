@@ -28,6 +28,7 @@ pub(super) const RLIMIT_NOFILE_RESOURCE: u32 = 7;
 pub(super) const DEFAULT_NOFILE_LIMIT: u64 = 1024;
 
 pub(super) const FD_SETSIZE: usize = 1024;
+pub(super) const IOV_MAX: usize = 1024;
 pub(super) const BITS_PER_USIZE: usize = usize::BITS as usize;
 pub(super) const FD_SET_WORDS: usize = FD_SETSIZE.div_ceil(BITS_PER_USIZE);
 
