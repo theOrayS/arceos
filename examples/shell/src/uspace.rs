@@ -2290,18 +2290,21 @@ fn sys_faccessat(
 }
 
 fn sys_setuid(process: &UserProcess, uid: usize) -> isize {
-    let Ok(uid) = u32::try_from(uid) else {
-        return neg_errno(LinuxError::EINVAL);
-    };
-    process.set_uid(uid);
-    0
+    set_single_id(uid, |uid| process.set_uid(uid))
 }
 
 fn sys_setgid(process: &UserProcess, gid: usize) -> isize {
-    let Ok(gid) = u32::try_from(gid) else {
+    set_single_id(gid, |gid| process.set_gid(gid))
+}
+
+fn set_single_id<F>(id: usize, apply: F) -> isize
+where
+    F: FnOnce(u32),
+{
+    let Ok(id) = u32::try_from(id) else {
         return neg_errno(LinuxError::EINVAL);
     };
-    process.set_gid(gid);
+    apply(id);
     0
 }
 
@@ -2313,101 +2316,111 @@ fn id_arg_optional(id: usize) -> Result<Option<u32>, LinuxError> {
 }
 
 fn sys_setreuid(process: &UserProcess, ruid: usize, euid: usize) -> isize {
-    let ruid = match id_arg_optional(ruid) {
-        Ok(uid) => uid,
-        Err(err) => return neg_errno(err),
-    };
-    let euid = match id_arg_optional(euid) {
-        Ok(uid) => uid,
-        Err(err) => return neg_errno(err),
-    };
-    let saved = euid.or(ruid);
-    process.set_user_ids(ruid, euid, saved);
-    0
+    set_re_ids(ruid, euid, |ruid, euid, saved| {
+        process.set_user_ids(ruid, euid, saved);
+    })
 }
 
 fn sys_setregid(process: &UserProcess, rgid: usize, egid: usize) -> isize {
-    let rgid = match id_arg_optional(rgid) {
-        Ok(gid) => gid,
-        Err(err) => return neg_errno(err),
-    };
-    let egid = match id_arg_optional(egid) {
-        Ok(gid) => gid,
-        Err(err) => return neg_errno(err),
-    };
-    let saved = egid.or(rgid);
-    process.set_group_ids(rgid, egid, saved);
-    0
+    set_re_ids(rgid, egid, |rgid, egid, saved| {
+        process.set_group_ids(rgid, egid, saved);
+    })
 }
 
 fn sys_setresuid(process: &UserProcess, ruid: usize, euid: usize, suid: usize) -> isize {
-    let ruid = match id_arg_optional(ruid) {
-        Ok(uid) => uid,
-        Err(err) => return neg_errno(err),
-    };
-    let euid = match id_arg_optional(euid) {
-        Ok(uid) => uid,
-        Err(err) => return neg_errno(err),
-    };
-    let suid = match id_arg_optional(suid) {
-        Ok(uid) => uid,
-        Err(err) => return neg_errno(err),
-    };
-    process.set_user_ids(ruid, euid, suid);
-    0
+    set_res_ids(ruid, euid, suid, |ruid, euid, suid| {
+        process.set_user_ids(ruid, euid, suid);
+    })
 }
 
 fn sys_setresgid(process: &UserProcess, rgid: usize, egid: usize, sgid: usize) -> isize {
-    let rgid = match id_arg_optional(rgid) {
-        Ok(gid) => gid,
+    set_res_ids(rgid, egid, sgid, |rgid, egid, sgid| {
+        process.set_group_ids(rgid, egid, sgid);
+    })
+}
+
+fn set_re_ids<F>(real: usize, effective: usize, apply: F) -> isize
+where
+    F: FnOnce(Option<u32>, Option<u32>, Option<u32>),
+{
+    let real = match id_arg_optional(real) {
+        Ok(id) => id,
         Err(err) => return neg_errno(err),
     };
-    let egid = match id_arg_optional(egid) {
-        Ok(gid) => gid,
+    let effective = match id_arg_optional(effective) {
+        Ok(id) => id,
         Err(err) => return neg_errno(err),
     };
-    let sgid = match id_arg_optional(sgid) {
-        Ok(gid) => gid,
+    apply(real, effective, effective.or(real));
+    0
+}
+
+fn set_res_ids<F>(real: usize, effective: usize, saved: usize, apply: F) -> isize
+where
+    F: FnOnce(Option<u32>, Option<u32>, Option<u32>),
+{
+    let real = match id_arg_optional(real) {
+        Ok(id) => id,
         Err(err) => return neg_errno(err),
     };
-    process.set_group_ids(rgid, egid, sgid);
+    let effective = match id_arg_optional(effective) {
+        Ok(id) => id,
+        Err(err) => return neg_errno(err),
+    };
+    let saved = match id_arg_optional(saved) {
+        Ok(id) => id,
+        Err(err) => return neg_errno(err),
+    };
+    apply(real, effective, saved);
+    0
+}
+
+fn write_id_triplet(process: &UserProcess, ptrs: [usize; 3], values: [u32; 3]) -> isize {
+    for (ptr, value) in ptrs.into_iter().zip(values.into_iter()) {
+        let ret = write_user_value(process, ptr, &value);
+        if ret != 0 {
+            return ret;
+        }
+    }
     0
 }
 
 fn sys_getresuid(process: &UserProcess, ruid: usize, euid: usize, suid: usize) -> isize {
-    let values = [process.real_uid(), process.uid(), process.saved_uid()];
-    for (ptr, value) in [ruid, euid, suid].iter().copied().zip(values.iter()) {
-        let ret = write_user_value(process, ptr, value);
-        if ret != 0 {
-            return ret;
-        }
-    }
-    0
+    write_id_triplet(
+        process,
+        [ruid, euid, suid],
+        [process.real_uid(), process.uid(), process.saved_uid()],
+    )
 }
 
 fn sys_getresgid(process: &UserProcess, rgid: usize, egid: usize, sgid: usize) -> isize {
-    let values = [process.real_gid(), process.gid(), process.saved_gid()];
-    for (ptr, value) in [rgid, egid, sgid].iter().copied().zip(values.iter()) {
-        let ret = write_user_value(process, ptr, value);
-        if ret != 0 {
-            return ret;
-        }
-    }
-    0
+    write_id_triplet(
+        process,
+        [rgid, egid, sgid],
+        [process.real_gid(), process.gid(), process.saved_gid()],
+    )
 }
 
 fn sys_setfsuid(process: &UserProcess, uid: usize) -> isize {
     let old = process.uid();
-    if let Ok(Some(uid)) = id_arg_optional(uid) {
+    set_fs_id(old, uid, |uid| {
         process.set_user_ids(None, Some(uid), None);
-    }
-    old as isize
+    })
 }
 
 fn sys_setfsgid(process: &UserProcess, gid: usize) -> isize {
     let old = process.gid();
-    if let Ok(Some(gid)) = id_arg_optional(gid) {
+    set_fs_id(old, gid, |gid| {
         process.set_group_ids(None, Some(gid), None);
+    })
+}
+
+fn set_fs_id<F>(old: u32, id: usize, apply: F) -> isize
+where
+    F: FnOnce(u32),
+{
+    if let Ok(Some(id)) = id_arg_optional(id) {
+        apply(id);
     }
     old as isize
 }
@@ -5880,16 +5893,8 @@ impl FdTable {
         Ok(buf)
     }
 
-    fn insert(&mut self, entry: FdEntry) -> Result<i32, LinuxError> {
-        self.insert_with_flags(entry, 0)
-    }
-
     fn insert_with_flags(&mut self, entry: FdEntry, fd_flags: u32) -> Result<i32, LinuxError> {
         self.insert_min_with_flags(entry, 0, fd_flags)
-    }
-
-    fn insert_min(&mut self, entry: FdEntry, min_fd: usize) -> Result<i32, LinuxError> {
-        self.insert_min_with_flags(entry, min_fd, 0)
     }
 
     fn insert_min_with_flags(

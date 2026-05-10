@@ -954,7 +954,7 @@ pub fn maybe_run_official_tests() {
     std::process::exit(0);
 }
 
-#[cfg(not(all(feature = "auto-run-tests", feature = "uspace")))]
+#[cfg(all(feature = "auto-run-tests", not(feature = "uspace")))]
 pub fn maybe_run_official_tests() {}
 
 pub fn run_cmd(line: &[u8]) {
