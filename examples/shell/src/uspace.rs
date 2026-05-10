@@ -2610,20 +2610,13 @@ fn sys_fchown(process: &UserProcess, fd: usize, owner: usize, group: usize) -> i
         Ok(ids) => ids,
         Err(err) => return neg_errno(err),
     };
-    let (path, st) = {
-        let mut fds = process.fds.lock();
-        let path = match fds.entry(fd as i32) {
-            Ok(entry) => fd_entry_path(entry).map(ToString::to_string),
-            Err(err) => return neg_errno(err),
-        };
-        let st = match fds.stat(fd as i32) {
-            Ok(st) => match path.as_deref() {
-                Some(path) => apply_recorded_path_metadata(process, path, st),
-                None => st,
-            },
-            Err(err) => return neg_errno(err),
-        };
-        (path, st)
+    let (path, st) = match process
+        .fds
+        .lock()
+        .stat_with_recorded_path(process, fd as i32)
+    {
+        Ok((path, st)) => (path, st),
+        Err(err) => return neg_errno(err),
     };
     apply_chown_metadata(process, path, &st, owner, group)
 }
@@ -2662,19 +2655,14 @@ fn sys_fchownat(
             };
             (Some(cwd), st)
         } else {
-            let mut fds = process.fds.lock();
-            let record_path = match fds.entry(dirfd as i32) {
-                Ok(entry) => fd_entry_path(entry).map(ToString::to_string),
+            match process
+                .fds
+                .lock()
+                .stat_with_recorded_path(process, dirfd as i32)
+            {
+                Ok((path, st)) => (path, st),
                 Err(err) => return neg_errno(err),
-            };
-            let st = match fds.stat(dirfd as i32) {
-                Ok(st) => match record_path.as_deref() {
-                    Some(path) => apply_recorded_path_metadata(process, path, st),
-                    None => st,
-                },
-                Err(err) => return neg_errno(err),
-            };
-            (record_path, st)
+            }
         }
     } else {
         let mut fds = process.fds.lock();
@@ -2836,21 +2824,13 @@ fn sys_newfstatat(
 }
 
 fn sys_fstat(process: &UserProcess, fd: usize, statbuf: usize) -> isize {
-    let (st, path) = {
-        let mut fds = process.fds.lock();
-        let path = match fds.entry(fd as i32) {
-            Ok(entry) => fd_entry_path(entry).map(ToString::to_string),
-            Err(err) => return neg_errno(err),
-        };
-        let st = match fds.stat(fd as i32) {
-            Ok(st) => st,
-            Err(err) => return neg_errno(err),
-        };
-        (st, path)
-    };
-    let st = match path.as_deref() {
-        Some(path) => apply_recorded_path_metadata(process, path, st),
-        None => st,
+    let st = match process
+        .fds
+        .lock()
+        .stat_with_recorded_path(process, fd as i32)
+    {
+        Ok((_, st)) => st,
+        Err(err) => return neg_errno(err),
     };
     write_user_value(process, statbuf, &st)
 }
@@ -5433,6 +5413,20 @@ impl FdTable {
             FdEntry::Socket(socket) => Ok(socket.stat()),
             FdEntry::LocalSocket(socket) => Ok(socket.stat()),
         }
+    }
+
+    fn stat_with_recorded_path(
+        &mut self,
+        process: &UserProcess,
+        fd: i32,
+    ) -> Result<(Option<String>, general::stat), LinuxError> {
+        let path = fd_entry_path(self.entry(fd)?).map(ToString::to_string);
+        let st = self.stat(fd)?;
+        let st = match path.as_deref() {
+            Some(path) => apply_recorded_path_metadata(process, path, st),
+            None => st,
+        };
+        Ok((path, st))
     }
 
     fn statfs(&self, fd: i32) -> Result<general::statfs, LinuxError> {
