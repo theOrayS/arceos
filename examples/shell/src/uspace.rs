@@ -96,6 +96,14 @@ macro_rules! socket_entry_or_return {
     };
 }
 
+macro_rules! return_errno_if {
+    ($condition:expr, $err:expr) => {
+        if $condition {
+            return neg_errno($err);
+        }
+    };
+}
+
 struct UserTaskExt {
     process: Arc<UserProcess>,
     clear_child_tid: AtomicUsize,
@@ -3858,12 +3866,8 @@ fn is_same_sched_target(process: &UserProcess, pid: i32) -> bool {
 }
 
 fn sys_sched_setparam(process: &UserProcess, pid: i32, param: usize) -> isize {
-    if !is_same_sched_target(process, pid) {
-        return neg_errno(LinuxError::ESRCH);
-    }
-    if param == 0 {
-        return neg_errno(LinuxError::EINVAL);
-    }
+    return_errno_if!(!is_same_sched_target(process, pid), LinuxError::ESRCH);
+    return_errno_if!(param == 0, LinuxError::EINVAL);
     match read_user_value::<UserSchedParam>(process, param) {
         Ok(value) if value.sched_priority == 0 => 0,
         Ok(_) => neg_errno(LinuxError::EINVAL),
@@ -3872,23 +3876,15 @@ fn sys_sched_setparam(process: &UserProcess, pid: i32, param: usize) -> isize {
 }
 
 fn sys_sched_getparam(process: &UserProcess, pid: i32, param: usize) -> isize {
-    if !is_same_sched_target(process, pid) {
-        return neg_errno(LinuxError::ESRCH);
-    }
-    if param == 0 {
-        return neg_errno(LinuxError::EINVAL);
-    }
+    return_errno_if!(!is_same_sched_target(process, pid), LinuxError::ESRCH);
+    return_errno_if!(param == 0, LinuxError::EINVAL);
     let value = UserSchedParam { sched_priority: 0 };
     write_user_value(process, param, &value)
 }
 
 fn sys_sched_setscheduler(process: &UserProcess, pid: i32, policy: i32, param: usize) -> isize {
-    if !is_same_sched_target(process, pid) {
-        return neg_errno(LinuxError::ESRCH);
-    }
-    if param == 0 {
-        return neg_errno(LinuxError::EINVAL);
-    }
+    return_errno_if!(!is_same_sched_target(process, pid), LinuxError::ESRCH);
+    return_errno_if!(param == 0, LinuxError::EINVAL);
     let param = match read_user_value::<UserSchedParam>(process, param) {
         Ok(param) => param,
         Err(err) => return neg_errno(err),
@@ -3902,19 +3898,13 @@ fn sys_sched_setscheduler(process: &UserProcess, pid: i32, policy: i32, param: u
 }
 
 fn sys_sched_getscheduler(process: &UserProcess, pid: i32) -> isize {
-    if !is_same_sched_target(process, pid) {
-        return neg_errno(LinuxError::ESRCH);
-    }
+    return_errno_if!(!is_same_sched_target(process, pid), LinuxError::ESRCH);
     0
 }
 
 fn sys_sched_setaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mask: usize) -> isize {
-    if !is_same_sched_target(process, pid) {
-        return neg_errno(LinuxError::ESRCH);
-    }
-    if cpusetsize == 0 || mask == 0 {
-        return neg_errno(LinuxError::EINVAL);
-    }
+    return_errno_if!(!is_same_sched_target(process, pid), LinuxError::ESRCH);
+    return_errno_if!(cpusetsize == 0 || mask == 0, LinuxError::EINVAL);
     with_readable_slice(process, mask, cpusetsize, |src| {
         if src[0] & 1 == 0 {
             return Err(LinuxError::EINVAL);
@@ -3924,12 +3914,8 @@ fn sys_sched_setaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mas
 }
 
 fn sys_sched_getaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mask: usize) -> isize {
-    if !is_same_sched_target(process, pid) {
-        return neg_errno(LinuxError::ESRCH);
-    }
-    if cpusetsize == 0 || mask == 0 {
-        return neg_errno(LinuxError::EINVAL);
-    }
+    return_errno_if!(!is_same_sched_target(process, pid), LinuxError::ESRCH);
+    return_errno_if!(cpusetsize == 0 || mask == 0, LinuxError::EINVAL);
     with_writable_slice(process, mask, cpusetsize, |dst| {
         dst.fill(0);
         dst[0] = 1;
