@@ -3070,7 +3070,16 @@ fn sys_socket_bridge(
     ret
 }
 
-fn sys_bind_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize) -> isize {
+fn socket_addr_call<F>(
+    process: &UserProcess,
+    fd: usize,
+    addr: usize,
+    addrlen: usize,
+    call: F,
+) -> isize
+where
+    F: FnOnce(i32, *const posix_ctypes::sockaddr, posix_ctypes::socklen_t) -> i32,
+{
     let socket = match socket_entry(process, fd) {
         Ok(socket) => socket,
         Err(err) => return neg_errno(err),
@@ -3078,15 +3087,18 @@ fn sys_bind_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize
     if let Err(err) = validate_user_read(process, addr, addrlen) {
         return neg_errno(err);
     }
-    let ret = match posix_ret_i32(arceos_posix_api::sys_bind(
+    match posix_ret_i32(call(
         socket.posix_fd,
         addr as *const posix_ctypes::sockaddr,
         addrlen as posix_ctypes::socklen_t,
     )) {
         Ok(_) => 0,
         Err(err) => neg_errno(err),
-    };
-    ret
+    }
+}
+
+fn sys_bind_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize) -> isize {
+    socket_addr_call(process, fd, addr, addrlen, arceos_posix_api::sys_bind)
 }
 
 fn sys_listen_bridge(process: &UserProcess, fd: usize, backlog: usize) -> isize {
@@ -3182,22 +3194,7 @@ fn sys_accept_bridge(
 }
 
 fn sys_connect_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize) -> isize {
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
-    if let Err(err) = validate_user_read(process, addr, addrlen) {
-        return neg_errno(err);
-    }
-    let ret = match posix_ret_i32(arceos_posix_api::sys_connect(
-        socket.posix_fd,
-        addr as *const posix_ctypes::sockaddr,
-        addrlen as posix_ctypes::socklen_t,
-    )) {
-        Ok(_) => 0,
-        Err(err) => neg_errno(err),
-    };
-    ret
+    socket_addr_call(process, fd, addr, addrlen, arceos_posix_api::sys_connect)
 }
 
 fn sys_sendto_bridge(
