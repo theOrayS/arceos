@@ -2316,6 +2316,14 @@ fn id_arg_optional(id: usize) -> Result<Option<u32>, LinuxError> {
     u32::try_from(id).map(Some).map_err(|_| LinuxError::EINVAL)
 }
 
+fn parse_id_args<const N: usize>(ids: [usize; N]) -> Result<[Option<u32>; N], LinuxError> {
+    let mut parsed = [None; N];
+    for (dst, id) in parsed.iter_mut().zip(ids) {
+        *dst = id_arg_optional(id)?;
+    }
+    Ok(parsed)
+}
+
 fn sys_setreuid(process: &UserProcess, ruid: usize, euid: usize) -> isize {
     set_re_ids(ruid, euid, |ruid, euid, saved| {
         process.set_user_ids(ruid, euid, saved);
@@ -2344,12 +2352,8 @@ fn set_re_ids<F>(real: usize, effective: usize, apply: F) -> isize
 where
     F: FnOnce(Option<u32>, Option<u32>, Option<u32>),
 {
-    let real = match id_arg_optional(real) {
-        Ok(id) => id,
-        Err(err) => return neg_errno(err),
-    };
-    let effective = match id_arg_optional(effective) {
-        Ok(id) => id,
+    let [real, effective] = match parse_id_args([real, effective]) {
+        Ok(ids) => ids,
         Err(err) => return neg_errno(err),
     };
     apply(real, effective, effective.or(real));
@@ -2360,16 +2364,8 @@ fn set_res_ids<F>(real: usize, effective: usize, saved: usize, apply: F) -> isiz
 where
     F: FnOnce(Option<u32>, Option<u32>, Option<u32>),
 {
-    let real = match id_arg_optional(real) {
-        Ok(id) => id,
-        Err(err) => return neg_errno(err),
-    };
-    let effective = match id_arg_optional(effective) {
-        Ok(id) => id,
-        Err(err) => return neg_errno(err),
-    };
-    let saved = match id_arg_optional(saved) {
-        Ok(id) => id,
+    let [real, effective, saved] = match parse_id_args([real, effective, saved]) {
+        Ok(ids) => ids,
         Err(err) => return neg_errno(err),
     };
     apply(real, effective, saved);
@@ -2687,7 +2683,7 @@ fn sys_fchownat(
 }
 
 fn chown_ids(owner: usize, group: usize) -> Result<(Option<u32>, Option<u32>), LinuxError> {
-    Ok((id_arg_optional(owner)?, id_arg_optional(group)?))
+    parse_id_args([owner, group]).map(|[owner, group]| (owner, group))
 }
 
 fn apply_chown_metadata(
