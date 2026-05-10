@@ -87,6 +87,15 @@ macro_rules! read_cstr_or_return {
     };
 }
 
+macro_rules! socket_entry_or_return {
+    ($process:expr, $fd:expr) => {
+        match socket_entry($process, $fd) {
+            Ok(socket) => socket,
+            Err(err) => return neg_errno(err),
+        }
+    };
+}
+
 struct UserTaskExt {
     process: Arc<UserProcess>,
     clear_child_tid: AtomicUsize,
@@ -3043,10 +3052,7 @@ fn socket_addr_call<F>(
 where
     F: FnOnce(i32, *const posix_ctypes::sockaddr, posix_ctypes::socklen_t) -> i32,
 {
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
+    let socket = socket_entry_or_return!(process, fd);
     if let Err(err) = validate_user_read(process, addr, addrlen) {
         return neg_errno(err);
     }
@@ -3065,10 +3071,7 @@ fn sys_bind_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize
 }
 
 fn sys_listen_bridge(process: &UserProcess, fd: usize, backlog: usize) -> isize {
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
+    let socket = socket_entry_or_return!(process, fd);
     let ret = match posix_ret_i32(arceos_posix_api::sys_listen(
         socket.posix_fd,
         backlog as i32,
@@ -3091,10 +3094,7 @@ fn sys_accept_bridge(
         Ok(false) => {}
         Err(err) => return neg_errno(err),
     }
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
+    let socket = socket_entry_or_return!(process, fd);
     let flag_mask = (posix_ctypes::SOCK_CLOEXEC | posix_ctypes::SOCK_NONBLOCK) as usize;
     if flags & !flag_mask != 0 {
         return neg_errno(LinuxError::EINVAL);
@@ -3169,10 +3169,7 @@ fn sys_sendto_bridge(
     addr: usize,
     addrlen: usize,
 ) -> isize {
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
+    let socket = socket_entry_or_return!(process, fd);
     if let Err(err) = validate_user_read(process, buf, len) {
         return neg_errno(err);
     }
@@ -3207,10 +3204,7 @@ fn sys_recvfrom_bridge(
     addr: usize,
     addrlen: usize,
 ) -> isize {
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
+    let socket = socket_entry_or_return!(process, fd);
     if let Err(err) = validate_user_write(process, buf, len) {
         return neg_errno(err);
     }
@@ -3246,10 +3240,7 @@ fn sys_recvfrom_bridge(
 }
 
 fn sys_shutdown_bridge(process: &UserProcess, fd: usize, how: usize) -> isize {
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
+    let socket = socket_entry_or_return!(process, fd);
     match posix_ret_i32(arceos_posix_api::sys_shutdown(socket.posix_fd, how as i32)) {
         Ok(_) => 0,
         Err(err) => neg_errno(err),
@@ -3286,10 +3277,7 @@ fn socket_name_bridge(
     addrlen: usize,
     op: SocketNameOp,
 ) -> isize {
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
+    let socket = socket_entry_or_return!(process, fd);
     if let Err(err) = validate_user_write(process, addrlen, size_of::<posix_ctypes::socklen_t>()) {
         return neg_errno(err);
     }
@@ -3507,10 +3495,7 @@ fn sys_setsockopt_bridge(
     optval: usize,
     optlen: usize,
 ) -> isize {
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
+    let socket = socket_entry_or_return!(process, fd);
     if optlen > 0 {
         if let Err(err) = validate_user_read(process, optval, optlen) {
             return neg_errno(err);
@@ -3581,10 +3566,7 @@ fn sys_getsockopt_bridge(
     optval: usize,
     optlen: usize,
 ) -> isize {
-    let socket = match socket_entry(process, fd) {
-        Ok(socket) => socket,
-        Err(err) => return neg_errno(err),
-    };
+    let socket = socket_entry_or_return!(process, fd);
     if optval == 0 || optlen == 0 {
         return neg_errno(LinuxError::EFAULT);
     }
