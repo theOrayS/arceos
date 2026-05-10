@@ -4979,23 +4979,26 @@ fn user_range_fits(ptr: usize, len: usize) -> bool {
     len == 0 || ptr.checked_add(len).is_some()
 }
 
-fn user_bytes<'a>(process: &UserProcess, ptr: usize, len: usize, write: bool) -> Option<&'a [u8]> {
-    if len == 0 {
-        return Some(&[]);
-    }
+fn user_range_accessible(process: &UserProcess, ptr: usize, len: usize, write: bool) -> bool {
     if !user_range_fits(ptr, len) {
-        return None;
+        return false;
     }
     let flags = if write {
         MappingFlags::READ | MappingFlags::WRITE
     } else {
         MappingFlags::READ
     };
-    if !process
+    process
         .aspace
         .lock()
         .can_access_range(VirtAddr::from(ptr), len, flags)
-    {
+}
+
+fn user_bytes<'a>(process: &UserProcess, ptr: usize, len: usize, write: bool) -> Option<&'a [u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+    if !user_range_accessible(process, ptr, len, write) {
         return None;
     }
     Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
@@ -5010,19 +5013,7 @@ fn user_bytes_mut<'a>(
     if len == 0 {
         return Some(&mut []);
     }
-    if !user_range_fits(ptr, len) {
-        return None;
-    }
-    let flags = if write {
-        MappingFlags::READ | MappingFlags::WRITE
-    } else {
-        MappingFlags::READ
-    };
-    if !process
-        .aspace
-        .lock()
-        .can_access_range(VirtAddr::from(ptr), len, flags)
-    {
+    if !user_range_accessible(process, ptr, len, write) {
         return None;
     }
     Some(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) })
