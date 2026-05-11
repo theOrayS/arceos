@@ -97,9 +97,18 @@ impl AddrSpace {
                 area.flags(),
                 area.backend().clone(),
             );
-            self.areas
-                .map(cloned_area, &mut self.pt, false)
-                .map_err(mapping_err_to_ax_err)?;
+            if let Err(err) = self.areas.map(cloned_area, &mut self.pt, false) {
+                warn!(
+                    "clone_user_mappings_from: map cloned area failed start={:#x} end={:#x} size={:#x} flags={:?} backend={} err={:?}",
+                    area.start(),
+                    area.end(),
+                    area.size(),
+                    area.flags(),
+                    area.backend().kind_name(),
+                    err
+                );
+                return Err(mapping_err_to_ax_err(err));
+            }
 
             let fault_flags = fault_flags_from_mapping(area.flags());
             for vaddr in PageIter4K::new(area.start(), area.end())
@@ -109,6 +118,16 @@ impl AddrSpace {
                     continue;
                 };
                 if self.pt.query(vaddr).is_err() && !self.handle_page_fault(vaddr, fault_flags) {
+                    warn!(
+                        "clone_user_mappings_from: materialize child page failed area_start={:#x} area_end={:#x} vaddr={:#x} src_paddr={:#x} flags={:?} backend={} fault_flags={:?}",
+                        area.start(),
+                        area.end(),
+                        vaddr,
+                        src_paddr,
+                        area.flags(),
+                        area.backend().kind_name(),
+                        fault_flags
+                    );
                     return ax_err!(BadState, "failed to materialize child page");
                 }
                 let (dst_paddr, _, _) = self.pt.query(vaddr).map_err(|_| AxError::BadState)?;

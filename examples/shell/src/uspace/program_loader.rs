@@ -50,6 +50,16 @@ struct AuxEntry {
     value: usize,
 }
 
+fn default_exec_env(exec_root: &str, cwd: &str) -> Vec<String> {
+    let path = if exec_root == "/glibc" {
+        "PATH=/glibc:/musl"
+    } else {
+        "PATH=/musl:/glibc"
+    };
+    let pwd = if cwd.is_empty() { "/" } else { cwd };
+    vec![path.into(), "HOME=/".into(), format!("PWD={pwd}")]
+}
+
 pub(super) fn load_program_image(
     aspace: &mut AddrSpace,
     cwd: &str,
@@ -112,11 +122,14 @@ pub(super) fn load_program_image(
         .map_err(|err| format!("failed to map user stack: {err}"))?;
 
     let argv_refs = prepared.argv.iter().map(String::as_str).collect::<Vec<_>>();
+    let env = default_exec_env(prepared.exec_root.as_str(), cwd);
+    let env_refs = env.iter().map(String::as_str).collect::<Vec<_>>();
     let stack_ptr = build_initial_stack(
         aspace,
         stack_base,
         stack_top,
         &argv_refs,
+        &env_refs,
         prepared.path.as_str(),
         main.entry,
         interp_base,
@@ -392,10 +405,11 @@ fn phdr_addr(elf: &ElfFile<'_>, load_bias: usize) -> Option<usize> {
 }
 
 fn build_initial_stack(
-    aspace: &AddrSpace,
+    aspace: &mut AddrSpace,
     stack_base: usize,
     stack_top: usize,
     argv: &[&str],
+    env: &[&str],
     execfn: &str,
     entry: usize,
     interp_base: usize,
@@ -421,6 +435,15 @@ fn build_initial_stack(
         arg_ptrs.push(ptr);
     }
     arg_ptrs.reverse();
+
+    let mut env_ptrs = Vec::with_capacity(env.len());
+    for item in env.iter().rev() {
+        let mut bytes = item.as_bytes().to_vec();
+        bytes.push(0);
+        let ptr = push_stack_bytes(aspace, stack_base, &mut sp, &bytes, 1)?;
+        env_ptrs.push(ptr);
+    }
+    env_ptrs.reverse();
 
     let aux = [
         AuxEntry {
@@ -505,10 +528,11 @@ fn build_initial_stack(
         },
     ];
 
-    let mut words = Vec::with_capacity(1 + arg_ptrs.len() + 1 + 1 + aux.len() * 2);
+    let mut words = Vec::with_capacity(1 + arg_ptrs.len() + 1 + env_ptrs.len() + 1 + aux.len() * 2);
     words.push(argv.len());
     words.extend(arg_ptrs.iter().copied());
     words.push(0);
+    words.extend(env_ptrs.iter().copied());
     words.push(0);
     for item in aux {
         words.push(item.key);
@@ -527,7 +551,7 @@ fn build_initial_stack(
 }
 
 fn push_stack_bytes(
-    aspace: &AddrSpace,
+    aspace: &mut AddrSpace,
     stack_base: usize,
     sp: &mut usize,
     data: &[u8],

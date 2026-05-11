@@ -579,19 +579,16 @@ impl AxRunQueue {
 fn gc_entry() {
     loop {
         // Drop all exited tasks and recycle resources.
-        let n = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len());
-        for _ in 0..n {
+        while let Some(task) = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.pop_front()) {
             // Do not do the slow drops in the critical section.
-            let task = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.pop_front());
-            if let Some(task) = task {
-                if Arc::strong_count(&task) == 1 {
-                    // If I'm the last holder of the task, drop it immediately.
-                    drop(task);
-                } else {
-                    // Otherwise (e.g, `switch_to` is not compeleted, held by the
-                    // joiner, etc), push it back and wait for them to drop first.
-                    EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task));
-                }
+            if Arc::strong_count(&task) == 1 {
+                // If I'm the last holder, drop the task to free resources.
+                drop(task);
+            } else {
+                // Otherwise (e.g. `switch_to` is not completed, held by the joiner, etc),
+                // we push it back and wait for them to drop first.
+                EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task));
+                break;
             }
         }
         // Note: we cannot block current task with preemption disabled,

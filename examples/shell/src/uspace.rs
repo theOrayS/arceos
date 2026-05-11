@@ -1,8 +1,10 @@
 use core::cmp;
-use core::ffi::{CStr, c_char, c_long, c_void};
+use core::ffi::{c_long, c_void};
 use core::mem::{offset_of, size_of};
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 use arceos_posix_api::ctypes as posix_ctypes;
 use axerrno::LinuxError;
@@ -39,6 +41,7 @@ mod runtime_paths;
 mod signal_abi;
 mod synthetic_fs;
 mod sysv_shm;
+mod user_memory;
 
 use fd_pipe::PipeEndpoint;
 use fd_socket::{LocalSocketEntry, SocketEntry};
@@ -62,8 +65,15 @@ use synthetic_fs::{
     proc_self_maps_is_writable_open, proc_self_maps_path_entry, synthetic_file_is_writable_open,
     synthetic_userdb_content, synthetic_userdb_fd_entry, synthetic_userdb_path_entry,
 };
+use user_memory::{
+    read_cstr, read_user_value, user_bytes, user_bytes_mut, validate_user_read,
+    validate_user_write, write_user_value,
+};
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
+static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
+
+const NSEC_PER_SEC: i128 = 1_000_000_000;
 
 macro_rules! user_trace {
     ($($arg:tt)*) => {};
@@ -1526,8 +1536,10 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         ),
         general::__NR_ioctl => sys_ioctl(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_clock_gettime => sys_clock_gettime(&process, tf.arg0(), tf.arg1()),
+        general::__NR_clock_settime => sys_clock_settime(&process, tf.arg0(), tf.arg1()),
         general::__NR_clock_getres => sys_clock_getres(&process, tf.arg0(), tf.arg1()),
         general::__NR_gettimeofday => sys_gettimeofday(&process, tf.arg0(), tf.arg1()),
+        general::__NR_adjtimex => sys_adjtimex(&process, tf.arg0()),
         general::__NR_getrandom => sys_getrandom(&process, tf.arg0(), tf.arg1(), tf.arg2()),
         general::__NR_setitimer => sys_setitimer(&process, tf.arg0() as i32, tf.arg1(), tf.arg2()),
         general::__NR_times => sys_times(&process, tf.arg0()),
@@ -2061,7 +2073,16 @@ fn sys_clone(
 
         let child_process = match process.fork() {
             Ok(process) => process,
-            Err(err) => return neg_errno(err),
+            Err(err) => {
+                println!(
+                    "clone-failure-diagnostic: err={err:?} flags={flags:#x} clone_flags={clone_flags:#x} exit_signal={exit_signal} child_stack={child_stack:#x} parent_sp={:#x} parent_pc={:#x} clone_vm={} clone_vfork={}",
+                    tf.regs.sp,
+                    user_pc(tf),
+                    clone_flags & general::CLONE_VM as usize != 0,
+                    clone_flags & general::CLONE_VFORK as usize != 0,
+                );
+                return neg_errno(err);
+            }
         };
         let mut child_tf = child_trap_frame(tf, child_stack);
         if clone_flags & general::CLONE_SETTLS as usize != 0 {
@@ -2891,34 +2912,6 @@ fn sys_fcntl(process: &UserProcess, fd: usize, cmd: usize, arg: usize) -> isize 
     }
 }
 
-fn validate_user_read(process: &UserProcess, ptr: usize, len: usize) -> Result<(), LinuxError> {
-    validate_user_access(process, ptr, len, false)
-}
-
-fn validate_user_write(process: &UserProcess, ptr: usize, len: usize) -> Result<(), LinuxError> {
-    validate_user_access(process, ptr, len, true)
-}
-
-fn validate_user_access(
-    process: &UserProcess,
-    ptr: usize,
-    len: usize,
-    write: bool,
-) -> Result<(), LinuxError> {
-    if len == 0 {
-        return Ok(());
-    }
-    let valid = if write {
-        user_bytes_mut(process, ptr, len, true).is_some()
-    } else {
-        user_bytes(process, ptr, len, false).is_some()
-    };
-    if ptr == 0 || !valid {
-        return Err(LinuxError::EFAULT);
-    }
-    Ok(())
-}
-
 fn socket_entry(process: &UserProcess, fd: usize) -> Result<SocketEntry, LinuxError> {
     let table = process.fds.lock();
     match table.entry(fd as i32)? {
@@ -3711,6 +3704,32 @@ fn sys_ioctl(process: &UserProcess, fd: usize, req: usize, arg: usize) -> isize 
     neg_errno(LinuxError::ENOTTY)
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UserTimex {
+    modes: u32,
+    offset: c_long,
+    freq: c_long,
+    maxerror: c_long,
+    esterror: c_long,
+    status: i32,
+    constant: c_long,
+    precision: c_long,
+    tolerance: c_long,
+    time: general::timeval,
+    tick: c_long,
+    ppsfreq: c_long,
+    jitter: c_long,
+    shift: i32,
+    stabil: c_long,
+    jitcnt: c_long,
+    calcnt: c_long,
+    errcnt: c_long,
+    stbcnt: c_long,
+    tai: i32,
+    __padding: [i32; 11],
+}
+
 fn sys_clock_gettime(process: &UserProcess, clk_id: usize, tp: usize) -> isize {
     let now = match clock_now_duration(clk_id as u32) {
         Ok(now) => now,
@@ -3721,6 +3740,23 @@ fn sys_clock_gettime(process: &UserProcess, clk_id: usize, tp: usize) -> isize {
         tv_nsec: now.subsec_nanos() as _,
     };
     write_user_value(process, tp, &ts)
+}
+
+fn sys_clock_settime(process: &UserProcess, clk_id: usize, tp: usize) -> isize {
+    if clk_id != general::CLOCK_REALTIME as usize {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let ts = match read_user_value::<general::timespec>(process, tp) {
+        Ok(ts) => ts,
+        Err(err) => return neg_errno(err),
+    };
+    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let target_ns = ts.tv_sec as i128 * NSEC_PER_SEC + ts.tv_nsec as i128;
+    let raw_ns = duration_to_ns_i128(axhal::time::wall_time());
+    REALTIME_OFFSET_NS.store(clamp_i128_to_i64(target_ns - raw_ns), Ordering::Release);
+    0
 }
 
 fn sys_clock_getres(process: &UserProcess, clk_id: usize, tp: usize) -> isize {
@@ -3739,7 +3775,7 @@ fn sys_clock_getres(process: &UserProcess, clk_id: usize, tp: usize) -> isize {
 
 fn sys_gettimeofday(process: &UserProcess, tv: usize, tz: usize) -> isize {
     if tv != 0 {
-        let now = axhal::time::wall_time();
+        let now = adjusted_wall_time();
         let value = general::timeval {
             tv_sec: now.as_secs() as _,
             tv_usec: now.subsec_micros() as _,
@@ -3754,6 +3790,71 @@ fn sys_gettimeofday(process: &UserProcess, tv: usize, tz: usize) -> isize {
         return_on_user_write_error!(process, tz, &value);
     }
     0
+}
+
+fn sys_adjtimex(process: &UserProcess, tx: usize) -> isize {
+    const ADJ_OFFSET: u32 = 0x0001;
+    const ADJ_FREQUENCY: u32 = 0x0002;
+    const ADJ_MAXERROR: u32 = 0x0004;
+    const ADJ_ESTERROR: u32 = 0x0008;
+    const ADJ_STATUS: u32 = 0x0010;
+    const ADJ_TIMECONST: u32 = 0x0020;
+    const ADJ_TAI: u32 = 0x0080;
+    const ADJ_SETOFFSET: u32 = 0x0100;
+    const ADJ_MICRO: u32 = 0x1000;
+    const ADJ_NANO: u32 = 0x2000;
+    const ADJ_TICK: u32 = 0x4000;
+    const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
+    const ADJ_OFFSET_SS_READ: u32 = 0xa001;
+    const ADJ_REGULAR_MASK: u32 = ADJ_OFFSET
+        | ADJ_FREQUENCY
+        | ADJ_MAXERROR
+        | ADJ_ESTERROR
+        | ADJ_STATUS
+        | ADJ_TIMECONST
+        | ADJ_TAI
+        | ADJ_SETOFFSET
+        | ADJ_MICRO
+        | ADJ_NANO
+        | ADJ_TICK;
+    const USER_HZ: c_long = 100;
+    const TIME_OK: isize = 0;
+
+    let input = match read_user_value::<UserTimex>(process, tx) {
+        Ok(input) => input,
+        Err(err) => return neg_errno(err),
+    };
+    let modes = input.modes;
+    let valid_modes = modes & !ADJ_REGULAR_MASK == 0
+        || modes == ADJ_OFFSET_SINGLESHOT
+        || modes == ADJ_OFFSET_SS_READ;
+    if !valid_modes {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    if modes & ADJ_TICK != 0 {
+        let min_tick = 900_000 / USER_HZ;
+        let max_tick = 1_100_000 / USER_HZ;
+        if input.tick < min_tick || input.tick > max_tick {
+            return neg_errno(LinuxError::EINVAL);
+        }
+    }
+    if modes != 0 && process.uid() != 0 {
+        return neg_errno(LinuxError::EPERM);
+    }
+
+    let now = adjusted_wall_time();
+    let mut output: UserTimex = unsafe { core::mem::zeroed() };
+    output.precision = 1;
+    output.time = general::timeval {
+        tv_sec: now.as_secs() as _,
+        tv_usec: now.subsec_micros() as _,
+    };
+    output.tick = 10_000;
+    let ret = write_user_value(process, tx, &output);
+    if ret != 0 {
+        return ret;
+    }
+    TIME_OK
 }
 
 fn sys_setitimer(
@@ -4010,7 +4111,7 @@ fn read_timespec_duration(
 fn clock_now_duration(clockid: u32) -> Result<core::time::Duration, LinuxError> {
     match clockid {
         general::CLOCK_REALTIME | general::CLOCK_REALTIME_COARSE | general::CLOCK_TAI => {
-            Ok(axhal::time::wall_time())
+            Ok(adjusted_wall_time())
         }
         general::CLOCK_MONOTONIC
         | general::CLOCK_MONOTONIC_RAW
@@ -4023,8 +4124,28 @@ fn clock_now_duration(clockid: u32) -> Result<core::time::Duration, LinuxError> 
     }
 }
 
+fn adjusted_wall_time() -> core::time::Duration {
+    let raw_ns = duration_to_ns_i128(axhal::time::wall_time());
+    let offset_ns = REALTIME_OFFSET_NS.load(Ordering::Acquire) as i128;
+    let adjusted_ns = raw_ns + offset_ns;
+    if adjusted_ns <= 0 {
+        return core::time::Duration::ZERO;
+    }
+    let secs = (adjusted_ns / NSEC_PER_SEC).min(u64::MAX as i128) as u64;
+    let nanos = (adjusted_ns % NSEC_PER_SEC) as u32;
+    core::time::Duration::new(secs, nanos)
+}
+
+fn duration_to_ns_i128(duration: core::time::Duration) -> i128 {
+    duration.as_secs() as i128 * NSEC_PER_SEC + duration.subsec_nanos() as i128
+}
+
+fn clamp_i128_to_i64(value: i128) -> i64 {
+    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
 fn rtc_time_from_wall_time() -> RtcTime {
-    let now = axhal::time::wall_time();
+    let now = adjusted_wall_time();
     let total_secs = now.as_secs() as i64;
     let days = total_secs.div_euclid(86_400);
     let secs_of_day = total_secs.rem_euclid(86_400);
@@ -4826,91 +4947,6 @@ fn with_writable_slice(
     }
 }
 
-fn user_range_fits(ptr: usize, len: usize) -> bool {
-    len == 0 || ptr.checked_add(len).is_some()
-}
-
-fn user_range_accessible(process: &UserProcess, ptr: usize, len: usize, write: bool) -> bool {
-    if !user_range_fits(ptr, len) {
-        return false;
-    }
-    let flags = if write {
-        MappingFlags::READ | MappingFlags::WRITE
-    } else {
-        MappingFlags::READ
-    };
-    process
-        .aspace
-        .lock()
-        .can_access_range(VirtAddr::from(ptr), len, flags)
-}
-
-fn user_bytes<'a>(process: &UserProcess, ptr: usize, len: usize, write: bool) -> Option<&'a [u8]> {
-    if len == 0 {
-        return Some(&[]);
-    }
-    if !user_range_accessible(process, ptr, len, write) {
-        return None;
-    }
-    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
-}
-
-fn user_bytes_mut<'a>(
-    process: &UserProcess,
-    ptr: usize,
-    len: usize,
-    write: bool,
-) -> Option<&'a mut [u8]> {
-    if len == 0 {
-        return Some(&mut []);
-    }
-    if !user_range_accessible(process, ptr, len, write) {
-        return None;
-    }
-    Some(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) })
-}
-
-fn write_user_value<T: Copy>(process: &UserProcess, ptr: usize, value: &T) -> isize {
-    let Some(dst) = user_bytes_mut(process, ptr, size_of::<T>(), true) else {
-        return neg_errno(LinuxError::EFAULT);
-    };
-    unsafe {
-        ptr::copy_nonoverlapping(
-            value as *const T as *const u8,
-            dst.as_mut_ptr(),
-            size_of::<T>(),
-        );
-    }
-    0
-}
-
-fn read_user_value<T: Copy>(process: &UserProcess, ptr: usize) -> Result<T, LinuxError> {
-    let Some(src) = user_bytes(process, ptr, size_of::<T>(), false) else {
-        return Err(LinuxError::EFAULT);
-    };
-    Ok(unsafe { ptr::read_unaligned(src.as_ptr() as *const T) })
-}
-
-fn read_cstr(process: &UserProcess, ptr: usize) -> Result<String, LinuxError> {
-    if ptr == 0 {
-        return Err(LinuxError::EFAULT);
-    }
-    if !user_range_fits(ptr, 1) {
-        return Err(LinuxError::EFAULT);
-    }
-    if !process
-        .aspace
-        .lock()
-        .can_access_range(VirtAddr::from(ptr), 1, MappingFlags::READ)
-    {
-        return Err(LinuxError::EFAULT);
-    }
-    unsafe { CStr::from_ptr(ptr as *const c_char) }
-        .to_str()
-        .map(|s| s.to_string())
-        .map_err(|_| LinuxError::EINVAL)
-}
-
 fn read_user_word(process: &UserProcess, ptr: usize) -> Result<usize, LinuxError> {
     let Some(bytes) = user_bytes(process, ptr, size_of::<usize>(), false) else {
         return Err(LinuxError::EFAULT);
@@ -4951,6 +4987,77 @@ fn current_cwd() -> String {
 
 fn resolve_host_path(cwd: String, path: &str) -> Result<String, String> {
     normalize_path(cwd.as_str(), path).ok_or_else(|| format!("invalid path: {path}"))
+}
+
+fn busybox_applet_target_path(path: &str) -> Option<String> {
+    let (root, applet) = path
+        .strip_prefix("/musl/")
+        .map(|applet| ("/musl", applet))
+        .or_else(|| {
+            path.strip_prefix("/glibc/")
+                .map(|applet| ("/glibc", applet))
+        })?;
+    if applet.is_empty()
+        || applet.contains('/')
+        || applet == "busybox"
+        || !is_busybox_applet_name(applet)
+    {
+        return None;
+    }
+    Some(format!("{root}/busybox"))
+}
+
+fn is_busybox_applet_name(name: &str) -> bool {
+    matches!(
+        name,
+        "[" | "ash"
+            | "basename"
+            | "cal"
+            | "cat"
+            | "clear"
+            | "cp"
+            | "cut"
+            | "date"
+            | "df"
+            | "dirname"
+            | "dmesg"
+            | "du"
+            | "echo"
+            | "expr"
+            | "false"
+            | "find"
+            | "free"
+            | "grep"
+            | "head"
+            | "hexdump"
+            | "hwclock"
+            | "kill"
+            | "ls"
+            | "md5sum"
+            | "mkdir"
+            | "more"
+            | "mv"
+            | "od"
+            | "printf"
+            | "ps"
+            | "pwd"
+            | "rm"
+            | "rmdir"
+            | "sh"
+            | "sleep"
+            | "sort"
+            | "stat"
+            | "strings"
+            | "tail"
+            | "test"
+            | "touch"
+            | "true"
+            | "uname"
+            | "uniq"
+            | "uptime"
+            | "wc"
+            | "which"
+    )
 }
 
 fn normalize_path(base: &str, path: &str) -> Option<String> {
@@ -5812,9 +5919,10 @@ fn open_fd_entry(
 
     let absolute = path.starts_with('/');
     let exec_root = process.exec_root();
+    let add_busybox_aliases = busybox_applet_alias_allowed(flags, access);
 
     if absolute || dirfd == general::AT_FDCWD {
-        let candidates = if absolute {
+        let mut candidates = if absolute {
             if let Some(path) = dev_shm_host_path(path) {
                 ensure_dev_shm_dir()?;
                 return open_candidates(process, &[path], &opts, flags, mode);
@@ -5829,6 +5937,9 @@ fn open_fd_entry(
             }
             candidates
         };
+        if add_busybox_aliases {
+            append_busybox_applet_alias_candidates(&mut candidates);
+        }
         if candidates.is_empty() {
             return Err(LinuxError::EINVAL);
         }
@@ -5842,7 +5953,22 @@ fn open_fd_entry(
         for extra in runtime_library_name_candidates(exec_root.as_str(), path) {
             push_runtime_candidate(&mut candidates, Some(extra));
         }
+        if add_busybox_aliases {
+            append_busybox_applet_alias_candidates(&mut candidates);
+        }
         open_candidates(process, &candidates, &opts, flags, mode)
+    }
+}
+
+fn busybox_applet_alias_allowed(flags: u32, access: u32) -> bool {
+    access != general::O_WRONLY
+        && access != general::O_RDWR
+        && flags & (general::O_CREAT | general::O_TRUNC | general::O_APPEND) == 0
+}
+
+fn append_busybox_applet_alias_candidates(candidates: &mut Vec<String>) {
+    for candidate in candidates.clone() {
+        push_runtime_candidate(candidates, busybox_applet_target_path(candidate.as_str()));
     }
 }
 

@@ -71,6 +71,14 @@ impl MappingBackend for Backend {
 }
 
 impl Backend {
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match *self {
+            Self::Linear { .. } => "linear",
+            Self::Alloc { populate: true } => "alloc-populate",
+            Self::Alloc { populate: false } => "alloc-lazy",
+        }
+    }
+
     pub(crate) fn handle_page_fault(
         &self,
         vaddr: VirtAddr,

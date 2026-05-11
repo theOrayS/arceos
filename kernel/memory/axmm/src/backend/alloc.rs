@@ -45,6 +45,10 @@ impl Backend {
             let mut cursor = pt.cursor();
             for addr in PageIter4K::new(start, start + size).unwrap() {
                 let Some(frame) = alloc_frame(true) else {
+                    warn!(
+                        "map_alloc: frame allocation failed start={:#x} size={:#x} at={:#x} flags={:?} populate=true",
+                        start, size, addr, flags
+                    );
                     for rollback_addr in PageIter4K::new(start, addr).unwrap() {
                         if let Ok((mapped_frame, _, page_size)) = cursor.unmap(rollback_addr)
                             && !page_size.is_huge()
@@ -55,6 +59,10 @@ impl Backend {
                     return false;
                 };
                 if cursor.map(addr, frame, PageSize::Size4K, flags).is_err() {
+                    warn!(
+                        "map_alloc: page-table map failed start={:#x} size={:#x} at={:#x} frame={:#x} flags={:?} populate=true",
+                        start, size, addr, frame, flags
+                    );
                     for rollback_addr in PageIter4K::new(start, addr).unwrap() {
                         if let Ok((mapped_frame, _, page_size)) = cursor.unmap(rollback_addr)
                             && !page_size.is_huge()
@@ -72,6 +80,13 @@ impl Backend {
             let flags = MappingFlags::empty();
             pt.cursor()
                 .map_region(start, |_| 0.into(), size, flags, false)
+                .map_err(|err| {
+                    warn!(
+                        "map_alloc: lazy placeholder map failed start={:#x} size={:#x}: {:?}",
+                        start, size, err
+                    );
+                    err
+                })
                 .is_ok()
         }
     }
@@ -112,7 +127,7 @@ impl Backend {
             // aligned during `pt.remap` regardless of the page size.
             let res = pt.cursor().remap(vaddr, frame, orig_flags);
             if let Err(e) = &res {
-                debug!(
+                warn!(
                     "handle_page_fault_alloc: remap failed for {:#x}: {:?}",
                     vaddr, e
                 );
@@ -120,6 +135,10 @@ impl Backend {
             }
             res.is_ok()
         } else {
+            warn!(
+                "handle_page_fault_alloc: frame allocation failed for {:#x} flags={:?}",
+                vaddr, orig_flags
+            );
             false
         }
     }
