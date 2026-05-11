@@ -5659,7 +5659,16 @@ fn sys_utimensat(
     };
 
     if let Some(abs_path) = abs_path.as_ref() {
-        update_path_times(abs_path.as_str(), atime, mtime);
+        let target_path = {
+            let table = process.fds.lock();
+            proc_magiclink_target(process, &table, abs_path.as_str())
+                .unwrap_or_else(|| abs_path.clone())
+        };
+        update_path_times(target_path.as_str(), atime, mtime);
+        process
+            .fds
+            .lock()
+            .sync_path_times(target_path.as_str(), atime, mtime, now);
         return 0;
     }
 
@@ -7921,6 +7930,21 @@ const fn zero_user_timespec() -> general::timespec {
     }
 }
 
+fn apply_fd_time_updates(
+    current: &mut FdStatTimes,
+    atime: Option<general::timespec>,
+    mtime: Option<general::timespec>,
+    ctime: general::timespec,
+) {
+    if let Some(ts) = atime {
+        current.atime = ts;
+    }
+    if let Some(ts) = mtime {
+        current.mtime = ts;
+    }
+    current.ctime = ctime;
+}
+
 #[cfg(feature = "net")]
 fn generic_socket_stat(socket_type: u32) -> general::stat {
     let mut st: general::stat = unsafe { core::mem::zeroed() };
@@ -8003,7 +8027,18 @@ fn stat_to_statx(st: &general::stat, requested_mask: u32, mnt_id: u64) -> genera
     out.stx_rdev_minor = linux_minor(st.st_rdev as u64);
     out.stx_dev_major = linux_major(st.st_dev as u64);
     out.stx_dev_minor = linux_minor(st.st_dev as u64);
+    out.stx_atime = stat_timestamp_to_statx(st.st_atime as i64, st.st_atime_nsec as i64);
+    out.stx_mtime = stat_timestamp_to_statx(st.st_mtime as i64, st.st_mtime_nsec as i64);
+    out.stx_ctime = stat_timestamp_to_statx(st.st_ctime as i64, st.st_ctime_nsec as i64);
     out
+}
+
+fn stat_timestamp_to_statx(sec: i64, nsec: i64) -> general::statx_timestamp {
+    general::statx_timestamp {
+        tv_sec: sec,
+        tv_nsec: nsec.clamp(0, 999_999_999) as u32,
+        __reserved: 0,
+    }
 }
 
 fn statx_mount_id(path: Option<&str>) -> u64 {
@@ -8369,6 +8404,30 @@ impl FdTable {
             FdEntry::Pipe(pipe) => Ok(pipe.stat()),
             #[cfg(feature = "net")]
             FdEntry::Socket(socket) => Ok(generic_socket_stat(socket.socket_type)),
+        }
+    }
+
+    fn sync_path_times(
+        &mut self,
+        path: &str,
+        atime: Option<general::timespec>,
+        mtime: Option<general::timespec>,
+        ctime: general::timespec,
+    ) {
+        for entry in &mut self.entries {
+            match entry {
+                Some(FdEntry::File(file)) if file.path == path => {
+                    let mut times = file.times.lock();
+                    let mut current = times.unwrap_or(FdStatTimes {
+                        atime: zero_user_timespec(),
+                        mtime: zero_user_timespec(),
+                        ctime: zero_user_timespec(),
+                    });
+                    apply_fd_time_updates(&mut current, atime, mtime, ctime);
+                    *times = Some(current);
+                }
+                _ => {}
+            }
         }
     }
 
