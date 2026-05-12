@@ -36,6 +36,10 @@ impl From<Duration> for ctypes::timeval {
 }
 
 /// Get clock time since booting
+///
+/// # Safety
+///
+/// `ts` must be writable for one `timespec` value.
 pub unsafe fn sys_clock_gettime(clk: ctypes::clockid_t, ts: *mut ctypes::timespec) -> c_int {
     syscall_body!(sys_clock_gettime, {
         if ts.is_null() {
@@ -58,6 +62,11 @@ pub unsafe fn sys_clock_gettime(clk: ctypes::clockid_t, ts: *mut ctypes::timespe
 /// Sleep some nanoseconds
 ///
 /// TODO: should be woken by signals, and set errno
+///
+/// # Safety
+///
+/// `req` must point to a readable `timespec`. `rem` must be writable for one
+/// `timespec` value when non-null.
 pub unsafe fn sys_nanosleep(req: *const ctypes::timespec, rem: *mut ctypes::timespec) -> c_int {
     syscall_body!(sys_nanosleep, {
         unsafe {

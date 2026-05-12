@@ -606,6 +606,11 @@ pub unsafe fn sys_getaddrinfo(
 }
 
 /// Free queried `addrinfo` struct
+///
+/// # Safety
+///
+/// `res` must be either null or a pointer previously returned by
+/// `sys_getaddrinfo` and not already freed.
 pub unsafe fn sys_freeaddrinfo(res: *mut ctypes::addrinfo) {
     if res.is_null() {
         return;

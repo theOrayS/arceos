@@ -156,7 +156,7 @@ pub unsafe extern "C" fn getaddrinfo(
 /// Free queried `addrinfo` struct
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn freeaddrinfo(res: *mut ctypes::addrinfo) {
-    sys_freeaddrinfo(res);
+    unsafe { sys_freeaddrinfo(res) };
 }
 
 /// Get current address to which the socket sockfd is bound.

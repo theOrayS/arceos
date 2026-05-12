@@ -5,6 +5,10 @@ use core::ffi::c_int;
 /// Get resource limitations
 ///
 /// TODO: support more resource types
+///
+/// # Safety
+///
+/// `rlimits` must be writable for one `rlimit` value when non-null.
 pub unsafe fn sys_getrlimit(resource: c_int, rlimits: *mut ctypes::rlimit) -> c_int {
     debug!("sys_getrlimit <= {} {:#x}", resource, rlimits as usize);
     syscall_body!(sys_getrlimit, {
@@ -36,6 +40,10 @@ pub unsafe fn sys_getrlimit(resource: c_int, rlimits: *mut ctypes::rlimit) -> c_
 /// Set resource limitations
 ///
 /// TODO: support more resource types
+///
+/// # Safety
+///
+/// `rlimits` must point to a readable `rlimit` value when non-null.
 pub unsafe fn sys_setrlimit(resource: c_int, rlimits: *mut crate::ctypes::rlimit) -> c_int {
     debug!("sys_setrlimit <= {} {:#x}", resource, rlimits as usize);
     syscall_body!(sys_setrlimit, {
