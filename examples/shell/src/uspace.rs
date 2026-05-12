@@ -52,7 +52,7 @@ mod user_memory;
 
 use credentials::{
     access_allowed, apply_chown_metadata, chown_ids, read_group_list, set_fs_id, set_re_ids,
-    set_res_ids, set_single_id, write_group_list, write_id_triplet,
+    set_res_ids, set_single_id, write_getgroups_response, write_id_triplet,
 };
 use fd_pipe::PipeEndpoint;
 use fd_socket::{
@@ -2056,13 +2056,7 @@ fn sys_setfsgid(process: &UserProcess, gid: usize) -> isize {
 
 fn sys_getgroups(process: &UserProcess, size: usize, list: usize) -> isize {
     let groups = process.groups();
-    if size == 0 {
-        return groups.len() as isize;
-    }
-    if size < groups.len() {
-        return neg_errno(LinuxError::EINVAL);
-    }
-    write_group_list(process, list, &groups)
+    write_getgroups_response(process, size, list, &groups)
 }
 
 fn sys_setgroups(process: &UserProcess, size: usize, list: usize) -> isize {

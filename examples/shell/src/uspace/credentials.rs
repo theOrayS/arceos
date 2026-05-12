@@ -79,7 +79,22 @@ pub(super) fn write_id_triplet(process: &UserProcess, ptrs: [usize; 3], values: 
     0
 }
 
-pub(super) fn write_group_list(process: &UserProcess, list: usize, groups: &[u32]) -> isize {
+pub(super) fn write_getgroups_response(
+    process: &UserProcess,
+    size: usize,
+    list: usize,
+    groups: &[u32],
+) -> isize {
+    if size == 0 {
+        return groups.len() as isize;
+    }
+    if size < groups.len() {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    write_group_list(process, list, groups)
+}
+
+fn write_group_list(process: &UserProcess, list: usize, groups: &[u32]) -> isize {
     for (idx, gid) in groups.iter().enumerate() {
         let ret = write_user_value(process, list + idx * size_of::<u32>(), gid);
         if ret != 0 {
