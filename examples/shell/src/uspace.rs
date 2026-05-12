@@ -3098,19 +3098,7 @@ fn sys_accept_bridge(
         if let Err(err) = validate_user_write(process, addr, len) {
             return cleanup(err);
         }
-        let copy_len = core::cmp::min(len, size_of::<posix_ctypes::sockaddr>());
-        if copy_len > 0 {
-            let local_addr_bytes = unsafe {
-                core::slice::from_raw_parts(
-                    &local_addr as *const _ as *const u8,
-                    size_of::<posix_ctypes::sockaddr>(),
-                )
-            };
-            if let Err(err) = write_user_bytes(process, addr, &local_addr_bytes[..copy_len]) {
-                return cleanup(err);
-            }
-        }
-        let ret = write_user_value(process, addrlen, &local_len);
+        let ret = write_socket_addr_to_user(process, addr, addrlen, len, &local_addr, local_len);
         if ret < 0 {
             let _ = arceos_posix_api::sys_close(new_posix_fd);
             return ret;
@@ -3196,6 +3184,7 @@ fn sys_recvfrom_bridge(
             flags as i32,
             addr,
             addrlen,
+            addr_len_value,
         )
     };
     ret
@@ -3247,17 +3236,16 @@ fn socket_name_bridge(
         Ok(len) => len as usize,
         Err(err) => return neg_errno(err),
     };
+    if addr == 0 {
+        return neg_errno(LinuxError::EFAULT);
+    }
     if let Err(err) = validate_user_write(process, addr, len) {
         return neg_errno(err);
     }
-    match posix_ret_i32(unsafe {
-        op(
-            socket.posix_fd,
-            addr as *mut posix_ctypes::sockaddr,
-            addrlen as *mut posix_ctypes::socklen_t,
-        )
-    }) {
-        Ok(_) => 0,
+    let mut local_addr: posix_ctypes::sockaddr = unsafe { core::mem::zeroed() };
+    let mut local_len = len as posix_ctypes::socklen_t;
+    match posix_ret_i32(unsafe { op(socket.posix_fd, &mut local_addr, &mut local_len) }) {
+        Ok(_) => write_socket_addr_to_user(process, addr, addrlen, len, &local_addr, local_len),
         Err(err) => neg_errno(err),
     }
 }
@@ -4961,6 +4949,29 @@ fn read_socket_addr_from_user(
     read_user_bytes(process, ptr, len)
 }
 
+fn write_socket_addr_to_user(
+    process: &UserProcess,
+    addr: usize,
+    addrlen: usize,
+    user_len: usize,
+    local_addr: &posix_ctypes::sockaddr,
+    local_len: posix_ctypes::socklen_t,
+) -> isize {
+    let copy_len = core::cmp::min(user_len, size_of::<posix_ctypes::sockaddr>());
+    if copy_len > 0 {
+        let local_addr_bytes = unsafe {
+            core::slice::from_raw_parts(
+                local_addr as *const _ as *const u8,
+                size_of::<posix_ctypes::sockaddr>(),
+            )
+        };
+        if let Err(err) = write_user_bytes(process, addr, &local_addr_bytes[..copy_len]) {
+            return neg_errno(err);
+        }
+    }
+    write_user_value(process, addrlen, &local_len)
+}
+
 fn recv_socket_data_to_user(
     process: &UserProcess,
     posix_fd: i32,
@@ -4981,17 +4992,27 @@ fn recv_socket_data_to_user_with_addr(
     flags: i32,
     addr: usize,
     addrlen: usize,
+    user_addr_len: usize,
 ) -> isize {
-    recv_socket_data_to_user_inner(process, posix_fd, buf, len, |dst| unsafe {
-        arceos_posix_api::sys_recvfrom(
-            posix_fd,
-            dst,
-            len,
-            flags,
-            addr as *mut posix_ctypes::sockaddr,
-            addrlen as *mut posix_ctypes::socklen_t,
-        )
-    })
+    let mut local_addr: posix_ctypes::sockaddr = unsafe { core::mem::zeroed() };
+    let mut local_len = 0 as posix_ctypes::socklen_t;
+    let ret = recv_socket_data_to_user_inner(process, posix_fd, buf, len, |dst| unsafe {
+        arceos_posix_api::sys_recvfrom(posix_fd, dst, len, flags, &mut local_addr, &mut local_len)
+    });
+    if ret > 0 && local_len != 0 {
+        let addr_ret = write_socket_addr_to_user(
+            process,
+            addr,
+            addrlen,
+            user_addr_len,
+            &local_addr,
+            local_len,
+        );
+        if addr_ret < 0 {
+            return addr_ret;
+        }
+    }
+    ret
 }
 
 fn recv_socket_data_to_user_inner(
