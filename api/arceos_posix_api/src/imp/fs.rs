@@ -212,12 +212,13 @@ pub unsafe fn sys_getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
         if buf.is_null() {
             return Ok(core::ptr::null::<c_char>() as _);
         }
-        let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, size as _) };
         let cwd = axfs::api::current_dir()?;
         let cwd = cwd.as_bytes();
         if cwd.len() < size {
-            dst[..cwd.len()].copy_from_slice(cwd);
-            dst[cwd.len()] = 0;
+            unsafe {
+                core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf as *mut u8, cwd.len());
+                core::ptr::write((buf as *mut u8).add(cwd.len()), 0);
+            }
             Ok(buf)
         } else {
             Err(LinuxError::ERANGE)
