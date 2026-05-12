@@ -73,8 +73,8 @@ use process_abi::apply_personality_request;
 use program_loader::load_program_image;
 use resource_sched::{
     UserRlimit, UserSchedParam, default_rlimit, default_sched_param, is_same_sched_target,
-    prlimit_target_valid, rlimit_is_valid, sched_param_accepts_policy,
-    sched_param_accepts_setparam,
+    prlimit_target_valid, rlimit_is_valid, sched_affinity_accepts_current_cpu,
+    sched_affinity_result_len, sched_param_accepts_policy, sched_param_accepts_setparam,
 };
 use runtime_paths::{
     busybox_applet_target_path, current_cwd, normalize_path, push_runtime_candidate,
@@ -3200,7 +3200,7 @@ fn sys_sched_setaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mas
         return neg_errno(err);
     }
     match read_user_value::<u8>(process, mask) {
-        Ok(first) if first & 1 != 0 => 0,
+        Ok(first) if sched_affinity_accepts_current_cpu(first) => 0,
         Ok(_) => neg_errno(LinuxError::EINVAL),
         Err(err) => neg_errno(err),
     }
@@ -3215,7 +3215,7 @@ fn sys_sched_getaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mas
     if let Err(err) = write_user_bytes(process, mask, &[1]) {
         return neg_errno(err);
     }
-    cmp::min(cpusetsize, size_of::<usize>()) as isize
+    sched_affinity_result_len(cpusetsize) as isize
 }
 
 fn sys_syslog(process: &UserProcess, log_type: i32, buf: usize, len: usize) -> isize {

@@ -1,3 +1,6 @@
+use core::cmp;
+use core::mem::size_of;
+
 use linux_raw_sys::general;
 
 use super::linux_abi::{
@@ -62,4 +65,12 @@ pub(super) fn sched_param_accepts_policy(policy: i32, param: UserSchedParam) -> 
 
 pub(super) fn is_same_sched_target(process: &UserProcess, pid: i32) -> bool {
     pid == 0 || pid == current_tid() || pid == process.pid()
+}
+
+pub(super) fn sched_affinity_accepts_current_cpu(first_mask_byte: u8) -> bool {
+    first_mask_byte & 1 != 0
+}
+
+pub(super) fn sched_affinity_result_len(cpusetsize: usize) -> usize {
+    cmp::min(cpusetsize, size_of::<usize>())
 }
