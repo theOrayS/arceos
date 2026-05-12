@@ -5,6 +5,7 @@
 use alloc::collections::BTreeMap;
 use alloc::collections::btree_map::Entry;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::{ffi::c_int, time::Duration};
 
 use axerrno::{LinuxError, LinuxResult};
@@ -88,22 +89,22 @@ impl EpollInstance {
             match get_file_like(*infd as c_int)?.poll() {
                 Err(_) => {
                     if (ev.events & ctypes::EPOLLERR) != 0 {
-                        events[events_num].events = ctypes::EPOLLERR;
-                        events[events_num].data = ev.data;
-                        events_num += 1;
+                        if !push_ready_event(events, &mut events_num, ctypes::EPOLLERR, ev.data) {
+                            return Ok(events_num);
+                        }
                     }
                 }
                 Ok(state) => {
                     if state.readable && (ev.events & ctypes::EPOLLIN != 0) {
-                        events[events_num].events = ctypes::EPOLLIN;
-                        events[events_num].data = ev.data;
-                        events_num += 1;
+                        if !push_ready_event(events, &mut events_num, ctypes::EPOLLIN, ev.data) {
+                            return Ok(events_num);
+                        }
                     }
 
                     if state.writable && (ev.events & ctypes::EPOLLOUT != 0) {
-                        events[events_num].events = ctypes::EPOLLOUT;
-                        events[events_num].data = ev.data;
-                        events_num += 1;
+                        if !push_ready_event(events, &mut events_num, ctypes::EPOLLOUT, ev.data) {
+                            return Ok(events_num);
+                        }
                     }
                 }
             }
@@ -142,6 +143,21 @@ impl FileLike for EpollInstance {
     fn set_nonblocking(&self, _nonblocking: bool) -> LinuxResult {
         Ok(())
     }
+}
+
+fn push_ready_event(
+    events: &mut [ctypes::epoll_event],
+    events_num: &mut usize,
+    event_mask: u32,
+    data: ctypes::epoll_data_t,
+) -> bool {
+    if *events_num >= events.len() {
+        return false;
+    }
+    events[*events_num].events = event_mask;
+    events[*events_num].data = data;
+    *events_num += 1;
+    true
 }
 
 /// Creates a new epoll instance.
@@ -209,15 +225,23 @@ pub unsafe fn sys_epoll_wait(
         if events.is_null() {
             return Err(LinuxError::EFAULT);
         }
-        let events = unsafe { core::slice::from_raw_parts_mut(events, maxevents as usize) };
+        let maxevents = maxevents as usize;
+        let mut ready_events = Vec::new();
+        ready_events
+            .try_reserve_exact(maxevents)
+            .map_err(|_| LinuxError::ENOMEM)?;
+        ready_events.resize(maxevents, ctypes::epoll_event::default());
         let deadline =
             (!timeout.is_negative()).then(|| wall_time() + Duration::from_millis(timeout as u64));
         let epoll_instance = EpollInstance::from_fd(epfd)?;
         loop {
             #[cfg(feature = "net")]
             axnet::poll_interfaces();
-            let events_num = epoll_instance.poll_all(events)?;
+            let events_num = epoll_instance.poll_all(&mut ready_events)?;
             if events_num > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(ready_events.as_ptr(), events, events_num);
+                }
                 return Ok(events_num as c_int);
             }
 
