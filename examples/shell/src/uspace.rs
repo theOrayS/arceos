@@ -96,7 +96,7 @@ use system_info::{
 };
 use task_context::{
     UserTaskExt, current_process, current_task_ext, current_tid, robust_list_for_task,
-    set_current_robust_list, task_ext,
+    set_current_clear_child_tid, set_current_robust_list, task_ext,
 };
 use task_registry::{
     UserThreadEntry, register_user_task, unregister_user_task, user_thread_entry_by_process_pid,
@@ -3538,9 +3538,7 @@ fn sys_mprotect(_process: &UserProcess, _addr: usize, _len: usize, _prot: usize)
 }
 
 fn sys_set_tid_address(_tf: &TrapFrame, _tidptr: usize) -> isize {
-    if let Some(ext) = current_task_ext() {
-        ext.clear_child_tid.store(_tidptr, Ordering::Release);
-    }
+    set_current_clear_child_tid(_tidptr);
     user_trace!(
         "user-set-tid: tid={} tidptr={_tidptr:#x} sp={:#x} tp={:#x} ra={:#x} pc={:#x}",
         current_tid(),

@@ -65,6 +65,12 @@ pub(super) fn task_ext(task: &AxTaskRef) -> Option<&UserTaskExt> {
     Some(unsafe { &*(ptr as *const UserTaskExt) })
 }
 
+pub(super) fn set_current_clear_child_tid(tidptr: usize) {
+    if let Some(ext) = current_task_ext() {
+        ext.clear_child_tid.store(tidptr, Ordering::Release);
+    }
+}
+
 pub(super) fn set_current_robust_list(head: usize, len: usize) -> Result<(), LinuxError> {
     let Some(ext) = current_task_ext() else {
         return Err(LinuxError::EINVAL);
