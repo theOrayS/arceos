@@ -57,7 +57,8 @@ use fd_pipe::PipeEndpoint;
 use fd_socket::{
     insert_local_socket_entry, insert_socket_entry, is_local_socket_fd, read_socket_addr_from_user,
     read_socket_data_from_user, recv_socket_data_to_user, recv_socket_data_to_user_with_addr,
-    socket_addr_call, socket_entry, socket_option_supported, write_socket_addr_to_user,
+    socket_addr_call, socket_entry, socket_name_bridge, socket_option_supported,
+    write_socket_addr_to_user,
 };
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
 use linux_abi::*;
@@ -2690,38 +2691,6 @@ fn sys_getpeername_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen
         addrlen,
         arceos_posix_api::sys_getpeername,
     )
-}
-
-type SocketNameOp =
-    unsafe fn(i32, *mut posix_ctypes::sockaddr, *mut posix_ctypes::socklen_t) -> i32;
-
-fn socket_name_bridge(
-    process: &UserProcess,
-    fd: usize,
-    addr: usize,
-    addrlen: usize,
-    op: SocketNameOp,
-) -> isize {
-    let socket = socket_entry_or_return!(process, fd);
-    if let Err(err) = validate_user_write(process, addrlen, size_of::<posix_ctypes::socklen_t>()) {
-        return neg_errno(err);
-    }
-    let len = match read_user_value::<posix_ctypes::socklen_t>(process, addrlen) {
-        Ok(len) => len as usize,
-        Err(err) => return neg_errno(err),
-    };
-    if addr == 0 {
-        return neg_errno(LinuxError::EFAULT);
-    }
-    if let Err(err) = validate_user_write(process, addr, len) {
-        return neg_errno(err);
-    }
-    let mut local_addr: posix_ctypes::sockaddr = unsafe { core::mem::zeroed() };
-    let mut local_len = len as posix_ctypes::socklen_t;
-    match posix_ret_i32(unsafe { op(socket.posix_fd, &mut local_addr, &mut local_len) }) {
-        Ok(_) => write_socket_addr_to_user(process, addr, addrlen, len, &local_addr, local_len),
-        Err(err) => neg_errno(err),
-    }
 }
 
 fn current_real_itimer(process: &UserProcess) -> general::itimerval {

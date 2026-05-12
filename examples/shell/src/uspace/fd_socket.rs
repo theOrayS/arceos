@@ -18,8 +18,8 @@ use super::linux_abi::{
     TCP_NODELAY_OPT, fd_cloexec_flag, posix_errno_from_ret,
 };
 use super::user_memory::{
-    read_user_bytes, user_io_buffer, validate_user_read, validate_user_write, write_user_bytes,
-    write_user_value,
+    read_user_bytes, read_user_value, user_io_buffer, validate_user_read, validate_user_write,
+    write_user_bytes, write_user_value,
 };
 use super::{
     SelectMode, UserProcess, neg_errno, posix_ret_i32, posix_ret_usize,
@@ -257,6 +257,38 @@ where
         addrlen as posix_ctypes::socklen_t,
     )) {
         Ok(_) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
+pub(super) fn socket_name_bridge(
+    process: &UserProcess,
+    fd: usize,
+    addr: usize,
+    addrlen: usize,
+    op: unsafe fn(i32, *mut posix_ctypes::sockaddr, *mut posix_ctypes::socklen_t) -> i32,
+) -> isize {
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = validate_user_write(process, addrlen, size_of::<posix_ctypes::socklen_t>()) {
+        return neg_errno(err);
+    }
+    let len = match read_user_value::<posix_ctypes::socklen_t>(process, addrlen) {
+        Ok(len) => len as usize,
+        Err(err) => return neg_errno(err),
+    };
+    if addr == 0 {
+        return neg_errno(LinuxError::EFAULT);
+    }
+    if let Err(err) = validate_user_write(process, addr, len) {
+        return neg_errno(err);
+    }
+    let mut local_addr: posix_ctypes::sockaddr = unsafe { core::mem::zeroed() };
+    let mut local_len = len as posix_ctypes::socklen_t;
+    match posix_ret_i32(unsafe { op(socket.posix_fd, &mut local_addr, &mut local_len) }) {
+        Ok(_) => write_socket_addr_to_user(process, addr, addrlen, len, &local_addr, local_len),
         Err(err) => neg_errno(err),
     }
 }
