@@ -9,12 +9,13 @@ use linux_raw_sys::general;
 use std::sync::Arc;
 use std::vec::Vec;
 
+use super::fd_table::FdEntry;
 use super::linux_abi::{
     IP_RECVERR_OPT, IPPROTO_IP_LEVEL, LOCAL_SOCKET_INO_BASE, MCAST_JOIN_GROUP_OPT,
     MCAST_LEAVE_GROUP_OPT, SO_BROADCAST_OPT, SO_DONTROUTE_OPT, SO_ERROR_OPT, SO_KEEPALIVE_OPT,
     SO_RCVBUF_OPT, SO_RCVTIMEO_OPT, SO_REUSEADDR_OPT, SO_REUSEPORT_OPT, SO_SNDBUF_OPT,
     SO_SNDTIMEO_OPT, SO_TYPE_OPT, SOL_SOCKET_LEVEL, ST_MODE_SOCKET, TCP_MAXSEG_OPT,
-    TCP_NODELAY_OPT,
+    TCP_NODELAY_OPT, fd_cloexec_flag, posix_errno_from_ret,
 };
 use super::user_memory::{
     read_user_bytes, user_io_buffer, validate_user_read, validate_user_write, write_user_bytes,
@@ -177,6 +178,59 @@ pub(super) fn socket_option_supported(level: i32, optname: i32) -> bool {
     } else {
         false
     }
+}
+
+pub(super) fn socket_entry(process: &UserProcess, fd: usize) -> Result<SocketEntry, LinuxError> {
+    let table = process.fds.lock();
+    match table.entry(fd as i32)? {
+        FdEntry::Socket(socket) => Ok(socket.clone()),
+        FdEntry::Path(_) => Err(LinuxError::EBADF),
+        _ => Err(LinuxError::ENOTSOCK),
+    }
+}
+
+pub(super) fn insert_socket_entry(
+    process: &UserProcess,
+    posix_fd: i32,
+    socktype: i32,
+    flags: i32,
+) -> isize {
+    if flags & posix_ctypes::SOCK_NONBLOCK as i32 != 0 {
+        let ret = arceos_posix_api::sys_fcntl(
+            posix_fd,
+            posix_ctypes::F_SETFL as i32,
+            posix_ctypes::O_NONBLOCK as usize,
+        );
+        if ret < 0 {
+            let _ = arceos_posix_api::sys_close(posix_fd);
+            return neg_errno(posix_errno_from_ret(ret as isize));
+        }
+    }
+    match process.fds.lock().insert_with_flags(
+        FdEntry::Socket(SocketEntry::new(posix_fd, socktype)),
+        fd_cloexec_flag(flags & posix_ctypes::SOCK_CLOEXEC as i32 != 0),
+    ) {
+        Ok(fd) => fd as isize,
+        Err(err) => {
+            let _ = arceos_posix_api::sys_close(posix_fd);
+            neg_errno(err)
+        }
+    }
+}
+
+pub(super) fn insert_local_socket_entry(process: &UserProcess, socktype: i32, flags: i32) -> isize {
+    match process.fds.lock().insert_with_flags(
+        FdEntry::LocalSocket(LocalSocketEntry::new(socktype, flags)),
+        fd_cloexec_flag(flags & posix_ctypes::SOCK_CLOEXEC as i32 != 0),
+    ) {
+        Ok(fd) => fd as isize,
+        Err(err) => neg_errno(err),
+    }
+}
+
+pub(super) fn is_local_socket_fd(process: &UserProcess, fd: usize) -> Result<bool, LinuxError> {
+    let table = process.fds.lock();
+    Ok(matches!(table.entry(fd as i32)?, FdEntry::LocalSocket(_)))
 }
 
 pub(super) fn read_socket_data_from_user(

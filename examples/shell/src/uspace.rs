@@ -55,9 +55,9 @@ use credentials::{
 };
 use fd_pipe::PipeEndpoint;
 use fd_socket::{
-    LocalSocketEntry, SocketEntry, read_socket_addr_from_user, read_socket_data_from_user,
-    recv_socket_data_to_user, recv_socket_data_to_user_with_addr, socket_option_supported,
-    write_socket_addr_to_user,
+    insert_local_socket_entry, insert_socket_entry, is_local_socket_fd, read_socket_addr_from_user,
+    read_socket_data_from_user, recv_socket_data_to_user, recv_socket_data_to_user_with_addr,
+    socket_entry, socket_option_supported, write_socket_addr_to_user,
 };
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
 use linux_abi::*;
@@ -2453,54 +2453,6 @@ fn sys_fcntl(process: &UserProcess, fd: usize, cmd: usize, arg: usize) -> isize 
         Ok(v) => v as isize,
         Err(err) => neg_errno(err),
     }
-}
-
-fn socket_entry(process: &UserProcess, fd: usize) -> Result<SocketEntry, LinuxError> {
-    let table = process.fds.lock();
-    match table.entry(fd as i32)? {
-        FdEntry::Socket(socket) => Ok(socket.clone()),
-        FdEntry::Path(_) => Err(LinuxError::EBADF),
-        _ => Err(LinuxError::ENOTSOCK),
-    }
-}
-
-fn insert_socket_entry(process: &UserProcess, posix_fd: i32, socktype: i32, flags: i32) -> isize {
-    if flags & posix_ctypes::SOCK_NONBLOCK as i32 != 0 {
-        let ret = arceos_posix_api::sys_fcntl(
-            posix_fd,
-            posix_ctypes::F_SETFL as i32,
-            posix_ctypes::O_NONBLOCK as usize,
-        );
-        if ret < 0 {
-            let _ = arceos_posix_api::sys_close(posix_fd);
-            return neg_errno(posix_errno_from_ret(ret as isize));
-        }
-    }
-    match process.fds.lock().insert_with_flags(
-        FdEntry::Socket(SocketEntry::new(posix_fd, socktype)),
-        fd_cloexec_flag(flags & posix_ctypes::SOCK_CLOEXEC as i32 != 0),
-    ) {
-        Ok(fd) => fd as isize,
-        Err(err) => {
-            let _ = arceos_posix_api::sys_close(posix_fd);
-            neg_errno(err)
-        }
-    }
-}
-
-fn insert_local_socket_entry(process: &UserProcess, socktype: i32, flags: i32) -> isize {
-    match process.fds.lock().insert_with_flags(
-        FdEntry::LocalSocket(LocalSocketEntry::new(socktype, flags)),
-        fd_cloexec_flag(flags & posix_ctypes::SOCK_CLOEXEC as i32 != 0),
-    ) {
-        Ok(fd) => fd as isize,
-        Err(err) => neg_errno(err),
-    }
-}
-
-fn is_local_socket_fd(process: &UserProcess, fd: usize) -> Result<bool, LinuxError> {
-    let table = process.fds.lock();
-    Ok(matches!(table.entry(fd as i32)?, FdEntry::LocalSocket(_)))
 }
 
 fn sys_socket_bridge(
