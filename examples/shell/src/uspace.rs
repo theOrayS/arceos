@@ -34,6 +34,7 @@ mod fd_socket;
 mod fd_table;
 mod futex;
 mod linux_abi;
+mod memory_policy;
 mod metadata;
 mod program_loader;
 mod resource_sched;
@@ -59,6 +60,7 @@ use fd_socket::{
 };
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
 use linux_abi::*;
+use memory_policy::{validate_mempolicy_nodemask, write_default_mempolicy};
 use metadata::{
     apply_recorded_path_metadata, canonical_permission_path, fd_entry_path, fd_entry_statfs_path,
     file_attr_to_stat, generic_statfs, normalize_file_mode,
@@ -1573,14 +1575,6 @@ fn sys_sched_yield(_tf: &TrapFrame) -> isize {
     0
 }
 
-fn nodemask_len(maxnode: usize) -> usize {
-    if maxnode == 0 {
-        0
-    } else {
-        maxnode.div_ceil(usize::BITS as usize) * size_of::<usize>()
-    }
-}
-
 fn sys_mbind(
     process: &UserProcess,
     start: usize,
@@ -1590,11 +1584,8 @@ fn sys_mbind(
     maxnode: usize,
 ) -> isize {
     let _ = (start, len, mode);
-    let mask_len = nodemask_len(maxnode);
-    if nodemask != 0 && mask_len != 0 {
-        if let Err(err) = validate_user_read(process, nodemask, mask_len) {
-            return neg_errno(err);
-        }
+    if let Err(err) = validate_mempolicy_nodemask(process, nodemask, maxnode) {
+        return neg_errno(err);
     }
     0
 }
@@ -1607,26 +1598,13 @@ fn sys_get_mempolicy(
     _addr: usize,
     _flags: usize,
 ) -> isize {
-    if mode != 0 {
-        let default_mode = 0i32;
-        return_on_user_write_error!(process, mode, &default_mode);
-    }
-    let mask_len = nodemask_len(maxnode);
-    if nodemask != 0 && mask_len != 0 {
-        if let Err(err) = clear_user_bytes(process, nodemask, mask_len) {
-            return neg_errno(err);
-        }
-    }
-    0
+    write_default_mempolicy(process, mode, nodemask, maxnode)
 }
 
 fn sys_set_mempolicy(process: &UserProcess, mode: usize, nodemask: usize, maxnode: usize) -> isize {
     let _ = mode;
-    let mask_len = nodemask_len(maxnode);
-    if nodemask != 0 && mask_len != 0 {
-        if let Err(err) = validate_user_read(process, nodemask, mask_len) {
-            return neg_errno(err);
-        }
+    if let Err(err) = validate_mempolicy_nodemask(process, nodemask, maxnode) {
+        return neg_errno(err);
     }
     0
 }
