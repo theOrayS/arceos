@@ -1,4 +1,4 @@
-use core::ffi::c_int;
+use core::ffi::{c_int, c_ulong};
 
 use axerrno::{LinuxError, LinuxResult};
 use axhal::time::wall_time;
@@ -6,102 +6,128 @@ use axhal::time::wall_time;
 use crate::{ctypes, imp::fd_ops::get_file_like};
 
 const FD_SETSIZE: usize = 1024;
-const BITS_PER_USIZE: usize = usize::BITS as usize;
-const FD_SETSIZE_USIZES: usize = FD_SETSIZE.div_ceil(BITS_PER_USIZE);
+const BITS_PER_WORD: usize = c_ulong::BITS as usize;
+const FD_SETSIZE_WORDS: usize = FD_SETSIZE.div_ceil(BITS_PER_WORD);
+const READ_SET: usize = 0;
+const WRITE_SET: usize = 1;
+const EXCEPT_SET: usize = 2;
+const FD_SET_GROUPS: usize = 3;
 
 struct FdSets {
     nfds: usize,
-    bits: [usize; FD_SETSIZE_USIZES * 3],
+    bits: [[c_ulong; FD_SETSIZE_WORDS]; FD_SET_GROUPS],
 }
 
 impl FdSets {
+    fn empty(nfds: usize) -> Self {
+        Self {
+            nfds: nfds.min(FD_SETSIZE),
+            bits: [[0; FD_SETSIZE_WORDS]; FD_SET_GROUPS],
+        }
+    }
+
     fn from(
         nfds: usize,
         read_fds: *const ctypes::fd_set,
         write_fds: *const ctypes::fd_set,
         except_fds: *const ctypes::fd_set,
     ) -> Self {
-        let nfds = nfds.min(FD_SETSIZE);
-        let nfds_usizes = nfds.div_ceil(BITS_PER_USIZE);
-        let mut bits = core::mem::MaybeUninit::<[usize; FD_SETSIZE_USIZES * 3]>::uninit();
-        let bits_ptr: *mut usize = unsafe { core::mem::transmute(bits.as_mut_ptr()) };
-
-        let copy_from_fd_set = |bits_ptr: *mut usize, fds: *const ctypes::fd_set| unsafe {
-            let dst = core::slice::from_raw_parts_mut(bits_ptr, nfds_usizes);
-            if fds.is_null() {
-                dst.fill(0);
-            } else {
-                let fds_ptr = (*fds).fds_bits.as_ptr() as *const usize;
-                let src = core::slice::from_raw_parts(fds_ptr, nfds_usizes);
-                dst.copy_from_slice(src);
-            }
-        };
-
-        let bits = unsafe {
-            copy_from_fd_set(bits_ptr, read_fds);
-            copy_from_fd_set(bits_ptr.add(FD_SETSIZE_USIZES), write_fds);
-            copy_from_fd_set(bits_ptr.add(FD_SETSIZE_USIZES * 2), except_fds);
-            bits.assume_init()
-        };
-        Self { nfds, bits }
+        let mut sets = Self::empty(nfds);
+        sets.copy_from_fd_set(READ_SET, read_fds);
+        sets.copy_from_fd_set(WRITE_SET, write_fds);
+        sets.copy_from_fd_set(EXCEPT_SET, except_fds);
+        sets
     }
 
-    fn poll_all(
+    fn nfds_words(&self) -> usize {
+        self.nfds.div_ceil(BITS_PER_WORD)
+    }
+
+    fn clear(&mut self) {
+        let words = self.nfds_words();
+        for set in &mut self.bits {
+            set[..words].fill(0);
+        }
+    }
+
+    fn copy_from_fd_set(&mut self, set_idx: usize, fds: *const ctypes::fd_set) {
+        if fds.is_null() {
+            return;
+        }
+        let words = self.nfds_words();
+        let src = unsafe { &(*fds).fds_bits[..words] };
+        self.bits[set_idx][..words].copy_from_slice(src);
+    }
+
+    fn set_fd(&mut self, set_idx: usize, fd: usize) {
+        self.bits[set_idx][fd / BITS_PER_WORD] |= 1 << (fd % BITS_PER_WORD);
+    }
+
+    unsafe fn write_back_to(
         &self,
-        res_read_fds: *mut ctypes::fd_set,
-        res_write_fds: *mut ctypes::fd_set,
-        res_except_fds: *mut ctypes::fd_set,
-    ) -> LinuxResult<usize> {
-        let mut read_bits_ptr = self.bits.as_ptr();
-        let mut write_bits_ptr = unsafe { read_bits_ptr.add(FD_SETSIZE_USIZES) };
-        let mut execpt_bits_ptr = unsafe { read_bits_ptr.add(FD_SETSIZE_USIZES * 2) };
-        let mut i = 0;
+        read_fds: *mut ctypes::fd_set,
+        write_fds: *mut ctypes::fd_set,
+        except_fds: *mut ctypes::fd_set,
+    ) {
+        unsafe {
+            self.copy_to_fd_set(READ_SET, read_fds);
+            self.copy_to_fd_set(WRITE_SET, write_fds);
+            self.copy_to_fd_set(EXCEPT_SET, except_fds);
+        }
+    }
+
+    unsafe fn copy_to_fd_set(&self, set_idx: usize, fds: *mut ctypes::fd_set) {
+        if fds.is_null() {
+            return;
+        }
+        let words = self.nfds_words();
+        unsafe {
+            (*fds).fds_bits[..words].copy_from_slice(&self.bits[set_idx][..words]);
+        }
+    }
+
+    fn poll_all(&self, result_sets: &mut FdSets) -> LinuxResult<usize> {
+        result_sets.clear();
         let mut res_num = 0;
-        while i < self.nfds {
-            let read_bits = unsafe { *read_bits_ptr };
-            let write_bits = unsafe { *write_bits_ptr };
-            let except_bits = unsafe { *execpt_bits_ptr };
-            unsafe {
-                read_bits_ptr = read_bits_ptr.add(1);
-                write_bits_ptr = write_bits_ptr.add(1);
-                execpt_bits_ptr = execpt_bits_ptr.add(1);
-            }
+        for word_idx in 0..self.nfds_words() {
+            let read_bits = self.bits[READ_SET][word_idx];
+            let write_bits = self.bits[WRITE_SET][word_idx];
+            let except_bits = self.bits[EXCEPT_SET][word_idx];
 
             let all_bits = read_bits | write_bits | except_bits;
             if all_bits == 0 {
-                i += BITS_PER_USIZE;
                 continue;
             }
             let mut j = 0;
-            while j < BITS_PER_USIZE && i + j < self.nfds {
+            let fd_base = word_idx * BITS_PER_WORD;
+            while j < BITS_PER_WORD && fd_base + j < self.nfds {
                 let bit = 1 << j;
                 if all_bits & bit == 0 {
                     j += 1;
                     continue;
                 }
-                let fd = i + j;
+                let fd = fd_base + j;
                 match get_file_like(fd as _)?.poll() {
                     Ok(state) => {
                         if state.readable && read_bits & bit != 0 {
-                            unsafe { set_fd_set(res_read_fds, fd) };
+                            result_sets.set_fd(READ_SET, fd);
                             res_num += 1;
                         }
                         if state.writable && write_bits & bit != 0 {
-                            unsafe { set_fd_set(res_write_fds, fd) };
+                            result_sets.set_fd(WRITE_SET, fd);
                             res_num += 1;
                         }
                     }
                     Err(e) => {
                         debug!("    except: {} {:?}", fd, e);
                         if except_bits & bit != 0 {
-                            unsafe { set_fd_set(res_except_fds, fd) };
+                            result_sets.set_fd(EXCEPT_SET, fd);
                             res_num += 1;
                         }
                     }
                 }
                 j += 1;
             }
-            i += BITS_PER_USIZE;
         }
         Ok(res_num)
     }
@@ -132,40 +158,29 @@ pub unsafe fn sys_select(
         let nfds = (nfds as usize).min(FD_SETSIZE);
         let deadline = unsafe { timeout.as_ref().map(|t| wall_time() + (*t).into()) };
         let fd_sets = FdSets::from(nfds, readfds, writefds, exceptfds);
-
-        unsafe {
-            zero_fd_set(readfds, nfds);
-            zero_fd_set(writefds, nfds);
-            zero_fd_set(exceptfds, nfds);
-        }
+        let mut result_sets = FdSets::empty(nfds);
 
         loop {
             #[cfg(feature = "net")]
             axnet::poll_interfaces();
-            let res = fd_sets.poll_all(readfds, writefds, exceptfds)?;
+            let res = match fd_sets.poll_all(&mut result_sets) {
+                Ok(res) => res,
+                Err(err) => {
+                    unsafe { result_sets.write_back_to(readfds, writefds, exceptfds) };
+                    return Err(err);
+                }
+            };
             if res > 0 {
+                unsafe { result_sets.write_back_to(readfds, writefds, exceptfds) };
                 return Ok(res);
             }
 
             if deadline.is_some_and(|ddl| wall_time() >= ddl) {
                 debug!("    timeout!");
+                unsafe { result_sets.write_back_to(readfds, writefds, exceptfds) };
                 return Ok(0);
             }
             crate::sys_sched_yield();
         }
     })
-}
-
-unsafe fn zero_fd_set(fds: *mut ctypes::fd_set, nfds: usize) {
-    if !fds.is_null() {
-        let nfds_usizes = nfds.div_ceil(BITS_PER_USIZE);
-        let dst = &mut unsafe { *fds }.fds_bits[..nfds_usizes];
-        dst.fill(0);
-    }
-}
-
-unsafe fn set_fd_set(fds: *mut ctypes::fd_set, fd: usize) {
-    if !fds.is_null() {
-        unsafe { *fds }.fds_bits[fd / BITS_PER_USIZE] |= 1 << (fd % BITS_PER_USIZE);
-    }
 }
