@@ -3018,12 +3018,13 @@ where
     F: FnOnce(i32, *const posix_ctypes::sockaddr, posix_ctypes::socklen_t) -> i32,
 {
     let socket = socket_entry_or_return!(process, fd);
-    if let Err(err) = validate_user_read(process, addr, addrlen) {
-        return neg_errno(err);
-    }
+    let addr_bytes = match read_socket_addr_from_user(process, addr, addrlen) {
+        Ok(bytes) => bytes,
+        Err(err) => return neg_errno(err),
+    };
     match posix_ret_i32(call(
         socket.posix_fd,
-        addr as *const posix_ctypes::sockaddr,
+        addr_bytes.as_ptr() as *const posix_ctypes::sockaddr,
         addrlen as posix_ctypes::socklen_t,
     )) {
         Ok(_) => 0,
@@ -3142,15 +3143,16 @@ fn sys_sendto_bridge(
     let ret = if addr == 0 {
         arceos_posix_api::sys_send(socket.posix_fd, data_ptr, len, flags as i32)
     } else {
-        if let Err(err) = validate_user_read(process, addr, addrlen) {
-            return neg_errno(err);
-        }
+        let addr_bytes = match read_socket_addr_from_user(process, addr, addrlen) {
+            Ok(bytes) => bytes,
+            Err(err) => return neg_errno(err),
+        };
         arceos_posix_api::sys_sendto(
             socket.posix_fd,
             data_ptr,
             len,
             flags as i32,
-            addr as *const posix_ctypes::sockaddr,
+            addr_bytes.as_ptr() as *const posix_ctypes::sockaddr,
             addrlen as posix_ctypes::socklen_t,
         )
     };
@@ -4940,6 +4942,21 @@ fn read_socket_data_from_user(
 ) -> Result<Vec<u8>, LinuxError> {
     if ptr == 0 {
         return Err(LinuxError::EFAULT);
+    }
+    read_user_bytes(process, ptr, len)
+}
+
+fn read_socket_addr_from_user(
+    process: &UserProcess,
+    ptr: usize,
+    len: usize,
+) -> Result<Vec<u8>, LinuxError> {
+    validate_user_read(process, ptr, len)?;
+    if ptr == 0 {
+        return Err(LinuxError::EFAULT);
+    }
+    if len != size_of::<posix_ctypes::sockaddr>() {
+        return Err(LinuxError::EINVAL);
     }
     read_user_bytes(process, ptr, len)
 }
