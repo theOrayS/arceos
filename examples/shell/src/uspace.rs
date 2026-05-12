@@ -28,6 +28,7 @@ use std::vec::Vec;
 #[cfg(target_arch = "riscv64")]
 use riscv::register::sstatus::{FS, Sstatus};
 
+mod credentials;
 mod fd_pipe;
 mod fd_socket;
 mod fd_table;
@@ -45,6 +46,10 @@ mod task_registry;
 mod time_abi;
 mod user_memory;
 
+use credentials::{
+    access_allowed, parse_id_args, read_group_list, set_fs_id, set_re_ids, set_res_ids,
+    set_single_id, write_group_list, write_id_triplet,
+};
 use fd_pipe::PipeEndpoint;
 use fd_socket::{LocalSocketEntry, SocketEntry};
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
@@ -2162,32 +2167,6 @@ fn sys_setgid(process: &UserProcess, gid: usize) -> isize {
     set_single_id(gid, |gid| process.set_gid(gid))
 }
 
-fn set_single_id<F>(id: usize, apply: F) -> isize
-where
-    F: FnOnce(u32),
-{
-    let Ok(id) = u32::try_from(id) else {
-        return neg_errno(LinuxError::EINVAL);
-    };
-    apply(id);
-    0
-}
-
-fn id_arg_optional(id: usize) -> Result<Option<u32>, LinuxError> {
-    if id == usize::MAX || id == CHOWN_ID_UNCHANGED as usize {
-        return Ok(None);
-    }
-    u32::try_from(id).map(Some).map_err(|_| LinuxError::EINVAL)
-}
-
-fn parse_id_args<const N: usize>(ids: [usize; N]) -> Result<[Option<u32>; N], LinuxError> {
-    let mut parsed = [None; N];
-    for (dst, id) in parsed.iter_mut().zip(ids) {
-        *dst = id_arg_optional(id)?;
-    }
-    Ok(parsed)
-}
-
 fn sys_setreuid(process: &UserProcess, ruid: usize, euid: usize) -> isize {
     set_re_ids(ruid, euid, |ruid, euid, saved| {
         process.set_user_ids(ruid, euid, saved);
@@ -2210,37 +2189,6 @@ fn sys_setresgid(process: &UserProcess, rgid: usize, egid: usize, sgid: usize) -
     set_res_ids(rgid, egid, sgid, |rgid, egid, sgid| {
         process.set_group_ids(rgid, egid, sgid);
     })
-}
-
-fn set_re_ids<F>(real: usize, effective: usize, apply: F) -> isize
-where
-    F: FnOnce(Option<u32>, Option<u32>, Option<u32>),
-{
-    let [real, effective] = match parse_id_args([real, effective]) {
-        Ok(ids) => ids,
-        Err(err) => return neg_errno(err),
-    };
-    apply(real, effective, effective.or(real));
-    0
-}
-
-fn set_res_ids<F>(real: usize, effective: usize, saved: usize, apply: F) -> isize
-where
-    F: FnOnce(Option<u32>, Option<u32>, Option<u32>),
-{
-    let [real, effective, saved] = match parse_id_args([real, effective, saved]) {
-        Ok(ids) => ids,
-        Err(err) => return neg_errno(err),
-    };
-    apply(real, effective, saved);
-    0
-}
-
-fn write_id_triplet(process: &UserProcess, ptrs: [usize; 3], values: [u32; 3]) -> isize {
-    for (ptr, value) in ptrs.into_iter().zip(values.into_iter()) {
-        return_on_user_write_error!(process, ptr, &value);
-    }
-    0
 }
 
 fn sys_getresuid(process: &UserProcess, ruid: usize, euid: usize, suid: usize) -> isize {
@@ -2273,16 +2221,6 @@ fn sys_setfsgid(process: &UserProcess, gid: usize) -> isize {
     })
 }
 
-fn set_fs_id<F>(old: u32, id: usize, apply: F) -> isize
-where
-    F: FnOnce(u32),
-{
-    if let Ok(Some(id)) = id_arg_optional(id) {
-        apply(id);
-    }
-    old as isize
-}
-
 fn sys_getgroups(process: &UserProcess, size: usize, list: usize) -> isize {
     let groups = process.groups();
     if size == 0 {
@@ -2291,10 +2229,7 @@ fn sys_getgroups(process: &UserProcess, size: usize, list: usize) -> isize {
     if size < groups.len() {
         return neg_errno(LinuxError::EINVAL);
     }
-    for (idx, gid) in groups.iter().enumerate() {
-        return_on_user_write_error!(process, list + idx * size_of::<u32>(), gid);
-    }
-    groups.len() as isize
+    write_group_list(process, list, &groups)
 }
 
 fn sys_setgroups(process: &UserProcess, size: usize, list: usize) -> isize {
@@ -2304,46 +2239,12 @@ fn sys_setgroups(process: &UserProcess, size: usize, list: usize) -> isize {
     if size > 65_536 {
         return neg_errno(LinuxError::EINVAL);
     }
-    let mut groups = Vec::new();
-    for idx in 0..size {
-        let gid = match read_user_value::<u32>(process, list + idx * size_of::<u32>()) {
-            Ok(gid) => gid,
-            Err(err) => return neg_errno(err),
-        };
-        groups.push(gid);
-    }
+    let groups = match read_group_list(process, size, list) {
+        Ok(groups) => groups,
+        Err(err) => return neg_errno(err),
+    };
     process.set_groups(groups);
     0
-}
-
-fn access_allowed(st: &general::stat, mode: usize, uid: u32, gid: u32) -> bool {
-    if mode == 0 {
-        return true;
-    }
-
-    let permissions = (st.st_mode & 0o777) as u32;
-    if uid == 0 {
-        return (mode & ACCESS_X_OK == 0) || (permissions & 0o111 != 0);
-    }
-
-    let bits = if uid == st.st_uid as u32 {
-        (permissions >> 6) & 0o7
-    } else if gid == st.st_gid as u32 {
-        (permissions >> 3) & 0o7
-    } else {
-        permissions & 0o7
-    };
-
-    if mode & ACCESS_R_OK != 0 && bits & 0o4 == 0 {
-        return false;
-    }
-    if mode & ACCESS_W_OK != 0 && bits & 0o2 == 0 {
-        return false;
-    }
-    if mode & ACCESS_X_OK != 0 && bits & 0o1 == 0 {
-        return false;
-    }
-    true
 }
 
 fn sys_setpgid(process: &UserProcess, pid: usize, pgid: usize) -> isize {
