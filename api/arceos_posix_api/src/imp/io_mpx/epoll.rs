@@ -36,7 +36,12 @@ impl EpollInstance {
             .map_err(|_| LinuxError::EINVAL)
     }
 
-    fn control(&self, op: usize, fd: usize, event: &ctypes::epoll_event) -> LinuxResult<usize> {
+    fn control(
+        &self,
+        op: usize,
+        fd: usize,
+        event: Option<&ctypes::epoll_event>,
+    ) -> LinuxResult<usize> {
         match get_file_like(fd as c_int) {
             Ok(_) => {}
             Err(e) => return Err(e),
@@ -44,6 +49,7 @@ impl EpollInstance {
 
         match op as u32 {
             ctypes::EPOLL_CTL_ADD => {
+                let event = event.ok_or(LinuxError::EFAULT)?;
                 if let Entry::Vacant(e) = self.events.lock().entry(fd) {
                     e.insert(*event);
                 } else {
@@ -51,6 +57,7 @@ impl EpollInstance {
                 }
             }
             ctypes::EPOLL_CTL_MOD => {
+                let event = event.ok_or(LinuxError::EFAULT)?;
                 let mut events = self.events.lock();
                 if let Entry::Occupied(mut ocp) = events.entry(fd) {
                     ocp.insert(*event);
@@ -152,6 +159,11 @@ pub fn sys_epoll_create(size: c_int) -> c_int {
 }
 
 /// Control interface for an epoll file descriptor
+///
+/// # Safety
+///
+/// For `EPOLL_CTL_ADD` and `EPOLL_CTL_MOD`, `event` must be valid for reads of
+/// one `epoll_event`. `EPOLL_CTL_DEL` ignores `event` and may receive null.
 pub unsafe fn sys_epoll_ctl(
     epfd: c_int,
     op: c_int,
@@ -160,14 +172,25 @@ pub unsafe fn sys_epoll_ctl(
 ) -> c_int {
     debug!("sys_epoll_ctl <= epfd: {} op: {} fd: {}", epfd, op, fd);
     syscall_body!(sys_epoll_ctl, {
-        let ret = unsafe {
-            EpollInstance::from_fd(epfd)?.control(op as usize, fd as usize, &(*event))? as c_int
+        let event = match op as u32 {
+            ctypes::EPOLL_CTL_ADD | ctypes::EPOLL_CTL_MOD => {
+                if event.is_null() {
+                    return Err(LinuxError::EFAULT);
+                }
+                Some(unsafe { &*event })
+            }
+            _ => None,
         };
+        let ret = EpollInstance::from_fd(epfd)?.control(op as usize, fd as usize, event)? as c_int;
         Ok(ret)
     })
 }
 
 /// Waits for events on the epoll instance referred to by the file descriptor epfd.
+///
+/// # Safety
+///
+/// `events` must be valid for writes of `maxevents` `epoll_event` entries.
 pub unsafe fn sys_epoll_wait(
     epfd: c_int,
     events: *mut ctypes::epoll_event,
@@ -182,6 +205,9 @@ pub unsafe fn sys_epoll_wait(
     syscall_body!(sys_epoll_wait, {
         if maxevents <= 0 {
             return Err(LinuxError::EINVAL);
+        }
+        if events.is_null() {
+            return Err(LinuxError::EFAULT);
         }
         let events = unsafe { core::slice::from_raw_parts_mut(events, maxevents as usize) };
         let deadline =

@@ -108,6 +108,12 @@ impl FdSets {
 }
 
 /// Monitor multiple file descriptors, waiting until one or more of the file descriptors become "ready" for some class of I/O operation
+///
+/// # Safety
+///
+/// Any non-null fd-set pointer must be valid for both reads and writes of the
+/// fd-set words covered by `nfds`; a non-null `timeout` must be valid for reads
+/// of one `timeval`.
 pub unsafe fn sys_select(
     nfds: c_int,
     readfds: *mut ctypes::fd_set,
