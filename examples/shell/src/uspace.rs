@@ -1688,13 +1688,7 @@ fn user_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
 
 fn sys_read(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize {
     if let Ok(socket) = socket_entry(process, fd) {
-        if let Err(err) = validate_user_write(process, buf, count) {
-            return neg_errno(err);
-        }
-        let ret = recv_with_real_timer_interrupt(process, socket.posix_fd, || {
-            arceos_posix_api::sys_recv(socket.posix_fd, buf as *mut c_void, count, 0)
-        });
-        return ret;
+        return recv_socket_data_to_user(process, socket.posix_fd, buf, count, 0);
     }
     with_writable_user_buffer(process, buf, count, |dst| {
         process.fds.lock().read(fd as i32, dst)
@@ -3140,18 +3134,20 @@ fn sys_sendto_bridge(
     addrlen: usize,
 ) -> isize {
     let socket = socket_entry_or_return!(process, fd);
-    if let Err(err) = validate_user_read(process, buf, len) {
-        return neg_errno(err);
-    }
+    let bytes = match read_socket_data_from_user(process, buf, len) {
+        Ok(bytes) => bytes,
+        Err(err) => return neg_errno(err),
+    };
+    let data_ptr = bytes.as_ptr() as *const c_void;
     let ret = if addr == 0 {
-        arceos_posix_api::sys_send(socket.posix_fd, buf as *const c_void, len, flags as i32)
+        arceos_posix_api::sys_send(socket.posix_fd, data_ptr, len, flags as i32)
     } else {
         if let Err(err) = validate_user_read(process, addr, addrlen) {
             return neg_errno(err);
         }
         arceos_posix_api::sys_sendto(
             socket.posix_fd,
-            buf as *const c_void,
+            data_ptr,
             len,
             flags as i32,
             addr as *const posix_ctypes::sockaddr,
@@ -3175,13 +3171,8 @@ fn sys_recvfrom_bridge(
     addrlen: usize,
 ) -> isize {
     let socket = socket_entry_or_return!(process, fd);
-    if let Err(err) = validate_user_write(process, buf, len) {
-        return neg_errno(err);
-    }
     let ret = if addr == 0 || addrlen == 0 {
-        recv_with_real_timer_interrupt(process, socket.posix_fd, || {
-            arceos_posix_api::sys_recv(socket.posix_fd, buf as *mut c_void, len, flags as i32)
-        })
+        recv_socket_data_to_user(process, socket.posix_fd, buf, len, flags as i32)
     } else {
         if let Err(err) =
             validate_user_write(process, addrlen, size_of::<posix_ctypes::socklen_t>())
@@ -3195,16 +3186,15 @@ fn sys_recvfrom_bridge(
         if let Err(err) = validate_user_write(process, addr, addr_len_value) {
             return neg_errno(err);
         }
-        recv_with_real_timer_interrupt(process, socket.posix_fd, || unsafe {
-            arceos_posix_api::sys_recvfrom(
-                socket.posix_fd,
-                buf as *mut c_void,
-                len,
-                flags as i32,
-                addr as *mut posix_ctypes::sockaddr,
-                addrlen as *mut posix_ctypes::socklen_t,
-            )
-        })
+        recv_socket_data_to_user_with_addr(
+            process,
+            socket.posix_fd,
+            buf,
+            len,
+            flags as i32,
+            addr,
+            addrlen,
+        )
     };
     ret
 }
@@ -4941,6 +4931,83 @@ fn user_io_buffer(len: usize) -> Result<Vec<u8>, LinuxError> {
         .map_err(|_| LinuxError::ENOMEM)?;
     bytes.resize(len, 0);
     Ok(bytes)
+}
+
+fn read_socket_data_from_user(
+    process: &UserProcess,
+    ptr: usize,
+    len: usize,
+) -> Result<Vec<u8>, LinuxError> {
+    if ptr == 0 {
+        return Err(LinuxError::EFAULT);
+    }
+    read_user_bytes(process, ptr, len)
+}
+
+fn recv_socket_data_to_user(
+    process: &UserProcess,
+    posix_fd: i32,
+    buf: usize,
+    len: usize,
+    flags: i32,
+) -> isize {
+    recv_socket_data_to_user_inner(process, posix_fd, buf, len, |dst| {
+        arceos_posix_api::sys_recv(posix_fd, dst, len, flags)
+    })
+}
+
+fn recv_socket_data_to_user_with_addr(
+    process: &UserProcess,
+    posix_fd: i32,
+    buf: usize,
+    len: usize,
+    flags: i32,
+    addr: usize,
+    addrlen: usize,
+) -> isize {
+    recv_socket_data_to_user_inner(process, posix_fd, buf, len, |dst| unsafe {
+        arceos_posix_api::sys_recvfrom(
+            posix_fd,
+            dst,
+            len,
+            flags,
+            addr as *mut posix_ctypes::sockaddr,
+            addrlen as *mut posix_ctypes::socklen_t,
+        )
+    })
+}
+
+fn recv_socket_data_to_user_inner(
+    process: &UserProcess,
+    posix_fd: i32,
+    buf: usize,
+    len: usize,
+    mut recv_once: impl FnMut(*mut c_void) -> isize,
+) -> isize {
+    if buf == 0 {
+        return neg_errno(LinuxError::EFAULT);
+    }
+    if let Err(err) = validate_user_write(process, buf, len) {
+        return neg_errno(err);
+    }
+    let mut bytes = match user_io_buffer(len) {
+        Ok(bytes) => bytes,
+        Err(err) => return neg_errno(err),
+    };
+    let ret = recv_with_real_timer_interrupt(process, posix_fd, || {
+        recv_once(bytes.as_mut_ptr() as *mut c_void)
+    });
+    if ret <= 0 {
+        return ret;
+    }
+    let received = ret as usize;
+    if received > len {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    match write_user_bytes(process, buf, &bytes[..received]) {
+        Ok(()) => ret,
+        Err(err) => neg_errno(err),
+    }
 }
 
 fn with_readable_user_buffer(
