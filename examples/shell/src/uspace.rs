@@ -92,10 +92,12 @@ use task_registry::{
     user_thread_entry_by_tid, user_thread_entry_for_process,
 };
 use time_abi::{
-    Tms, USER_HZ, UserTimex, adjusted_wall_time, clock_now_duration, micros_to_duration,
-    micros_to_timeval, monotonic_time_micros, rtc_time_from_wall_time,
-    set_realtime_offset_from_timespec, socket_duration_to_timeval, socket_timeval_to_duration,
-    timespec_to_duration, timeval_to_micros, validate_clock_id,
+    UserTimex, adjtimex_changes_clock, adjtimex_input_valid, clock_now_duration,
+    clock_resolution_timespec, current_timeval, default_timex, default_tms,
+    itimerval_to_micros_pair, micros_to_duration, micros_to_timeval, monotonic_time_micros,
+    read_timespec_duration, rtc_time_from_wall_time, set_realtime_offset_from_timespec,
+    sleep_duration, socket_duration_to_timeval, socket_timeval_to_duration, timespec_from_duration,
+    validate_clock_id, zero_timespec, zero_timezone,
 };
 use user_memory::{
     clear_user_bytes, read_cstr, read_user_bytes, read_user_value, read_user_word, user_io_buffer,
@@ -3327,10 +3329,7 @@ fn sys_clock_gettime(process: &UserProcess, clk_id: usize, tp: usize) -> isize {
         Ok(now) => now,
         Err(err) => return neg_errno(err),
     };
-    let ts = general::timespec {
-        tv_sec: now.as_secs() as _,
-        tv_nsec: now.subsec_nanos() as _,
-    };
+    let ts = timespec_from_duration(now);
     write_user_value(process, tp, &ts)
 }
 
@@ -3356,89 +3355,37 @@ fn sys_clock_getres(process: &UserProcess, clk_id: usize, tp: usize) -> isize {
     if tp == 0 {
         return 0;
     }
-    let ts = general::timespec {
-        tv_sec: 0,
-        tv_nsec: 1,
-    };
+    let ts = clock_resolution_timespec();
     write_user_value(process, tp, &ts)
 }
 
 fn sys_gettimeofday(process: &UserProcess, tv: usize, tz: usize) -> isize {
     if tv != 0 {
-        let now = adjusted_wall_time();
-        let value = general::timeval {
-            tv_sec: now.as_secs() as _,
-            tv_usec: now.subsec_micros() as _,
-        };
+        let value = current_timeval();
         return_on_user_write_error!(process, tv, &value);
     }
     if tz != 0 {
-        let value = general::timezone {
-            tz_minuteswest: 0,
-            tz_dsttime: 0,
-        };
+        let value = zero_timezone();
         return_on_user_write_error!(process, tz, &value);
     }
     0
 }
 
 fn sys_adjtimex(process: &UserProcess, tx: usize) -> isize {
-    const ADJ_OFFSET: u32 = 0x0001;
-    const ADJ_FREQUENCY: u32 = 0x0002;
-    const ADJ_MAXERROR: u32 = 0x0004;
-    const ADJ_ESTERROR: u32 = 0x0008;
-    const ADJ_STATUS: u32 = 0x0010;
-    const ADJ_TIMECONST: u32 = 0x0020;
-    const ADJ_TAI: u32 = 0x0080;
-    const ADJ_SETOFFSET: u32 = 0x0100;
-    const ADJ_MICRO: u32 = 0x1000;
-    const ADJ_NANO: u32 = 0x2000;
-    const ADJ_TICK: u32 = 0x4000;
-    const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
-    const ADJ_OFFSET_SS_READ: u32 = 0xa001;
-    const ADJ_REGULAR_MASK: u32 = ADJ_OFFSET
-        | ADJ_FREQUENCY
-        | ADJ_MAXERROR
-        | ADJ_ESTERROR
-        | ADJ_STATUS
-        | ADJ_TIMECONST
-        | ADJ_TAI
-        | ADJ_SETOFFSET
-        | ADJ_MICRO
-        | ADJ_NANO
-        | ADJ_TICK;
     const TIME_OK: isize = 0;
 
     let input = match read_user_value::<UserTimex>(process, tx) {
         Ok(input) => input,
         Err(err) => return neg_errno(err),
     };
-    let modes = input.modes;
-    let valid_modes = modes & !ADJ_REGULAR_MASK == 0
-        || modes == ADJ_OFFSET_SINGLESHOT
-        || modes == ADJ_OFFSET_SS_READ;
-    if !valid_modes {
+    if !adjtimex_input_valid(input) {
         return neg_errno(LinuxError::EINVAL);
     }
-    if modes & ADJ_TICK != 0 {
-        let min_tick = 900_000 / USER_HZ;
-        let max_tick = 1_100_000 / USER_HZ;
-        if input.tick < min_tick || input.tick > max_tick {
-            return neg_errno(LinuxError::EINVAL);
-        }
-    }
-    if modes != 0 && process.uid() != 0 {
+    if adjtimex_changes_clock(input) && process.uid() != 0 {
         return neg_errno(LinuxError::EPERM);
     }
 
-    let now = adjusted_wall_time();
-    let mut output: UserTimex = unsafe { core::mem::zeroed() };
-    output.precision = 1;
-    output.time = general::timeval {
-        tv_sec: now.as_secs() as _,
-        tv_usec: now.subsec_micros() as _,
-    };
-    output.tick = 10_000;
+    let output = default_timex();
     let ret = write_user_value(process, tx, &output);
     if ret != 0 {
         return ret;
@@ -3469,17 +3416,10 @@ fn sys_setitimer(
         }
     };
     let (first_us, interval_us) = match new_timer {
-        Some(value) => {
-            let first_us = match timeval_to_micros(value.it_value) {
-                Ok(micros) => micros,
-                Err(err) => return neg_errno(err),
-            };
-            let interval_us = match timeval_to_micros(value.it_interval) {
-                Ok(micros) => micros,
-                Err(err) => return neg_errno(err),
-            };
-            (first_us, interval_us)
-        }
+        Some(value) => match itimerval_to_micros_pair(value) {
+            Ok(pair) => pair,
+            Err(err) => return neg_errno(err),
+        },
         None => (0, 0),
     };
 
@@ -3500,12 +3440,7 @@ fn sys_setitimer(
 }
 
 fn sys_times(process: &UserProcess, buf: usize) -> isize {
-    let tms = Tms {
-        tms_utime: 0,
-        tms_stime: 0,
-        tms_cutime: 0,
-        tms_cstime: 0,
-    };
+    let tms = default_tms();
     return_on_user_write_error!(process, buf, &tms);
     axhal::time::monotonic_time().as_millis() as isize
 }
@@ -3614,12 +3549,9 @@ fn sys_nanosleep(process: &UserProcess, req: usize, rem: usize) -> isize {
         Ok(duration) => duration,
         Err(err) => return neg_errno(err),
     };
-    user_sleep_duration(duration);
+    sleep_duration(duration);
     if rem != 0 {
-        let zero = general::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
+        let zero = zero_timespec();
         return_on_user_write_error!(process, rem, &zero);
     }
     0
@@ -3645,29 +3577,11 @@ fn sys_clock_nanosleep(
             Err(err) => return neg_errno(err),
         };
         if let Some(delta) = duration.checked_sub(now) {
-            user_sleep_duration(delta);
+            sleep_duration(delta);
         }
         return 0;
     }
     sys_nanosleep(process, req, rem)
-}
-
-fn user_sleep_duration(duration: core::time::Duration) {
-    if duration.as_nanos() == 0 {
-        return;
-    }
-    let deadline = axhal::time::wall_time() + duration;
-    while axhal::time::wall_time() < deadline {
-        axtask::yield_now();
-    }
-}
-
-fn read_timespec_duration(
-    process: &UserProcess,
-    ptr: usize,
-) -> Result<core::time::Duration, LinuxError> {
-    let ts = read_user_value::<general::timespec>(process, ptr)?;
-    timespec_to_duration(ts)
 }
 
 fn sys_brk(process: &UserProcess, addr: usize) -> isize {

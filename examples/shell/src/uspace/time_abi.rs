@@ -4,6 +4,9 @@ use core::sync::atomic::{AtomicI64, Ordering};
 use axerrno::LinuxError;
 use linux_raw_sys::general;
 
+use super::UserProcess;
+use super::user_memory::read_user_value;
+
 static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
 
 const NSEC_PER_SEC: i128 = 1_000_000_000;
@@ -110,6 +113,54 @@ pub(super) fn micros_to_timeval(micros: u64) -> general::timeval {
     general::timeval {
         tv_sec: (micros / 1_000_000).min(i64::MAX as u64) as _,
         tv_usec: (micros % 1_000_000) as _,
+    }
+}
+
+pub(super) fn timespec_from_duration(duration: core::time::Duration) -> general::timespec {
+    general::timespec {
+        tv_sec: duration.as_secs() as _,
+        tv_nsec: duration.subsec_nanos() as _,
+    }
+}
+
+pub(super) fn timeval_from_duration(duration: core::time::Duration) -> general::timeval {
+    general::timeval {
+        tv_sec: duration.as_secs() as _,
+        tv_usec: duration.subsec_micros() as _,
+    }
+}
+
+pub(super) fn clock_resolution_timespec() -> general::timespec {
+    general::timespec {
+        tv_sec: 0,
+        tv_nsec: 1,
+    }
+}
+
+pub(super) fn zero_timespec() -> general::timespec {
+    general::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    }
+}
+
+pub(super) fn zero_timezone() -> general::timezone {
+    general::timezone {
+        tz_minuteswest: 0,
+        tz_dsttime: 0,
+    }
+}
+
+pub(super) fn current_timeval() -> general::timeval {
+    timeval_from_duration(adjusted_wall_time())
+}
+
+pub(super) fn default_tms() -> Tms {
+    Tms {
+        tms_utime: 0,
+        tms_stime: 0,
+        tms_cutime: 0,
+        tms_cstime: 0,
     }
 }
 
@@ -224,4 +275,90 @@ fn year_day(year: i32, month: i32, day: i32) -> i32 {
 
 pub(super) fn validate_clock_id(clockid: u32) -> Result<(), LinuxError> {
     clock_now_duration(clockid).map(|_| ())
+}
+
+pub(super) fn adjtimex_input_valid(input: UserTimex) -> bool {
+    let modes = input.modes;
+    if !adjtimex_modes_valid(modes) {
+        return false;
+    }
+    if modes & ADJ_TICK != 0 {
+        return adjtimex_tick_valid(input.tick);
+    }
+    true
+}
+
+pub(super) fn adjtimex_changes_clock(input: UserTimex) -> bool {
+    input.modes != 0
+}
+
+pub(super) fn default_timex() -> UserTimex {
+    let now = adjusted_wall_time();
+    let mut output: UserTimex = unsafe { core::mem::zeroed() };
+    output.precision = 1;
+    output.time = timeval_from_duration(now);
+    output.tick = 10_000;
+    output
+}
+
+pub(super) fn itimerval_to_micros_pair(
+    value: general::itimerval,
+) -> Result<(u64, u64), LinuxError> {
+    let first_us = timeval_to_micros(value.it_value)?;
+    let interval_us = timeval_to_micros(value.it_interval)?;
+    Ok((first_us, interval_us))
+}
+
+pub(super) fn read_timespec_duration(
+    process: &UserProcess,
+    ptr: usize,
+) -> Result<core::time::Duration, LinuxError> {
+    let ts = read_user_value::<general::timespec>(process, ptr)?;
+    timespec_to_duration(ts)
+}
+
+pub(super) fn sleep_duration(duration: core::time::Duration) {
+    if duration.as_nanos() == 0 {
+        return;
+    }
+    let deadline = axhal::time::wall_time() + duration;
+    while axhal::time::wall_time() < deadline {
+        axtask::yield_now();
+    }
+}
+
+const ADJ_OFFSET: u32 = 0x0001;
+const ADJ_FREQUENCY: u32 = 0x0002;
+const ADJ_MAXERROR: u32 = 0x0004;
+const ADJ_ESTERROR: u32 = 0x0008;
+const ADJ_STATUS: u32 = 0x0010;
+const ADJ_TIMECONST: u32 = 0x0020;
+const ADJ_TAI: u32 = 0x0080;
+const ADJ_SETOFFSET: u32 = 0x0100;
+const ADJ_MICRO: u32 = 0x1000;
+const ADJ_NANO: u32 = 0x2000;
+const ADJ_TICK: u32 = 0x4000;
+const ADJ_OFFSET_SINGLESHOT: u32 = 0x8001;
+const ADJ_OFFSET_SS_READ: u32 = 0xa001;
+
+const ADJ_REGULAR_MASK: u32 = ADJ_OFFSET
+    | ADJ_FREQUENCY
+    | ADJ_MAXERROR
+    | ADJ_ESTERROR
+    | ADJ_STATUS
+    | ADJ_TIMECONST
+    | ADJ_TAI
+    | ADJ_SETOFFSET
+    | ADJ_MICRO
+    | ADJ_NANO
+    | ADJ_TICK;
+
+fn adjtimex_modes_valid(modes: u32) -> bool {
+    modes & !ADJ_REGULAR_MASK == 0 || modes == ADJ_OFFSET_SINGLESHOT || modes == ADJ_OFFSET_SS_READ
+}
+
+fn adjtimex_tick_valid(tick: c_long) -> bool {
+    let min_tick = 900_000 / USER_HZ;
+    let max_tick = 1_100_000 / USER_HZ;
+    tick >= min_tick && tick <= max_tick
 }
