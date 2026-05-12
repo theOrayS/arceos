@@ -82,9 +82,10 @@ use signal_abi::{
     riscv_signal_frame_size, trap_frame_to_riscv_sigcontext,
 };
 use synthetic_fs::{
-    dev_shm_host_path, ensure_dev_shm_dir, is_proc_self_maps_path, proc_self_maps_fd_entry,
-    proc_self_maps_is_writable_open, proc_self_maps_path_entry, synthetic_file_is_writable_open,
-    synthetic_userdb_content, synthetic_userdb_fd_entry, synthetic_userdb_path_entry,
+    dev_shm_host_path, ensure_dev_shm_dir, is_proc_self_maps_path, proc_exe_link_target,
+    proc_self_maps_fd_entry, proc_self_maps_is_writable_open, proc_self_maps_path_entry,
+    synthetic_file_is_writable_open, synthetic_userdb_content, synthetic_userdb_fd_entry,
+    synthetic_userdb_path_entry,
 };
 use system_info::{SyslogAction, default_rusage, default_utsname, syslog_action};
 use task_context::{UserTaskExt, current_process, current_task_ext, current_tid, task_ext};
@@ -3111,11 +3112,6 @@ fn sys_getrandom(process: &UserProcess, buf: usize, len: usize, flags: usize) ->
         filled += n;
     }
     filled as isize
-}
-
-fn proc_exe_link_target(process: &UserProcess, path: &str) -> Option<String> {
-    let pid_path = format!("/proc/{}/exe", process.pid());
-    (path == "/proc/self/exe" || path == pid_path).then(|| process.exec_path())
 }
 
 fn sys_readlinkat(

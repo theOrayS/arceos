@@ -59,6 +59,11 @@ pub(super) fn proc_self_maps_path_entry(process: &UserProcess) -> FdEntry {
     FdEntry::Path(PathEntry::synthetic_file(PROC_SELF_MAPS_PATH, content_len))
 }
 
+pub(super) fn proc_exe_link_target(process: &UserProcess, path: &str) -> Option<String> {
+    let pid_path = format!("/proc/{}/exe", process.pid());
+    (path == "/proc/self/exe" || path == pid_path).then(|| process.exec_path())
+}
+
 pub(super) fn synthetic_userdb_content(path: &str) -> Option<(&'static str, &'static [u8])> {
     match normalize_path("/", path).as_deref() {
         Some(ETC_PASSWD_PATH) => Some((ETC_PASSWD_PATH, DEFAULT_PASSWD_CONTENT)),
