@@ -75,6 +75,10 @@ impl FileLike for File {
     }
 }
 
+unsafe fn write_stat_output(buf: *mut ctypes::stat, value: ctypes::stat) {
+    unsafe { core::ptr::write_unaligned(buf, value) };
+}
+
 /// Convert open flags to [`OpenOptions`].
 fn flags_to_options(flags: c_int, _mode: ctypes::mode_t) -> OpenOptions {
     let flags = flags as u32;
@@ -156,7 +160,7 @@ pub unsafe fn sys_stat(path: *const c_char, buf: *mut ctypes::stat) -> c_int {
         options.read(true);
         let file = axfs::fops::File::open(path?, &options)?;
         let st = File::new(file).stat()?;
-        unsafe { *buf = st };
+        unsafe { write_stat_output(buf, st) };
         Ok(0)
     })
 }
@@ -175,7 +179,8 @@ pub unsafe fn sys_fstat(fd: c_int, buf: *mut ctypes::stat) -> c_int {
             return Err(LinuxError::EFAULT);
         }
 
-        unsafe { *buf = get_file_like(fd)?.stat()? };
+        let st = get_file_like(fd)?.stat()?;
+        unsafe { write_stat_output(buf, st) };
         Ok(0)
     })
 }
@@ -195,7 +200,8 @@ pub unsafe fn sys_lstat(path: *const c_char, buf: *mut ctypes::stat) -> ctypes::
         if buf.is_null() {
             return Err(LinuxError::EFAULT);
         }
-        unsafe { *buf = Default::default() }; // TODO
+        let st = ctypes::stat::default(); // TODO
+        unsafe { write_stat_output(buf, st) };
         Ok(0)
     })
 }
