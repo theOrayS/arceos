@@ -4972,6 +4972,19 @@ fn read_socket_addr_from_user(
     read_user_bytes(process, ptr, len)
 }
 
+fn sockaddr_bytes(addr: &posix_ctypes::sockaddr) -> [u8; size_of::<posix_ctypes::sockaddr>()] {
+    let mut bytes = [0u8; size_of::<posix_ctypes::sockaddr>()];
+    let family_len = size_of::<posix_ctypes::sa_family_t>();
+    bytes[..family_len].copy_from_slice(&addr.sa_family.to_ne_bytes());
+    for (dst, src) in bytes[family_len..]
+        .iter_mut()
+        .zip(addr.sa_data.iter().copied())
+    {
+        *dst = src as u8;
+    }
+    bytes
+}
+
 fn write_socket_addr_to_user(
     process: &UserProcess,
     addr: usize,
@@ -4982,12 +4995,7 @@ fn write_socket_addr_to_user(
 ) -> isize {
     let copy_len = core::cmp::min(user_len, size_of::<posix_ctypes::sockaddr>());
     if copy_len > 0 {
-        let local_addr_bytes = unsafe {
-            core::slice::from_raw_parts(
-                local_addr as *const _ as *const u8,
-                size_of::<posix_ctypes::sockaddr>(),
-            )
-        };
+        let local_addr_bytes = sockaddr_bytes(local_addr);
         if let Err(err) = write_user_bytes(process, addr, &local_addr_bytes[..copy_len]) {
             return neg_errno(err);
         }
