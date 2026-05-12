@@ -41,6 +41,7 @@ mod runtime_paths;
 mod signal_abi;
 mod synthetic_fs;
 mod sysv_shm;
+mod task_context;
 mod task_registry;
 mod user_memory;
 
@@ -66,6 +67,7 @@ use synthetic_fs::{
     proc_self_maps_is_writable_open, proc_self_maps_path_entry, synthetic_file_is_writable_open,
     synthetic_userdb_content, synthetic_userdb_fd_entry, synthetic_userdb_path_entry,
 };
+use task_context::{UserTaskExt, current_process, current_task_ext, current_tid, task_ext};
 use task_registry::{
     UserThreadEntry, register_user_task, unregister_user_task, user_thread_entry_by_process_pid,
     user_thread_entry_by_tid, user_thread_entry_for_process,
@@ -127,40 +129,6 @@ macro_rules! return_on_fd_set_write_error {
         }
     };
 }
-
-struct UserTaskExt {
-    process: Arc<UserProcess>,
-    clear_child_tid: AtomicUsize,
-    pending_signal: AtomicI32,
-    signal_mask: AtomicU64,
-    futex_wait: AtomicUsize,
-    robust_list_head: AtomicUsize,
-    robust_list_len: AtomicUsize,
-    deferred_unmap_start: AtomicUsize,
-    deferred_unmap_len: AtomicUsize,
-    signal_frame: AtomicUsize,
-    pending_sigreturn: Mutex<Option<TrapFrame>>,
-}
-
-impl UserTaskExt {
-    fn new(process: Arc<UserProcess>, clear_child_tid: usize, signal_mask: u64) -> Self {
-        Self {
-            process,
-            clear_child_tid: AtomicUsize::new(clear_child_tid),
-            pending_signal: AtomicI32::new(0),
-            signal_mask: AtomicU64::new(signal_mask),
-            futex_wait: AtomicUsize::new(0),
-            robust_list_head: AtomicUsize::new(0),
-            robust_list_len: AtomicUsize::new(0),
-            deferred_unmap_start: AtomicUsize::new(0),
-            deferred_unmap_len: AtomicUsize::new(0),
-            signal_frame: AtomicUsize::new(0),
-            pending_sigreturn: Mutex::new(None),
-        }
-    }
-}
-
-axtask::def_task_ext!(UserTaskExt);
 
 struct AxNamespaceImpl;
 
@@ -890,33 +858,10 @@ impl UserProcess {
     }
 }
 
-fn current_process() -> Option<Arc<UserProcess>> {
-    let ext = current_task_ext()?;
-    Some(ext.process.clone())
-}
-
 fn notify_parent_child_exit(ppid: i32) {
     if let Some(parent) = user_thread_entry_by_process_pid(ppid) {
         parent.process.child_exit_wait.notify_all(false);
     }
-}
-
-fn current_task_ext() -> Option<&'static UserTaskExt> {
-    let curr = axtask::current_may_uninit()?;
-    let ptr = unsafe { curr.task_ext_ptr() };
-    if ptr.is_null() {
-        return None;
-    }
-    let ext = unsafe { &*(ptr as *const UserTaskExt) };
-    Some(ext)
-}
-
-fn task_ext(task: &AxTaskRef) -> Option<&UserTaskExt> {
-    let ptr = unsafe { task.task_ext_ptr() };
-    if ptr.is_null() {
-        return None;
-    }
-    Some(unsafe { &*(ptr as *const UserTaskExt) })
 }
 
 fn deliver_user_signal(entry: &UserThreadEntry, sig: i32) -> Result<(), LinuxError> {
@@ -979,10 +924,6 @@ fn perform_deferred_self_unmap() {
         return;
     }
     let _ = ext.process.aspace.lock().unmap(VirtAddr::from(start), len);
-}
-
-fn current_tid() -> i32 {
-    axtask::current().id().as_u64() as i32
 }
 
 fn signal_mask_bit(sig: i32) -> u64 {
