@@ -89,7 +89,7 @@ use synthetic_fs::{
     synthetic_file_is_writable_open, synthetic_userdb_content, synthetic_userdb_fd_entry,
     synthetic_userdb_path_entry,
 };
-use system_info::{SyslogAction, default_rusage, default_utsname, syslog_action};
+use system_info::{SyslogAction, default_rusage, default_utsname, default_winsize, syslog_action};
 use task_context::{UserTaskExt, current_process, current_task_ext, current_tid, task_ext};
 use task_registry::{
     UserThreadEntry, register_user_task, unregister_user_task, user_thread_entry_by_process_pid,
@@ -3039,12 +3039,7 @@ fn sys_ioctl(process: &UserProcess, fd: usize, req: usize, arg: usize) -> isize 
         return write_user_value(process, arg, &rtc);
     }
     if req as u32 == ioctl::TIOCGWINSZ {
-        let winsize = general::winsize {
-            ws_row: 0,
-            ws_col: 0,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
+        let winsize = default_winsize();
         if process.fds.lock().is_stdio(fd as i32) {
             return write_user_value(process, arg, &winsize);
         }

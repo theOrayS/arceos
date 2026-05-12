@@ -25,6 +25,15 @@ pub(super) fn default_rusage() -> general::rusage {
     unsafe { core::mem::zeroed() }
 }
 
+pub(super) fn default_winsize() -> general::winsize {
+    general::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    }
+}
+
 pub(super) fn default_utsname() -> system::new_utsname {
     let mut uts = system::new_utsname {
         sysname: [0; 65],
