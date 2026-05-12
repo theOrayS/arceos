@@ -193,13 +193,9 @@ impl FileLike for Pipe {
 /// Create a pipe
 ///
 /// Return 0 if succeed
-pub fn sys_pipe(fds: &mut [c_int]) -> c_int {
+pub fn sys_pipe(fds: &mut [c_int; 2]) -> c_int {
     debug!("sys_pipe <= {:#x}", fds.as_ptr() as usize);
     syscall_body!(sys_pipe, {
-        if fds.len() != 2 {
-            return Err(LinuxError::EFAULT);
-        }
-
         let (read_end, write_end) = Pipe::new();
         let read_fd = add_file_like(Arc::new(read_end))?;
         let write_fd = add_file_like(Arc::new(write_end)).inspect_err(|_| {
