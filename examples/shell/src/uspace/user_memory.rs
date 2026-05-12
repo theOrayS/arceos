@@ -263,6 +263,31 @@ pub(super) fn read_user_word(process: &UserProcess, ptr: usize) -> Result<usize,
     read_user_value(process, ptr)
 }
 
+pub(super) fn read_execve_argv(
+    process: &UserProcess,
+    argv_ptr: usize,
+    default_argv0: &str,
+) -> Result<Vec<String>, LinuxError> {
+    const MAX_ARGC: usize = 256;
+
+    if argv_ptr == 0 {
+        return Ok(vec![default_argv0.into()]);
+    }
+
+    let mut argv = Vec::new();
+    for idx in 0..MAX_ARGC {
+        let item_ptr = read_user_word(process, argv_ptr + idx * size_of::<usize>())?;
+        if item_ptr == 0 {
+            break;
+        }
+        argv.push(read_cstr(process, item_ptr)?);
+    }
+    if argv.is_empty() {
+        argv.push(default_argv0.into());
+    }
+    Ok(argv)
+}
+
 pub(super) fn read_cstr(process: &UserProcess, ptr: usize) -> Result<String, LinuxError> {
     const MAX_USER_CSTR_LEN: usize = 128 * 1024;
 

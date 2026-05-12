@@ -101,8 +101,8 @@ use time_abi::{
     validate_clock_id, zero_timespec, zero_timezone,
 };
 use user_memory::{
-    clear_user_bytes, read_cstr, read_iovec_entries, read_user_bytes, read_user_value,
-    read_user_word, user_io_buffer, validate_user_read, validate_user_write,
+    clear_user_bytes, read_cstr, read_execve_argv, read_iovec_entries, read_user_bytes,
+    read_user_value, user_io_buffer, validate_user_read, validate_user_write,
     with_readable_user_buffer, with_writable_user_buffer, write_user_bytes, write_user_value,
 };
 
@@ -4101,31 +4101,6 @@ fn sys_exit_group(process: &UserProcess, _tf: &TrapFrame, code: i32) -> ! {
     );
     process.request_exit_group(code);
     terminate_current_thread(process, code)
-}
-
-fn read_execve_argv(
-    process: &UserProcess,
-    argv_ptr: usize,
-    default_argv0: &str,
-) -> Result<Vec<String>, LinuxError> {
-    const MAX_ARGC: usize = 256;
-
-    if argv_ptr == 0 {
-        return Ok(vec![default_argv0.into()]);
-    }
-
-    let mut argv = Vec::new();
-    for idx in 0..MAX_ARGC {
-        let item_ptr = read_user_word(process, argv_ptr + idx * size_of::<usize>())?;
-        if item_ptr == 0 {
-            break;
-        }
-        argv.push(read_cstr(process, item_ptr)?);
-    }
-    if argv.is_empty() {
-        argv.push(default_argv0.into());
-    }
-    Ok(argv)
 }
 
 impl FdTable {
