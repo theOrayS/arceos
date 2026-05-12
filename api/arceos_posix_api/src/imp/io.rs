@@ -64,11 +64,22 @@ pub unsafe fn sys_write(fd: c_int, buf: *const c_void, count: usize) -> ctypes::
 }
 
 /// Write a vector.
+///
+/// # Safety
+///
+/// `iov` must either be null with `iocnt == 0`, or point to a readable array of
+/// `iocnt` iovec entries.
 pub unsafe fn sys_writev(fd: c_int, iov: *const ctypes::iovec, iocnt: c_int) -> ctypes::ssize_t {
     debug!("sys_writev <= fd: {}", fd);
     syscall_body!(sys_writev, {
         if !(0..=1024).contains(&iocnt) {
             return Err(LinuxError::EINVAL);
+        }
+        if iocnt == 0 {
+            return Ok(0);
+        }
+        if iov.is_null() {
+            return Err(LinuxError::EFAULT);
         }
 
         let iovs = unsafe { core::slice::from_raw_parts(iov, iocnt as usize) };
