@@ -101,9 +101,9 @@ use time_abi::{
     validate_clock_id, zero_timespec, zero_timezone,
 };
 use user_memory::{
-    clear_user_bytes, read_cstr, read_user_bytes, read_user_value, read_user_word, user_io_buffer,
-    validate_user_read, validate_user_write, with_readable_user_buffer, with_writable_user_buffer,
-    write_user_bytes, write_user_value,
+    clear_user_bytes, read_cstr, read_iovec_entries, read_user_bytes, read_user_value,
+    read_user_word, user_io_buffer, validate_user_read, validate_user_write,
+    with_readable_user_buffer, with_writable_user_buffer, write_user_bytes, write_user_value,
 };
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -1779,24 +1779,6 @@ fn sys_readv(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isi
         }
     }
     total
-}
-
-fn read_iovec_entries(
-    process: &UserProcess,
-    iov: usize,
-    iovcnt: usize,
-) -> Result<Vec<general::iovec>, LinuxError> {
-    if iovcnt > IOV_MAX {
-        return Err(LinuxError::EINVAL);
-    }
-    let iov_bytes_len = iovcnt
-        .checked_mul(size_of::<general::iovec>())
-        .ok_or(LinuxError::EINVAL)?;
-    let iov_bytes = read_user_bytes(process, iov, iov_bytes_len)?;
-    Ok(iov_bytes
-        .chunks_exact(size_of::<general::iovec>())
-        .map(|chunk| unsafe { ptr::read_unaligned(chunk.as_ptr() as *const general::iovec) })
-        .collect())
 }
 
 fn sys_getcwd(process: &UserProcess, buf: usize, size: usize) -> isize {

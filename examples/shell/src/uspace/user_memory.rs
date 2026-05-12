@@ -1,11 +1,14 @@
 use core::mem::{MaybeUninit, size_of};
+use core::ptr;
 
 use axerrno::LinuxError;
 use axhal::paging::MappingFlags;
+use linux_raw_sys::general;
 use memory_addr::VirtAddr;
 use std::string::String;
 use std::vec::Vec;
 
+use super::linux_abi::IOV_MAX;
 use super::{UserProcess, neg_errno};
 
 pub(super) fn validate_user_read(
@@ -110,6 +113,24 @@ pub(super) fn read_user_bytes(
         .read(VirtAddr::from(ptr), &mut bytes)
         .map_err(|_| LinuxError::EFAULT)?;
     Ok(bytes)
+}
+
+pub(super) fn read_iovec_entries(
+    process: &UserProcess,
+    iov: usize,
+    iovcnt: usize,
+) -> Result<Vec<general::iovec>, LinuxError> {
+    if iovcnt > IOV_MAX {
+        return Err(LinuxError::EINVAL);
+    }
+    let iov_bytes_len = iovcnt
+        .checked_mul(size_of::<general::iovec>())
+        .ok_or(LinuxError::EINVAL)?;
+    let iov_bytes = read_user_bytes(process, iov, iov_bytes_len)?;
+    Ok(iov_bytes
+        .chunks_exact(size_of::<general::iovec>())
+        .map(|chunk| unsafe { ptr::read_unaligned(chunk.as_ptr() as *const general::iovec) })
+        .collect())
 }
 
 pub(super) fn write_user_bytes(
