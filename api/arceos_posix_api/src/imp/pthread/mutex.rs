@@ -58,7 +58,11 @@ impl PthreadMutex {
 }
 
 /// Initialize a mutex.
-pub fn sys_pthread_mutex_init(
+///
+/// # Safety
+///
+/// `mutex` must point to writable storage for a `pthread_mutex_t`.
+pub unsafe fn sys_pthread_mutex_init(
     mutex: *mut ctypes::pthread_mutex_t,
     _attr: *const ctypes::pthread_mutexattr_t,
 ) -> c_int {
@@ -73,7 +77,11 @@ pub fn sys_pthread_mutex_init(
 }
 
 /// Lock the given mutex.
-pub fn sys_pthread_mutex_lock(mutex: *mut ctypes::pthread_mutex_t) -> c_int {
+///
+/// # Safety
+///
+/// `mutex` must point to a valid initialized `pthread_mutex_t`.
+pub unsafe fn sys_pthread_mutex_lock(mutex: *mut ctypes::pthread_mutex_t) -> c_int {
     debug!("sys_pthread_mutex_lock <= {:#x}", mutex as usize);
     syscall_body!(sys_pthread_mutex_lock, {
         check_null_mut_ptr(mutex)?;
@@ -85,7 +93,11 @@ pub fn sys_pthread_mutex_lock(mutex: *mut ctypes::pthread_mutex_t) -> c_int {
 }
 
 /// Unlock the given mutex.
-pub fn sys_pthread_mutex_unlock(mutex: *mut ctypes::pthread_mutex_t) -> c_int {
+///
+/// # Safety
+///
+/// `mutex` must point to a valid initialized `pthread_mutex_t` owned by the current task.
+pub unsafe fn sys_pthread_mutex_unlock(mutex: *mut ctypes::pthread_mutex_t) -> c_int {
     debug!("sys_pthread_mutex_unlock <= {:#x}", mutex as usize);
     syscall_body!(sys_pthread_mutex_unlock, {
         check_null_mut_ptr(mutex)?;
