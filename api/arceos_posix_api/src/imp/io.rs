@@ -10,7 +10,11 @@ use axio::prelude::*;
 /// Read data from the file indicated by `fd`.
 ///
 /// Return the read size if success.
-pub fn sys_read(fd: c_int, buf: *mut c_void, count: usize) -> ctypes::ssize_t {
+///
+/// # Safety
+///
+/// `buf` must be valid for writes of `count` bytes.
+pub unsafe fn sys_read(fd: c_int, buf: *mut c_void, count: usize) -> ctypes::ssize_t {
     debug!("sys_read <= {} {:#x} {}", fd, buf as usize, count);
     syscall_body!(sys_read, {
         if buf.is_null() {
@@ -30,7 +34,7 @@ pub fn sys_read(fd: c_int, buf: *mut c_void, count: usize) -> ctypes::ssize_t {
     })
 }
 
-fn write_impl(fd: c_int, buf: *const c_void, count: usize) -> LinuxResult<ctypes::ssize_t> {
+unsafe fn write_impl(fd: c_int, buf: *const c_void, count: usize) -> LinuxResult<ctypes::ssize_t> {
     if buf.is_null() {
         return Err(LinuxError::EFAULT);
     }
@@ -50,9 +54,13 @@ fn write_impl(fd: c_int, buf: *const c_void, count: usize) -> LinuxResult<ctypes
 /// Write data to the file indicated by `fd`.
 ///
 /// Return the written size if success.
-pub fn sys_write(fd: c_int, buf: *const c_void, count: usize) -> ctypes::ssize_t {
+///
+/// # Safety
+///
+/// `buf` must be valid for reads of `count` bytes.
+pub unsafe fn sys_write(fd: c_int, buf: *const c_void, count: usize) -> ctypes::ssize_t {
     debug!("sys_write <= {} {:#x} {}", fd, buf as usize, count);
-    syscall_body!(sys_write, write_impl(fd, buf, count))
+    syscall_body!(sys_write, unsafe { write_impl(fd, buf, count) })
 }
 
 /// Write a vector.
@@ -69,7 +77,7 @@ pub unsafe fn sys_writev(fd: c_int, iov: *const ctypes::iovec, iocnt: c_int) -> 
             if iov.iov_len == 0 {
                 continue;
             }
-            let result = write_impl(fd, iov.iov_base, iov.iov_len)?;
+            let result = unsafe { write_impl(fd, iov.iov_base, iov.iov_len) }?;
             if result < 0 {
                 return Ok(result);
             }
