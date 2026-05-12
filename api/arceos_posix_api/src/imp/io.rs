@@ -1,6 +1,7 @@
 use crate::ctypes;
 use axerrno::{LinuxError, LinuxResult};
 use core::ffi::{c_int, c_void};
+use core::ptr::NonNull;
 
 #[cfg(feature = "fd")]
 use crate::imp::fd_ops::get_file_like;
@@ -13,14 +14,12 @@ use axio::prelude::*;
 ///
 /// # Safety
 ///
-/// `buf` must be valid for writes of `count` bytes.
+/// `buf` must either be null with `count == 0`, or be valid for writes of
+/// `count` bytes.
 pub unsafe fn sys_read(fd: c_int, buf: *mut c_void, count: usize) -> ctypes::ssize_t {
     debug!("sys_read <= {} {:#x} {}", fd, buf as usize, count);
     syscall_body!(sys_read, {
-        if buf.is_null() {
-            return Err(LinuxError::EFAULT);
-        }
-        let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, count) };
+        let dst = unsafe { writable_user_buffer(buf, count)? };
         #[cfg(feature = "fd")]
         {
             Ok(get_file_like(fd)?.read(dst)? as ctypes::ssize_t)
@@ -34,11 +33,32 @@ pub unsafe fn sys_read(fd: c_int, buf: *mut c_void, count: usize) -> ctypes::ssi
     })
 }
 
+unsafe fn writable_user_buffer<'a>(buf: *mut c_void, count: usize) -> LinuxResult<&'a mut [u8]> {
+    let ptr = if count == 0 {
+        NonNull::<u8>::dangling().as_ptr()
+    } else {
+        if buf.is_null() {
+            return Err(LinuxError::EFAULT);
+        }
+        buf as *mut u8
+    };
+    Ok(unsafe { core::slice::from_raw_parts_mut(ptr, count) })
+}
+
+unsafe fn readable_user_buffer<'a>(buf: *const c_void, count: usize) -> LinuxResult<&'a [u8]> {
+    let ptr = if count == 0 {
+        NonNull::<u8>::dangling().as_ptr()
+    } else {
+        if buf.is_null() {
+            return Err(LinuxError::EFAULT);
+        }
+        buf as *const u8
+    };
+    Ok(unsafe { core::slice::from_raw_parts(ptr, count) })
+}
+
 unsafe fn write_impl(fd: c_int, buf: *const c_void, count: usize) -> LinuxResult<ctypes::ssize_t> {
-    if buf.is_null() {
-        return Err(LinuxError::EFAULT);
-    }
-    let src = unsafe { core::slice::from_raw_parts(buf as *const u8, count) };
+    let src = unsafe { readable_user_buffer(buf, count)? };
     #[cfg(feature = "fd")]
     {
         Ok(get_file_like(fd)?.write(src)? as ctypes::ssize_t)
@@ -57,7 +77,8 @@ unsafe fn write_impl(fd: c_int, buf: *const c_void, count: usize) -> LinuxResult
 ///
 /// # Safety
 ///
-/// `buf` must be valid for reads of `count` bytes.
+/// `buf` must either be null with `count == 0`, or be valid for reads of
+/// `count` bytes.
 pub unsafe fn sys_write(fd: c_int, buf: *const c_void, count: usize) -> ctypes::ssize_t {
     debug!("sys_write <= {} {:#x} {}", fd, buf as usize, count);
     syscall_body!(sys_write, unsafe { write_impl(fd, buf, count) })
