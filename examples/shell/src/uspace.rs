@@ -94,8 +94,8 @@ use synthetic_fs::{
     synthetic_userdb_path_entry,
 };
 use system_info::{
-    SyslogAction, default_utsname, default_winsize, syslog_action, syslog_empty_read_bytes,
-    write_default_rusage,
+    SyslogAction, default_winsize, syslog_action, syslog_empty_read_bytes, write_default_rusage,
+    write_default_utsname,
 };
 use task_context::{
     UserTaskExt, current_process, current_task_ext, current_tid, robust_list_for_task,
@@ -3235,8 +3235,7 @@ fn sys_getrusage(process: &UserProcess, who: i32, usage: usize) -> isize {
 }
 
 fn sys_uname(process: &UserProcess, buf: usize) -> isize {
-    let uts = default_utsname();
-    write_user_value(process, buf, &uts)
+    write_default_utsname(process, buf)
 }
 
 fn sys_nanosleep(process: &UserProcess, req: usize, rem: usize) -> isize {

@@ -60,7 +60,7 @@ pub(super) fn default_winsize() -> general::winsize {
     }
 }
 
-pub(super) fn default_utsname() -> system::new_utsname {
+fn default_utsname() -> system::new_utsname {
     let mut uts = system::new_utsname {
         sysname: [0; 65],
         nodename: [0; 65],
@@ -79,6 +79,11 @@ pub(super) fn default_utsname() -> system::new_utsname {
     write_c_string(&mut uts.machine, b"loongarch64");
     write_c_string(&mut uts.domainname, b"localdomain");
     uts
+}
+
+pub(super) fn write_default_utsname(process: &UserProcess, buf: usize) -> isize {
+    let value = default_utsname();
+    write_user_value(process, buf, &value)
 }
 
 trait CCharSlot: Copy {
