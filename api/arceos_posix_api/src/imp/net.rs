@@ -265,13 +265,36 @@ impl From<ctypes::sockaddr_in> for SocketAddrV4 {
     }
 }
 
+fn sockaddr_from_ipv4(addr: ctypes::sockaddr_in) -> ctypes::sockaddr {
+    let mut sa_data = [0 as c_char; 14];
+    for (dst, src) in sa_data[..2].iter_mut().zip(addr.sin_port.to_ne_bytes()) {
+        *dst = src as c_char;
+    }
+    for (dst, src) in sa_data[2..6]
+        .iter_mut()
+        .zip(addr.sin_addr.s_addr.to_ne_bytes())
+    {
+        *dst = src as c_char;
+    }
+    for (dst, src) in sa_data[6..].iter_mut().zip(addr.sin_zero) {
+        *dst = src as c_char;
+    }
+    ctypes::sockaddr {
+        sa_family: addr.sin_family,
+        sa_data,
+    }
+}
+
 fn into_sockaddr(addr: SocketAddr) -> (ctypes::sockaddr, ctypes::socklen_t) {
     debug!("    Sockaddr: {}", addr);
     match addr {
-        SocketAddr::V4(addr) => (
-            unsafe { *(&ctypes::sockaddr_in::from(addr) as *const _ as *const ctypes::sockaddr) },
-            size_of::<ctypes::sockaddr>() as ctypes::socklen_t,
-        ),
+        SocketAddr::V4(addr) => {
+            let addr = ctypes::sockaddr_in::from(addr);
+            (
+                sockaddr_from_ipv4(addr),
+                size_of::<ctypes::sockaddr>() as ctypes::socklen_t,
+            )
+        }
         SocketAddr::V6(_) => panic!("IPv6 is not supported"),
     }
 }
@@ -287,7 +310,7 @@ fn from_sockaddr(
         return Err(LinuxError::EINVAL);
     }
 
-    let mid = unsafe { *(addr as *const ctypes::sockaddr_in) };
+    let mid = unsafe { core::ptr::read_unaligned(addr as *const ctypes::sockaddr_in) };
     if mid.sin_family != ctypes::AF_INET as u16 {
         return Err(LinuxError::EINVAL);
     }
