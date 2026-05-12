@@ -1,3 +1,7 @@
+use axerrno::LinuxError;
+use linux_raw_sys::general;
+use std::string::String;
+
 pub(super) const USER_ASPACE_BASE: usize = 0x1_0000;
 pub(super) const USER_ASPACE_SIZE: usize = 0x20_0000_0000;
 pub(super) const USER_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -122,3 +126,39 @@ pub(super) const LINUX_PERSONALITY_MASK: usize = 0xffff_ffff;
 pub(super) const AUX_PLATFORM: &str = "riscv64";
 #[cfg(target_arch = "loongarch64")]
 pub(super) const AUX_PLATFORM: &str = "loongarch64";
+
+pub(super) fn posix_errno_from_ret(ret: isize) -> LinuxError {
+    LinuxError::try_from((-ret) as i32).unwrap_or(LinuxError::EIO)
+}
+
+pub(super) fn posix_ret_usize(ret: isize) -> Result<usize, LinuxError> {
+    if ret < 0 {
+        Err(posix_errno_from_ret(ret))
+    } else {
+        Ok(ret as usize)
+    }
+}
+
+pub(super) fn posix_ret_i32(ret: i32) -> Result<i32, LinuxError> {
+    if ret < 0 {
+        Err(posix_errno_from_ret(ret as isize))
+    } else {
+        Ok(ret)
+    }
+}
+
+pub(super) fn neg_errno(err: LinuxError) -> isize {
+    -(err.code() as isize)
+}
+
+pub(super) fn neg_errno_code(code: u32) -> isize {
+    -(code as isize)
+}
+
+pub(super) fn fd_cloexec_flag(enabled: bool) -> u32 {
+    if enabled { general::FD_CLOEXEC } else { 0 }
+}
+
+pub(super) fn str_err(err: &'static str) -> String {
+    err.into()
+}

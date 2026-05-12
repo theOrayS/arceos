@@ -212,26 +212,6 @@ struct LoadedProgram {
 
 const NO_EXIT_GROUP_CODE: i32 = i32::MIN;
 
-fn posix_errno_from_ret(ret: isize) -> LinuxError {
-    LinuxError::try_from((-ret) as i32).unwrap_or(LinuxError::EIO)
-}
-
-fn posix_ret_usize(ret: isize) -> Result<usize, LinuxError> {
-    if ret < 0 {
-        Err(posix_errno_from_ret(ret))
-    } else {
-        Ok(ret as usize)
-    }
-}
-
-fn posix_ret_i32(ret: i32) -> Result<i32, LinuxError> {
-    if ret < 0 {
-        Err(posix_errno_from_ret(ret as isize))
-    } else {
-        Ok(ret)
-    }
-}
-
 #[crate_interface::impl_interface]
 impl axns::AxNamespaceIf for AxNamespaceImpl {
     fn current_namespace_base() -> *mut u8 {
@@ -4146,22 +4126,6 @@ fn read_execve_argv(
         argv.push(default_argv0.into());
     }
     Ok(argv)
-}
-
-fn neg_errno(err: LinuxError) -> isize {
-    -(err.code() as isize)
-}
-
-fn neg_errno_code(code: u32) -> isize {
-    -(code as isize)
-}
-
-fn fd_cloexec_flag(enabled: bool) -> u32 {
-    if enabled { general::FD_CLOEXEC } else { 0 }
-}
-
-fn str_err(err: &'static str) -> String {
-    err.into()
 }
 
 impl FdTable {
