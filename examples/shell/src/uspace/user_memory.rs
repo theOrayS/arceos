@@ -1,11 +1,10 @@
-use core::ffi::{CStr, c_char};
-use core::mem::size_of;
-use core::ptr;
+use core::mem::{MaybeUninit, size_of};
 
 use axerrno::LinuxError;
 use axhal::paging::MappingFlags;
 use memory_addr::VirtAddr;
 use std::string::{String, ToString};
+use std::vec::Vec;
 
 use super::{UserProcess, neg_errno};
 
@@ -93,42 +92,61 @@ pub(super) fn user_bytes_mut<'a>(
 }
 
 pub(super) fn write_user_value<T: Copy>(process: &UserProcess, ptr: usize, value: &T) -> isize {
-    let Some(dst) = user_bytes_mut(process, ptr, size_of::<T>(), true) else {
+    if ptr == 0 || !user_range_accessible(process, ptr, size_of::<T>(), true) {
         return neg_errno(LinuxError::EFAULT);
-    };
-    unsafe {
-        ptr::copy_nonoverlapping(
-            value as *const T as *const u8,
-            dst.as_mut_ptr(),
-            size_of::<T>(),
-        );
     }
-    0
+
+    let src =
+        unsafe { core::slice::from_raw_parts(value as *const T as *const u8, size_of::<T>()) };
+    process
+        .aspace
+        .lock()
+        .write(VirtAddr::from(ptr), src)
+        .map_or_else(|_| neg_errno(LinuxError::EFAULT), |_| 0)
 }
 
 pub(super) fn read_user_value<T: Copy>(process: &UserProcess, ptr: usize) -> Result<T, LinuxError> {
-    let Some(src) = user_bytes(process, ptr, size_of::<T>(), false) else {
+    if ptr == 0 || !user_range_accessible(process, ptr, size_of::<T>(), false) {
         return Err(LinuxError::EFAULT);
-    };
-    Ok(unsafe { ptr::read_unaligned(src.as_ptr() as *const T) })
+    }
+
+    let mut value = MaybeUninit::<T>::uninit();
+    let dst =
+        unsafe { core::slice::from_raw_parts_mut(value.as_mut_ptr() as *mut u8, size_of::<T>()) };
+    process
+        .aspace
+        .lock()
+        .read(VirtAddr::from(ptr), dst)
+        .map_err(|_| LinuxError::EFAULT)?;
+    Ok(unsafe { value.assume_init() })
 }
 
 pub(super) fn read_cstr(process: &UserProcess, ptr: usize) -> Result<String, LinuxError> {
+    const MAX_USER_CSTR_LEN: usize = 128 * 1024;
+
     if ptr == 0 {
         return Err(LinuxError::EFAULT);
     }
     if !user_range_fits(ptr, 1) {
         return Err(LinuxError::EFAULT);
     }
-    if !process
-        .aspace
-        .lock()
-        .can_access_range(VirtAddr::from(ptr), 1, MappingFlags::READ)
-    {
-        return Err(LinuxError::EFAULT);
+
+    let aspace = process.aspace.lock();
+    let mut bytes = Vec::new();
+    for offset in 0..MAX_USER_CSTR_LEN {
+        let addr = ptr.checked_add(offset).ok_or(LinuxError::EFAULT)?;
+        if !aspace.can_access_range(VirtAddr::from(addr), 1, MappingFlags::READ) {
+            return Err(LinuxError::EFAULT);
+        }
+        let mut byte = [0u8; 1];
+        aspace
+            .read(VirtAddr::from(addr), &mut byte)
+            .map_err(|_| LinuxError::EFAULT)?;
+        if byte[0] == 0 {
+            return String::from_utf8(bytes).map_err(|_| LinuxError::EINVAL);
+        }
+        bytes.push(byte[0]);
     }
-    unsafe { CStr::from_ptr(ptr as *const c_char) }
-        .to_str()
-        .map(|s| s.to_string())
-        .map_err(|_| LinuxError::EINVAL)
+
+    Err(LinuxError::EINVAL)
 }

@@ -4948,12 +4948,7 @@ fn with_writable_slice(
 }
 
 fn read_user_word(process: &UserProcess, ptr: usize) -> Result<usize, LinuxError> {
-    let Some(bytes) = user_bytes(process, ptr, size_of::<usize>(), false) else {
-        return Err(LinuxError::EFAULT);
-    };
-    let mut raw = [0u8; size_of::<usize>()];
-    raw.copy_from_slice(bytes);
-    Ok(usize::from_ne_bytes(raw))
+    read_user_value(process, ptr)
 }
 
 fn read_execve_argv(
