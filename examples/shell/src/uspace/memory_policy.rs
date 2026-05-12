@@ -13,7 +13,7 @@ fn nodemask_len(maxnode: usize) -> usize {
     }
 }
 
-pub(super) fn validate_mempolicy_nodemask(
+fn validate_mempolicy_nodemask(
     process: &UserProcess,
     nodemask: usize,
     maxnode: usize,
@@ -23,6 +23,17 @@ pub(super) fn validate_mempolicy_nodemask(
         validate_user_read(process, nodemask, mask_len)?;
     }
     Ok(())
+}
+
+pub(super) fn validate_mempolicy_request(
+    process: &UserProcess,
+    nodemask: usize,
+    maxnode: usize,
+) -> isize {
+    match validate_mempolicy_nodemask(process, nodemask, maxnode) {
+        Ok(()) => 0,
+        Err(err) => neg_errno(err),
+    }
 }
 
 pub(super) fn write_default_mempolicy(

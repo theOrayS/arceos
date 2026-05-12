@@ -63,7 +63,7 @@ use fd_socket::{
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
 use linux_abi::*;
 use memory_map::{align_down, align_up, mmap_prot_to_flags, user_mapping_flags};
-use memory_policy::{validate_mempolicy_nodemask, write_default_mempolicy};
+use memory_policy::{validate_mempolicy_request, write_default_mempolicy};
 use metadata::{
     apply_recorded_path_metadata, canonical_permission_path, dirent_type, fd_entry_path,
     fd_entry_statfs_path, file_attr_to_stat, generic_statfs, normalize_file_mode, stdio_stat,
@@ -1474,10 +1474,7 @@ fn sys_mbind(
     maxnode: usize,
 ) -> isize {
     let _ = (start, len, mode);
-    if let Err(err) = validate_mempolicy_nodemask(process, nodemask, maxnode) {
-        return neg_errno(err);
-    }
-    0
+    validate_mempolicy_request(process, nodemask, maxnode)
 }
 
 fn sys_get_mempolicy(
@@ -1493,10 +1490,7 @@ fn sys_get_mempolicy(
 
 fn sys_set_mempolicy(process: &UserProcess, mode: usize, nodemask: usize, maxnode: usize) -> isize {
     let _ = mode;
-    if let Err(err) = validate_mempolicy_nodemask(process, nodemask, maxnode) {
-        return neg_errno(err);
-    }
-    0
+    validate_mempolicy_request(process, nodemask, maxnode)
 }
 
 fn sys_pipe2(process: &UserProcess, pipefd: usize, flags: usize) -> isize {
