@@ -51,13 +51,18 @@ pub(super) fn write_default_rusage(process: &UserProcess, who: i32, usage: usize
     write_user_value(process, usage, &value)
 }
 
-pub(super) fn default_winsize() -> general::winsize {
+fn default_winsize() -> general::winsize {
     general::winsize {
         ws_row: 0,
         ws_col: 0,
         ws_xpixel: 0,
         ws_ypixel: 0,
     }
+}
+
+pub(super) fn write_default_winsize(process: &UserProcess, buf: usize) -> isize {
+    let value = default_winsize();
+    write_user_value(process, buf, &value)
 }
 
 fn default_utsname() -> system::new_utsname {

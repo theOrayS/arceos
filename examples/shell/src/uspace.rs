@@ -94,8 +94,8 @@ use synthetic_fs::{
     synthetic_userdb_path_entry,
 };
 use system_info::{
-    SyslogAction, default_winsize, syslog_action, syslog_empty_read_bytes, write_default_rusage,
-    write_default_utsname,
+    SyslogAction, syslog_action, syslog_empty_read_bytes, write_default_rusage,
+    write_default_utsname, write_default_winsize,
 };
 use task_context::{
     UserTaskExt, current_process, current_task_ext, current_tid, robust_list_for_task,
@@ -3023,9 +3023,8 @@ fn sys_ioctl(process: &UserProcess, fd: usize, req: usize, arg: usize) -> isize 
         return write_user_value(process, arg, &rtc);
     }
     if req as u32 == ioctl::TIOCGWINSZ {
-        let winsize = default_winsize();
         if process.fds.lock().is_stdio(fd as i32) {
-            return write_user_value(process, arg, &winsize);
+            return write_default_winsize(process, arg);
         }
     }
     neg_errno(LinuxError::ENOTTY)
