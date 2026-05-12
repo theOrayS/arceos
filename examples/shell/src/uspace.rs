@@ -47,8 +47,8 @@ mod time_abi;
 mod user_memory;
 
 use credentials::{
-    access_allowed, parse_id_args, read_group_list, set_fs_id, set_re_ids, set_res_ids,
-    set_single_id, write_group_list, write_id_triplet,
+    access_allowed, apply_chown_metadata, chown_ids, read_group_list, set_fs_id, set_re_ids,
+    set_res_ids, set_single_id, write_group_list, write_id_triplet,
 };
 use fd_pipe::PipeEndpoint;
 use fd_socket::{LocalSocketEntry, SocketEntry};
@@ -2419,51 +2419,6 @@ fn sys_fchownat(
         (Some(resolved_path), st)
     };
     apply_chown_metadata(process, record_path, &st, owner, group)
-}
-
-fn chown_ids(owner: usize, group: usize) -> Result<(Option<u32>, Option<u32>), LinuxError> {
-    parse_id_args([owner, group]).map(|[owner, group]| (owner, group))
-}
-
-fn apply_chown_metadata(
-    process: &UserProcess,
-    path: Option<String>,
-    st: &general::stat,
-    owner: Option<u32>,
-    group: Option<u32>,
-) -> isize {
-    if !chown_allowed(process, st, owner, group) {
-        return neg_errno(LinuxError::EPERM);
-    }
-    if let Some(path) = path {
-        process.set_path_owner(path.clone(), owner, group);
-        if owner.is_some() || group.is_some() {
-            process.clear_path_chown_special_bits(path.as_str(), st.st_mode);
-        }
-    }
-    0
-}
-
-fn chown_allowed(
-    process: &UserProcess,
-    st: &general::stat,
-    owner: Option<u32>,
-    group: Option<u32>,
-) -> bool {
-    if process.uid() == 0 {
-        return true;
-    }
-    if let Some(owner) = owner {
-        if owner != st.st_uid || owner != process.uid() {
-            return false;
-        }
-    }
-    if let Some(group) = group {
-        if group != st.st_gid && !process.has_group(group) {
-            return false;
-        }
-    }
-    true
 }
 
 fn sys_ftruncate(process: &UserProcess, fd: usize, length: usize) -> isize {

@@ -2,6 +2,7 @@ use core::mem::size_of;
 
 use axerrno::LinuxError;
 use linux_raw_sys::general;
+use std::string::String;
 use std::vec::Vec;
 
 use super::linux_abi::{ACCESS_R_OK, ACCESS_W_OK, ACCESS_X_OK, CHOWN_ID_UNCHANGED};
@@ -26,9 +27,7 @@ pub(super) fn id_arg_optional(id: usize) -> Result<Option<u32>, LinuxError> {
     u32::try_from(id).map(Some).map_err(|_| LinuxError::EINVAL)
 }
 
-pub(super) fn parse_id_args<const N: usize>(
-    ids: [usize; N],
-) -> Result<[Option<u32>; N], LinuxError> {
+fn parse_id_args<const N: usize>(ids: [usize; N]) -> Result<[Option<u32>; N], LinuxError> {
     let mut parsed = [None; N];
     for (dst, id) in parsed.iter_mut().zip(ids) {
         *dst = id_arg_optional(id)?;
@@ -131,6 +130,54 @@ pub(super) fn access_allowed(st: &general::stat, mode: usize, uid: u32, gid: u32
     }
     if mode & ACCESS_X_OK != 0 && bits & 0o1 == 0 {
         return false;
+    }
+    true
+}
+
+pub(super) fn chown_ids(
+    owner: usize,
+    group: usize,
+) -> Result<(Option<u32>, Option<u32>), LinuxError> {
+    parse_id_args([owner, group]).map(|[owner, group]| (owner, group))
+}
+
+pub(super) fn apply_chown_metadata(
+    process: &UserProcess,
+    path: Option<String>,
+    st: &general::stat,
+    owner: Option<u32>,
+    group: Option<u32>,
+) -> isize {
+    if !chown_allowed(process, st, owner, group) {
+        return neg_errno(LinuxError::EPERM);
+    }
+    if let Some(path) = path {
+        process.set_path_owner(path.clone(), owner, group);
+        if owner.is_some() || group.is_some() {
+            process.clear_path_chown_special_bits(path.as_str(), st.st_mode);
+        }
+    }
+    0
+}
+
+fn chown_allowed(
+    process: &UserProcess,
+    st: &general::stat,
+    owner: Option<u32>,
+    group: Option<u32>,
+) -> bool {
+    if process.uid() == 0 {
+        return true;
+    }
+    if let Some(owner) = owner {
+        if owner != st.st_uid || owner != process.uid() {
+            return false;
+        }
+    }
+    if let Some(group) = group {
+        if group != st.st_gid && !process.has_group(group) {
+            return false;
+        }
     }
     true
 }
