@@ -103,6 +103,10 @@ impl Pthread {
     }
 }
 
+unsafe fn write_pthread_output<T>(dst: *mut T, value: T) {
+    unsafe { core::ptr::write_unaligned(dst, value) };
+}
+
 /// Returns the `pthread` struct of current thread.
 pub fn sys_pthread_self() -> ctypes::pthread_t {
     Pthread::current().expect("fail to get current thread") as *const Pthread as _
@@ -132,7 +136,7 @@ pub unsafe fn sys_pthread_create(
             return Err(LinuxError::EFAULT);
         }
         let ptr = Pthread::create(attr, start_routine, arg)?;
-        unsafe { core::ptr::write(res, ptr) };
+        unsafe { write_pthread_output(res, ptr) };
         Ok(0)
     })
 }
@@ -154,7 +158,7 @@ pub unsafe fn sys_pthread_join(thread: ctypes::pthread_t, retval: *mut *mut c_vo
     syscall_body!(sys_pthread_join, {
         let ret = Pthread::join(thread)?;
         if !retval.is_null() {
-            unsafe { core::ptr::write(retval, ret) };
+            unsafe { write_pthread_output(retval, ret) };
         }
         Ok(0)
     })
