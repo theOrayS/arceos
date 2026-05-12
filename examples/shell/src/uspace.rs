@@ -107,11 +107,11 @@ use task_registry::{
 };
 use time_abi::{
     UserTimex, adjtimex_changes_clock, adjtimex_input_valid, clock_getres_timespec,
-    clock_gettime_timespec, clock_now_duration, current_timeval, default_timex, default_tms,
+    clock_gettime_timespec, clock_now_duration, current_timeval, default_tms,
     itimerval_to_micros_pair, micros_to_duration, micros_to_timeval, monotonic_time_micros,
     read_timespec_duration, rtc_time_from_wall_time, set_realtime_offset_from_timespec,
     sleep_duration, socket_duration_to_timeval, socket_timeval_to_duration, times_ticks,
-    zero_timespec, zero_timezone,
+    write_default_timex, zero_timespec, zero_timezone,
 };
 use user_memory::{
     clear_user_bytes, read_cstr, read_execve_argv, read_iovec_entries, read_user_bytes,
@@ -3090,8 +3090,7 @@ fn sys_adjtimex(process: &UserProcess, tx: usize) -> isize {
         return neg_errno(LinuxError::EPERM);
     }
 
-    let output = default_timex();
-    let ret = write_user_value(process, tx, &output);
+    let ret = write_default_timex(process, tx);
     if ret != 0 {
         return ret;
     }

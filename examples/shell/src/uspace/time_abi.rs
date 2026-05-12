@@ -5,7 +5,7 @@ use axerrno::LinuxError;
 use linux_raw_sys::general;
 
 use super::UserProcess;
-use super::user_memory::read_user_value;
+use super::user_memory::{read_user_value, write_user_value};
 
 static REALTIME_OFFSET_NS: AtomicI64 = AtomicI64::new(0);
 
@@ -305,13 +305,18 @@ pub(super) fn adjtimex_changes_clock(input: UserTimex) -> bool {
     input.modes != 0
 }
 
-pub(super) fn default_timex() -> UserTimex {
+fn default_timex() -> UserTimex {
     let now = adjusted_wall_time();
     let mut output: UserTimex = unsafe { core::mem::zeroed() };
     output.precision = 1;
     output.time = timeval_from_duration(now);
     output.tick = 10_000;
     output
+}
+
+pub(super) fn write_default_timex(process: &UserProcess, tx: usize) -> isize {
+    let output = default_timex();
+    write_user_value(process, tx, &output)
 }
 
 pub(super) fn itimerval_to_micros_pair(
