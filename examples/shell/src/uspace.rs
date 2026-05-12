@@ -100,12 +100,12 @@ use task_registry::{
     user_thread_entry_by_tid, user_thread_entry_for_process,
 };
 use time_abi::{
-    UserTimex, adjtimex_changes_clock, adjtimex_input_valid, clock_now_duration,
-    clock_resolution_timespec, current_timeval, default_timex, default_tms,
+    UserTimex, adjtimex_changes_clock, adjtimex_input_valid, clock_getres_timespec,
+    clock_gettime_timespec, clock_now_duration, current_timeval, default_timex, default_tms,
     itimerval_to_micros_pair, micros_to_duration, micros_to_timeval, monotonic_time_micros,
     read_timespec_duration, rtc_time_from_wall_time, set_realtime_offset_from_timespec,
-    sleep_duration, socket_duration_to_timeval, socket_timeval_to_duration, timespec_from_duration,
-    validate_clock_id, zero_timespec, zero_timezone,
+    sleep_duration, socket_duration_to_timeval, socket_timeval_to_duration, zero_timespec,
+    zero_timezone,
 };
 use user_memory::{
     clear_user_bytes, read_cstr, read_execve_argv, read_iovec_entries, read_user_bytes,
@@ -3046,11 +3046,10 @@ fn sys_ioctl(process: &UserProcess, fd: usize, req: usize, arg: usize) -> isize 
 }
 
 fn sys_clock_gettime(process: &UserProcess, clk_id: usize, tp: usize) -> isize {
-    let now = match clock_now_duration(clk_id as u32) {
-        Ok(now) => now,
+    let ts = match clock_gettime_timespec(clk_id as u32) {
+        Ok(ts) => ts,
         Err(err) => return neg_errno(err),
     };
-    let ts = timespec_from_duration(now);
     write_user_value(process, tp, &ts)
 }
 
@@ -3070,13 +3069,13 @@ fn sys_clock_settime(process: &UserProcess, clk_id: usize, tp: usize) -> isize {
 }
 
 fn sys_clock_getres(process: &UserProcess, clk_id: usize, tp: usize) -> isize {
-    if let Err(err) = validate_clock_id(clk_id as u32) {
-        return neg_errno(err);
-    }
+    let ts = match clock_getres_timespec(clk_id as u32) {
+        Ok(ts) => ts,
+        Err(err) => return neg_errno(err),
+    };
     if tp == 0 {
         return 0;
     }
-    let ts = clock_resolution_timespec();
     write_user_value(process, tp, &ts)
 }
 

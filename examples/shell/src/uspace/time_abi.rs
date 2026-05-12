@@ -123,6 +123,10 @@ pub(super) fn timespec_from_duration(duration: core::time::Duration) -> general:
     }
 }
 
+pub(super) fn clock_gettime_timespec(clockid: u32) -> Result<general::timespec, LinuxError> {
+    clock_now_duration(clockid).map(timespec_from_duration)
+}
+
 pub(super) fn timeval_from_duration(duration: core::time::Duration) -> general::timeval {
     general::timeval {
         tv_sec: duration.as_secs() as _,
@@ -135,6 +139,11 @@ pub(super) fn clock_resolution_timespec() -> general::timespec {
         tv_sec: 0,
         tv_nsec: 1,
     }
+}
+
+pub(super) fn clock_getres_timespec(clockid: u32) -> Result<general::timespec, LinuxError> {
+    validate_clock_id(clockid)?;
+    Ok(clock_resolution_timespec())
 }
 
 pub(super) fn zero_timespec() -> general::timespec {
