@@ -73,8 +73,9 @@ use task_registry::{
     user_thread_entry_by_tid, user_thread_entry_for_process,
 };
 use user_memory::{
-    clear_user_bytes, read_cstr, read_user_bytes, read_user_value, validate_user_read,
-    validate_user_write, write_user_bytes, write_user_value,
+    clear_user_bytes, read_cstr, read_user_bytes, read_user_value, read_user_word, user_io_buffer,
+    validate_user_read, validate_user_write, with_readable_user_buffer, with_writable_user_buffer,
+    write_user_bytes, write_user_value,
 };
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -4786,15 +4787,6 @@ fn sys_exit_group(process: &UserProcess, _tf: &TrapFrame, code: i32) -> ! {
     terminate_current_thread(process, code)
 }
 
-fn user_io_buffer(len: usize) -> Result<Vec<u8>, LinuxError> {
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(len)
-        .map_err(|_| LinuxError::ENOMEM)?;
-    bytes.resize(len, 0);
-    Ok(bytes)
-}
-
 fn read_socket_data_from_user(
     process: &UserProcess,
     ptr: usize,
@@ -4926,53 +4918,6 @@ fn recv_socket_data_to_user_inner(
         Ok(()) => ret,
         Err(err) => neg_errno(err),
     }
-}
-
-fn with_readable_user_buffer(
-    process: &UserProcess,
-    ptr: usize,
-    len: usize,
-    f: impl FnOnce(&[u8]) -> Result<usize, LinuxError>,
-) -> isize {
-    let bytes = match read_user_bytes(process, ptr, len) {
-        Ok(bytes) => bytes,
-        Err(err) => return neg_errno(err),
-    };
-    match f(&bytes) {
-        Ok(v) => v as isize,
-        Err(err) => neg_errno(err),
-    }
-}
-
-fn with_writable_user_buffer(
-    process: &UserProcess,
-    ptr: usize,
-    len: usize,
-    f: impl FnOnce(&mut [u8]) -> Result<usize, LinuxError>,
-) -> isize {
-    if let Err(err) = validate_user_write(process, ptr, len) {
-        return neg_errno(err);
-    }
-    let mut bytes = match user_io_buffer(len) {
-        Ok(bytes) => bytes,
-        Err(err) => return neg_errno(err),
-    };
-    match f(&mut bytes) {
-        Ok(v) => {
-            if v > len {
-                return neg_errno(LinuxError::EINVAL);
-            }
-            match write_user_bytes(process, ptr, &bytes[..v]) {
-                Ok(()) => v as isize,
-                Err(err) => neg_errno(err),
-            }
-        }
-        Err(err) => neg_errno(err),
-    }
-}
-
-fn read_user_word(process: &UserProcess, ptr: usize) -> Result<usize, LinuxError> {
-    read_user_value(process, ptr)
 }
 
 fn read_execve_argv(

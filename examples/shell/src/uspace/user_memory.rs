@@ -131,6 +131,58 @@ pub(super) fn write_user_bytes(
         .map_err(|_| LinuxError::EFAULT)
 }
 
+pub(super) fn user_io_buffer(len: usize) -> Result<Vec<u8>, LinuxError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| LinuxError::ENOMEM)?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+pub(super) fn with_readable_user_buffer(
+    process: &UserProcess,
+    ptr: usize,
+    len: usize,
+    f: impl FnOnce(&[u8]) -> Result<usize, LinuxError>,
+) -> isize {
+    let bytes = match read_user_bytes(process, ptr, len) {
+        Ok(bytes) => bytes,
+        Err(err) => return neg_errno(err),
+    };
+    match f(&bytes) {
+        Ok(v) => v as isize,
+        Err(err) => neg_errno(err),
+    }
+}
+
+pub(super) fn with_writable_user_buffer(
+    process: &UserProcess,
+    ptr: usize,
+    len: usize,
+    f: impl FnOnce(&mut [u8]) -> Result<usize, LinuxError>,
+) -> isize {
+    if let Err(err) = validate_user_write(process, ptr, len) {
+        return neg_errno(err);
+    }
+    let mut bytes = match user_io_buffer(len) {
+        Ok(bytes) => bytes,
+        Err(err) => return neg_errno(err),
+    };
+    match f(&mut bytes) {
+        Ok(v) => {
+            if v > len {
+                return neg_errno(LinuxError::EINVAL);
+            }
+            match write_user_bytes(process, ptr, &bytes[..v]) {
+                Ok(()) => v as isize,
+                Err(err) => neg_errno(err),
+            }
+        }
+        Err(err) => neg_errno(err),
+    }
+}
+
 pub(super) fn clear_user_bytes(
     process: &UserProcess,
     ptr: usize,
@@ -184,6 +236,10 @@ pub(super) fn read_user_value<T: Copy>(process: &UserProcess, ptr: usize) -> Res
         .read(VirtAddr::from(ptr), dst)
         .map_err(|_| LinuxError::EFAULT)?;
     Ok(unsafe { value.assume_init() })
+}
+
+pub(super) fn read_user_word(process: &UserProcess, ptr: usize) -> Result<usize, LinuxError> {
+    read_user_value(process, ptr)
 }
 
 pub(super) fn read_cstr(process: &UserProcess, ptr: usize) -> Result<String, LinuxError> {
