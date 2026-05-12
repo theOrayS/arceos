@@ -1905,13 +1905,12 @@ fn sys_pselect6(
 }
 
 fn sys_writev(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isize {
-    let iov_bytes = match read_iovec_array(process, iov, iovcnt) {
-        Ok(iov_bytes) => iov_bytes,
+    let iov_entries = match read_iovec_entries(process, iov, iovcnt) {
+        Ok(iov_entries) => iov_entries,
         Err(err) => return neg_errno(err),
     };
     let mut written = 0isize;
-    for chunk in iov_bytes.chunks_exact(size_of::<general::iovec>()) {
-        let entry = unsafe { ptr::read_unaligned(chunk.as_ptr() as *const general::iovec) };
+    for entry in iov_entries {
         let len = entry.iov_len as usize;
         if len == 0 {
             continue;
@@ -1933,13 +1932,12 @@ fn sys_writev(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> is
 }
 
 fn sys_readv(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isize {
-    let iov_bytes = match read_iovec_array(process, iov, iovcnt) {
-        Ok(iov_bytes) => iov_bytes,
+    let iov_entries = match read_iovec_entries(process, iov, iovcnt) {
+        Ok(iov_entries) => iov_entries,
         Err(err) => return neg_errno(err),
     };
     let mut total = 0isize;
-    for chunk in iov_bytes.chunks_exact(size_of::<general::iovec>()) {
-        let entry = unsafe { ptr::read_unaligned(chunk.as_ptr() as *const general::iovec) };
+    for entry in iov_entries {
         let len = entry.iov_len as usize;
         if len == 0 {
             continue;
@@ -1974,15 +1972,22 @@ fn sys_readv(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isi
     total
 }
 
-fn read_iovec_array(
+fn read_iovec_entries(
     process: &UserProcess,
     iov: usize,
     iovcnt: usize,
-) -> Result<Vec<u8>, LinuxError> {
+) -> Result<Vec<general::iovec>, LinuxError> {
     if iovcnt > IOV_MAX {
         return Err(LinuxError::EINVAL);
     }
-    read_user_bytes(process, iov, iovcnt * size_of::<general::iovec>())
+    let iov_bytes_len = iovcnt
+        .checked_mul(size_of::<general::iovec>())
+        .ok_or(LinuxError::EINVAL)?;
+    let iov_bytes = read_user_bytes(process, iov, iov_bytes_len)?;
+    Ok(iov_bytes
+        .chunks_exact(size_of::<general::iovec>())
+        .map(|chunk| unsafe { ptr::read_unaligned(chunk.as_ptr() as *const general::iovec) })
+        .collect())
 }
 
 fn sys_getcwd(process: &UserProcess, buf: usize, size: usize) -> isize {
