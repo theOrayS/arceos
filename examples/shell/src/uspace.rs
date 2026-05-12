@@ -36,6 +36,7 @@ mod linux_abi;
 mod memory_map;
 mod memory_policy;
 mod metadata;
+mod process_abi;
 mod program_loader;
 mod resource_sched;
 mod runtime_paths;
@@ -68,6 +69,7 @@ use metadata::{
     apply_recorded_path_metadata, canonical_permission_path, dirent_type, fd_entry_path,
     fd_entry_statfs_path, file_attr_to_stat, generic_statfs, normalize_file_mode, stdio_stat,
 };
+use process_abi::apply_personality_request;
 use program_loader::load_program_image;
 use resource_sched::{
     UserRlimit, UserSchedParam, default_rlimit, default_sched_param, is_same_sched_target,
@@ -3552,11 +3554,7 @@ fn sys_set_tid_address(_tf: &TrapFrame, _tidptr: usize) -> isize {
 }
 
 fn sys_personality(process: &UserProcess, persona: usize) -> isize {
-    let old = process.personality();
-    if persona != LINUX_PERSONALITY_QUERY {
-        process.set_personality(persona);
-    }
-    old as isize
+    apply_personality_request(process, persona) as isize
 }
 
 fn sys_set_robust_list(head: usize, len: usize) -> isize {
