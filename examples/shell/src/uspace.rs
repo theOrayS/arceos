@@ -18,7 +18,7 @@ use axmm::AddrSpace;
 use axns::AxNamespace;
 use axsync::Mutex;
 use axtask::{AxTaskRef, TaskInner, WaitQueue};
-use linux_raw_sys::{general, ioctl, system};
+use linux_raw_sys::{general, ioctl};
 use memory_addr::{PAGE_SIZE_4K, PageIter4K, VirtAddr};
 use std::collections::BTreeMap;
 use std::string::{String, ToString};
@@ -41,6 +41,7 @@ mod runtime_paths;
 mod select_fdset;
 mod signal_abi;
 mod synthetic_fs;
+mod system_info;
 mod sysv_shm;
 mod task_context;
 mod task_registry;
@@ -82,6 +83,7 @@ use synthetic_fs::{
     proc_self_maps_is_writable_open, proc_self_maps_path_entry, synthetic_file_is_writable_open,
     synthetic_userdb_content, synthetic_userdb_fd_entry, synthetic_userdb_path_entry,
 };
+use system_info::{SyslogAction, default_rusage, default_utsname, syslog_action};
 use task_context::{UserTaskExt, current_process, current_task_ext, current_tid, task_ext};
 use task_registry::{
     UserThreadEntry, register_user_task, unregister_user_task, user_thread_entry_by_process_pid,
@@ -3596,9 +3598,8 @@ fn sys_sched_getaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mas
 }
 
 fn sys_syslog(process: &UserProcess, log_type: i32, buf: usize, len: usize) -> isize {
-    match log_type {
-        // SYSLOG_ACTION_READ_ALL and READ_CLEAR. Expose an empty kernel log.
-        3 | 4 => {
+    match syslog_action(log_type) {
+        SyslogAction::EmptyRead => {
             if len > 0 && buf != 0 {
                 if let Err(err) = validate_user_write(process, buf, len) {
                     return neg_errno(err);
@@ -3609,11 +3610,8 @@ fn sys_syslog(process: &UserProcess, log_type: i32, buf: usize, len: usize) -> i
             }
             0
         }
-        // SYSLOG_ACTION_SIZE_BUFFER.
-        10 => 0,
-        // Console control operations are accepted as no-ops.
-        6..=8 => 0,
-        _ => neg_errno(LinuxError::EINVAL),
+        SyslogAction::SizeBuffer | SyslogAction::ConsoleControl => 0,
+        SyslogAction::Invalid => neg_errno(LinuxError::EINVAL),
     }
 }
 
@@ -3624,28 +3622,12 @@ fn sys_getrusage(process: &UserProcess, who: i32, usage: usize) -> isize {
             || x == general::RUSAGE_CHILDREN => {}
         _ => return neg_errno(LinuxError::EINVAL),
     }
-    let value: general::rusage = unsafe { core::mem::zeroed() };
+    let value = default_rusage();
     write_user_value(process, usage, &value)
 }
 
 fn sys_uname(process: &UserProcess, buf: usize) -> isize {
-    let mut uts = system::new_utsname {
-        sysname: [0; 65],
-        nodename: [0; 65],
-        release: [0; 65],
-        version: [0; 65],
-        machine: [0; 65],
-        domainname: [0; 65],
-    };
-    write_c_string(&mut uts.sysname, b"Linux");
-    write_c_string(&mut uts.nodename, b"arceos");
-    write_c_string(&mut uts.release, b"6.0.0");
-    write_c_string(&mut uts.version, b"ArceOS");
-    #[cfg(target_arch = "riscv64")]
-    write_c_string(&mut uts.machine, b"riscv64");
-    #[cfg(target_arch = "loongarch64")]
-    write_c_string(&mut uts.machine, b"loongarch64");
-    write_c_string(&mut uts.domainname, b"localdomain");
+    let uts = default_utsname();
     write_user_value(process, buf, &uts)
 }
 
@@ -4389,32 +4371,6 @@ fn read_execve_argv(
         argv.push(default_argv0.into());
     }
     Ok(argv)
-}
-
-trait CCharSlot: Copy {
-    fn from_byte(byte: u8) -> Self;
-}
-
-impl CCharSlot for u8 {
-    fn from_byte(byte: u8) -> Self {
-        byte
-    }
-}
-
-impl CCharSlot for i8 {
-    fn from_byte(byte: u8) -> Self {
-        byte as i8
-    }
-}
-
-fn write_c_string<T: CCharSlot>(dst: &mut [T], src: &[u8]) {
-    let len = cmp::min(dst.len().saturating_sub(1), src.len());
-    for (idx, byte) in src[..len].iter().enumerate() {
-        dst[idx] = T::from_byte(*byte);
-    }
-    if !dst.is_empty() {
-        dst[len] = T::from_byte(0);
-    }
 }
 
 fn mmap_prot_to_flags(prot: u32) -> MappingFlags {
