@@ -2,6 +2,7 @@ use alloc::{sync::Arc, vec, vec::Vec};
 use core::ffi::{c_char, c_int, c_void};
 use core::mem::size_of;
 use core::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use core::ptr::NonNull;
 use core::time::Duration;
 
 use axerrno::{LinuxError, LinuxResult};
@@ -16,6 +17,36 @@ use crate::utils::char_ptr_to_str;
 const SHUT_RD: c_int = 0;
 const SHUT_WR: c_int = 1;
 const SHUT_RDWR: c_int = 2;
+
+unsafe fn readable_socket_buffer<'a>(
+    buf: *const c_void,
+    len: ctypes::size_t,
+) -> LinuxResult<&'a [u8]> {
+    let ptr = if len == 0 {
+        NonNull::<u8>::dangling().as_ptr()
+    } else {
+        if buf.is_null() {
+            return Err(LinuxError::EFAULT);
+        }
+        buf as *const u8
+    };
+    Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+}
+
+unsafe fn writable_socket_buffer<'a>(
+    buf: *mut c_void,
+    len: ctypes::size_t,
+) -> LinuxResult<&'a mut [u8]> {
+    let ptr = if len == 0 {
+        NonNull::<u8>::dangling().as_ptr()
+    } else {
+        if buf.is_null() {
+            return Err(LinuxError::EFAULT);
+        }
+        buf as *mut u8
+    };
+    Ok(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
+}
 
 pub enum Socket {
     Udp(Mutex<UdpSocket>),
@@ -385,8 +416,9 @@ pub fn sys_connect(
 ///
 /// # Safety
 ///
-/// `buf_ptr` must point to a readable buffer of `len` bytes. If `socket_addr`
-/// is non-null, it must point to a valid socket address of `addrlen` bytes.
+/// `buf_ptr` must either be null with `len == 0`, or point to a readable
+/// buffer of `len` bytes. If `socket_addr` is non-null, it must point to a
+/// valid socket address of `addrlen` bytes.
 pub unsafe fn sys_sendto(
     socket_fd: c_int,
     buf_ptr: *const c_void,
@@ -400,11 +432,8 @@ pub unsafe fn sys_sendto(
         socket_fd, buf_ptr as usize, len, flag, socket_addr as usize, addrlen
     );
     syscall_body!(sys_sendto, {
-        if buf_ptr.is_null() {
-            return Err(LinuxError::EFAULT);
-        }
+        let buf = unsafe { readable_socket_buffer(buf_ptr, len)? };
         let addr = from_sockaddr(socket_addr, addrlen)?;
-        let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
         Socket::from_fd(socket_fd)?.sendto(buf, addr)
     })
 }
@@ -415,7 +444,8 @@ pub unsafe fn sys_sendto(
 ///
 /// # Safety
 ///
-/// `buf_ptr` must point to a readable buffer of `len` bytes.
+/// `buf_ptr` must either be null with `len == 0`, or point to a readable
+/// buffer of `len` bytes.
 pub unsafe fn sys_send(
     socket_fd: c_int,
     buf_ptr: *const c_void,
@@ -427,10 +457,7 @@ pub unsafe fn sys_send(
         socket_fd, buf_ptr as usize, len, flag
     );
     syscall_body!(sys_send, {
-        if buf_ptr.is_null() {
-            return Err(LinuxError::EFAULT);
-        }
-        let buf = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
+        let buf = unsafe { readable_socket_buffer(buf_ptr, len)? };
         Socket::from_fd(socket_fd)?.send(buf)
     })
 }
@@ -441,8 +468,9 @@ pub unsafe fn sys_send(
 ///
 /// # Safety
 ///
-/// `buf_ptr` must point to a writable buffer of `len` bytes. `socket_addr` and
-/// `addrlen` must point to writable storage for the returned peer address.
+/// `buf_ptr` must either be null with `len == 0`, or point to a writable buffer
+/// of `len` bytes. `socket_addr` and `addrlen` must point to writable storage
+/// for the returned peer address.
 pub unsafe fn sys_recvfrom(
     socket_fd: c_int,
     buf_ptr: *mut c_void,
@@ -456,11 +484,11 @@ pub unsafe fn sys_recvfrom(
         socket_fd, buf_ptr as usize, len, flag, socket_addr as usize, addrlen as usize
     );
     syscall_body!(sys_recvfrom, {
-        if buf_ptr.is_null() || socket_addr.is_null() || addrlen.is_null() {
+        if socket_addr.is_null() || addrlen.is_null() {
             return Err(LinuxError::EFAULT);
         }
         let socket = Socket::from_fd(socket_fd)?;
-        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
+        let buf = unsafe { writable_socket_buffer(buf_ptr, len)? };
 
         let res = socket.recvfrom(buf)?;
         if let Some(addr) = res.1 {
@@ -478,7 +506,8 @@ pub unsafe fn sys_recvfrom(
 ///
 /// # Safety
 ///
-/// `buf_ptr` must point to a writable buffer of `len` bytes.
+/// `buf_ptr` must either be null with `len == 0`, or point to a writable buffer
+/// of `len` bytes.
 pub unsafe fn sys_recv(
     socket_fd: c_int,
     buf_ptr: *mut c_void,
@@ -490,10 +519,7 @@ pub unsafe fn sys_recv(
         socket_fd, buf_ptr as usize, len, flag
     );
     syscall_body!(sys_recv, {
-        if buf_ptr.is_null() {
-            return Err(LinuxError::EFAULT);
-        }
-        let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len) };
+        let buf = unsafe { writable_socket_buffer(buf_ptr, len)? };
         Socket::from_fd(socket_fd)?.recv(buf)
     })
 }
