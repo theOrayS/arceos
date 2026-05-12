@@ -8,8 +8,8 @@ use lazyinit::LazyInit;
 use memory_addr::PAGE_SIZE_4K;
 use std::collections::BTreeMap;
 
-use super::align_up;
 use super::linux_abi::{SYSV_IPC_CREAT, SYSV_IPC_EXCL, SYSV_IPC_PRIVATE, SYSV_SHM_MAX_SIZE};
+use super::memory_map::align_up;
 
 #[derive(Clone)]
 struct SysvShmSegment {

@@ -9,7 +9,6 @@ use axerrno::LinuxError;
 use axfs::fops::{self, Directory, File, FileType, OpenOptions};
 use axhal::context::{TrapFrame, UspaceContext};
 use axhal::mem::virt_to_phys;
-use axhal::paging::MappingFlags;
 use axhal::trap::{
     PAGE_FAULT, PageFaultFlags, SYSCALL, register_trap_handler, register_user_return_handler,
 };
@@ -34,6 +33,7 @@ mod fd_socket;
 mod fd_table;
 mod futex;
 mod linux_abi;
+mod memory_map;
 mod memory_policy;
 mod metadata;
 mod program_loader;
@@ -60,6 +60,7 @@ use fd_socket::{
 };
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
 use linux_abi::*;
+use memory_map::{align_down, align_up, mmap_prot_to_flags, user_mapping_flags};
 use memory_policy::{validate_mempolicy_nodemask, write_default_mempolicy};
 use metadata::{
     apply_recorded_path_metadata, canonical_permission_path, fd_entry_path, fd_entry_statfs_path,
@@ -4263,46 +4264,6 @@ fn read_execve_argv(
         argv.push(default_argv0.into());
     }
     Ok(argv)
-}
-
-fn mmap_prot_to_flags(prot: u32) -> MappingFlags {
-    let mut flags = MappingFlags::USER;
-    if prot & general::PROT_READ != 0 {
-        flags |= MappingFlags::READ;
-    }
-    if prot & general::PROT_WRITE != 0 {
-        flags |= MappingFlags::READ | MappingFlags::WRITE;
-    }
-    if prot & general::PROT_EXEC != 0 {
-        flags |= MappingFlags::READ | MappingFlags::EXECUTE;
-    }
-    flags
-}
-
-fn user_mapping_flags(read: bool, write: bool, exec: bool) -> MappingFlags {
-    let mut flags = MappingFlags::USER;
-    if read {
-        flags |= MappingFlags::READ;
-    }
-    if write {
-        flags |= MappingFlags::WRITE;
-    }
-    if exec {
-        flags |= MappingFlags::EXECUTE;
-    }
-    flags
-}
-
-fn align_down(value: usize, align: usize) -> usize {
-    value & !(align - 1)
-}
-
-fn align_up(value: usize, align: usize) -> usize {
-    if value == 0 {
-        0
-    } else {
-        align_down(value + align - 1, align)
-    }
 }
 
 fn neg_errno(err: LinuxError) -> isize {

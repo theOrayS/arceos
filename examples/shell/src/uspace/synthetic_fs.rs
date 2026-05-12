@@ -5,13 +5,14 @@ use std::string::String;
 use std::sync::Arc;
 use std::vec::Vec;
 
+use super::UserProcess;
 use super::fd_table::{FdEntry, MemoryFileEntry, PathEntry};
 use super::linux_abi::{
     DEFAULT_GROUP_CONTENT, DEFAULT_PASSWD_CONTENT, ETC_GROUP_PATH, ETC_PASSWD_PATH,
     PROC_SELF_MAPS_PATH, USER_ASPACE_BASE, USER_STACK_SIZE, USER_STACK_TOP,
 };
+use super::memory_map::{align_down, align_up};
 use super::runtime_paths::normalize_path;
-use super::{UserProcess, align_down, align_up};
 
 fn proc_self_maps_content(process: &UserProcess) -> Vec<u8> {
     let exec_path = process.exec_path();
