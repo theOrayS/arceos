@@ -71,7 +71,8 @@ use metadata::{
 use program_loader::load_program_image;
 use resource_sched::{
     UserRlimit, UserSchedParam, default_rlimit, default_sched_param, is_same_sched_target,
-    rlimit_is_valid, sched_param_accepts_policy, sched_param_accepts_setparam,
+    prlimit_target_valid, rlimit_is_valid, sched_param_accepts_policy,
+    sched_param_accepts_setparam,
 };
 use runtime_paths::{
     busybox_applet_target_path, current_cwd, normalize_path, push_runtime_candidate,
@@ -3911,7 +3912,7 @@ fn sys_prlimit64(
     new_limit: usize,
     old_limit: usize,
 ) -> isize {
-    if pid != 0 && pid != current_tid() {
+    if !prlimit_target_valid(pid) {
         return neg_errno(LinuxError::ESRCH);
     }
 

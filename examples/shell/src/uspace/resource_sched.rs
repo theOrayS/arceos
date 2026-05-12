@@ -39,6 +39,10 @@ pub(super) fn rlimit_is_valid(limit: UserRlimit) -> bool {
     limit.rlim_cur <= limit.rlim_max
 }
 
+pub(super) fn prlimit_target_valid(pid: i32) -> bool {
+    pid == 0 || pid == current_tid()
+}
+
 pub(super) fn default_sched_param() -> UserSchedParam {
     UserSchedParam { sched_priority: 0 }
 }
