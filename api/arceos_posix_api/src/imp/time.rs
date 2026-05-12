@@ -1,4 +1,4 @@
-use axerrno::LinuxError;
+use axerrno::{LinuxError, LinuxResult};
 use core::ffi::{c_int, c_long};
 use core::time::Duration;
 
@@ -35,6 +35,28 @@ impl From<Duration> for ctypes::timeval {
     }
 }
 
+unsafe fn read_nanosleep_request(req: *const ctypes::timespec) -> LinuxResult<ctypes::timespec> {
+    if req.is_null() {
+        return Err(LinuxError::EINVAL);
+    }
+
+    let req = unsafe { core::ptr::read_unaligned(req) };
+    if req.tv_nsec < 0 || req.tv_nsec > 999_999_999 {
+        return Err(LinuxError::EINVAL);
+    }
+    Ok(req)
+}
+
+unsafe fn write_timespec(dst: *mut ctypes::timespec, value: ctypes::timespec) {
+    unsafe { core::ptr::write_unaligned(dst, value) };
+}
+
+unsafe fn write_optional_timespec(dst: *mut ctypes::timespec, value: ctypes::timespec) {
+    if !dst.is_null() {
+        unsafe { write_timespec(dst, value) };
+    }
+}
+
 /// Get clock time since booting
 ///
 /// # Safety
@@ -53,7 +75,7 @@ pub unsafe fn sys_clock_gettime(clk: ctypes::clockid_t, ts: *mut ctypes::timespe
                 return Err(LinuxError::EINVAL);
             }
         };
-        unsafe { *ts = now };
+        unsafe { write_timespec(ts, now) };
         debug!("sys_clock_gettime: {}.{:09}s", now.tv_sec, now.tv_nsec);
         Ok(0)
     })
@@ -69,15 +91,11 @@ pub unsafe fn sys_clock_gettime(clk: ctypes::clockid_t, ts: *mut ctypes::timespe
 /// `timespec` value when non-null.
 pub unsafe fn sys_nanosleep(req: *const ctypes::timespec, rem: *mut ctypes::timespec) -> c_int {
     syscall_body!(sys_nanosleep, {
-        unsafe {
-            if req.is_null() || (*req).tv_nsec < 0 || (*req).tv_nsec > 999999999 {
-                return Err(LinuxError::EINVAL);
-            }
-        }
+        let req = unsafe { read_nanosleep_request(req)? };
 
-        let dur = unsafe {
-            debug!("sys_nanosleep <= {}.{:09}s", (*req).tv_sec, (*req).tv_nsec);
-            Duration::from(*req)
+        let dur = {
+            debug!("sys_nanosleep <= {}.{:09}s", req.tv_sec, req.tv_nsec);
+            Duration::from(req)
         };
 
         let now = axhal::time::monotonic_time();
@@ -91,9 +109,7 @@ pub unsafe fn sys_nanosleep(req: *const ctypes::timespec, rem: *mut ctypes::time
         let actual = after - now;
 
         if let Some(diff) = dur.checked_sub(actual) {
-            if !rem.is_null() {
-                unsafe { (*rem) = diff.into() };
-            }
+            unsafe { write_optional_timespec(rem, diff.into()) };
             return Err(LinuxError::EINTR);
         }
         Ok(0)
