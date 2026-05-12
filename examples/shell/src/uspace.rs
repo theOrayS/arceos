@@ -2867,13 +2867,17 @@ fn sys_fstatfs(process: &UserProcess, fd: usize, statfsbuf: usize) -> isize {
 }
 
 fn sys_getdents64(process: &UserProcess, fd: usize, dirp: usize, count: usize) -> isize {
-    let Some(dst) = user_bytes_mut(process, dirp, count, true) else {
-        return neg_errno(LinuxError::EFAULT);
-    };
-    match process.fds.lock().getdents64(fd as i32, dst) {
-        Ok(n) => n as isize,
-        Err(err) => neg_errno(err),
+    if let Err(err) = validate_user_write(process, dirp, count) {
+        return neg_errno(err);
     }
+    let bytes = match process.fds.lock().getdents64(fd as i32, count) {
+        Ok(bytes) => bytes,
+        Err(err) => return neg_errno(err),
+    };
+    if let Err(err) = write_user_bytes(process, dirp, &bytes) {
+        return neg_errno(err);
+    }
+    bytes.len() as isize
 }
 
 fn sys_lseek(process: &UserProcess, fd: usize, offset: usize, whence: usize) -> isize {
@@ -5780,7 +5784,7 @@ impl FdTable {
         Ok(newfd as i32)
     }
 
-    fn getdents64(&mut self, fd: i32, dst: &mut [u8]) -> Result<usize, LinuxError> {
+    fn getdents64(&mut self, fd: i32, max_len: usize) -> Result<Vec<u8>, LinuxError> {
         let entry = self.entry_mut(fd)?;
         let FdEntry::Directory(dir) = entry else {
             return Err(LinuxError::ENOTDIR);
@@ -5788,18 +5792,20 @@ impl FdTable {
         let mut read_buf: [fops::DirEntry; 16] =
             core::array::from_fn(|_| fops::DirEntry::default());
         let count = dir.dir.read_dir(&mut read_buf).map_err(LinuxError::from)?;
-        let mut written = 0usize;
+        let mut out = Vec::new();
         for (idx, item) in read_buf[..count].iter().enumerate() {
             let name = item.name_as_bytes();
             let reclen = align_up(
                 offset_of!(general::linux_dirent64, d_name) + name.len() + 1,
                 8,
             );
-            if written + reclen > dst.len() {
+            if out.len() + reclen > max_len {
                 break;
             }
+            let start = out.len();
+            out.resize(start + reclen, 0);
             unsafe {
-                let dirent = dst.as_mut_ptr().add(written) as *mut general::linux_dirent64;
+                let dirent = out[start..].as_mut_ptr() as *mut general::linux_dirent64;
                 ptr::write_unaligned(
                     dirent,
                     general::linux_dirent64 {
@@ -5810,15 +5816,11 @@ impl FdTable {
                         d_name: Default::default(),
                     },
                 );
-                let name_ptr = dst
-                    .as_mut_ptr()
-                    .add(written + offset_of!(general::linux_dirent64, d_name));
-                ptr::copy_nonoverlapping(name.as_ptr(), name_ptr, name.len());
-                *name_ptr.add(name.len()) = 0;
             }
-            written += reclen;
+            let name_start = start + offset_of!(general::linux_dirent64, d_name);
+            out[name_start..name_start + name.len()].copy_from_slice(name);
         }
-        Ok(written)
+        Ok(out)
     }
 
     fn read_file_at(&mut self, fd: i32, offset: u64, len: usize) -> Result<Vec<u8>, LinuxError> {
