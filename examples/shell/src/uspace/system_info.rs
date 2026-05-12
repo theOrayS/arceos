@@ -1,6 +1,10 @@
 use core::cmp;
 
+use axerrno::LinuxError;
 use linux_raw_sys::{general, system};
+
+use super::user_memory::write_user_value;
+use super::{UserProcess, neg_errno};
 
 pub(super) enum SyslogAction {
     EmptyRead,
@@ -29,14 +33,22 @@ pub(super) fn syslog_empty_read_bytes(buf: usize, len: usize) -> Option<&'static
     }
 }
 
-pub(super) fn default_rusage() -> general::rusage {
+fn default_rusage() -> general::rusage {
     unsafe { core::mem::zeroed() }
 }
 
-pub(super) fn rusage_target_valid(who: i32) -> bool {
+fn rusage_target_valid(who: i32) -> bool {
     who == general::RUSAGE_SELF as i32
         || who == general::RUSAGE_THREAD as i32
         || who == general::RUSAGE_CHILDREN
+}
+
+pub(super) fn write_default_rusage(process: &UserProcess, who: i32, usage: usize) -> isize {
+    if !rusage_target_valid(who) {
+        return neg_errno(LinuxError::EINVAL);
+    }
+    let value = default_rusage();
+    write_user_value(process, usage, &value)
 }
 
 pub(super) fn default_winsize() -> general::winsize {

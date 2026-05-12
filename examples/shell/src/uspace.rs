@@ -94,8 +94,8 @@ use synthetic_fs::{
     synthetic_userdb_path_entry,
 };
 use system_info::{
-    SyslogAction, default_rusage, default_utsname, default_winsize, rusage_target_valid,
-    syslog_action, syslog_empty_read_bytes,
+    SyslogAction, default_utsname, default_winsize, syslog_action, syslog_empty_read_bytes,
+    write_default_rusage,
 };
 use task_context::{
     UserTaskExt, current_process, current_task_ext, current_tid, robust_list_for_task,
@@ -3231,11 +3231,7 @@ fn sys_syslog(process: &UserProcess, log_type: i32, buf: usize, len: usize) -> i
 }
 
 fn sys_getrusage(process: &UserProcess, who: i32, usage: usize) -> isize {
-    if !rusage_target_valid(who) {
-        return neg_errno(LinuxError::EINVAL);
-    }
-    let value = default_rusage();
-    write_user_value(process, usage, &value)
+    write_default_rusage(process, who, usage)
 }
 
 fn sys_uname(process: &UserProcess, buf: usize) -> isize {
