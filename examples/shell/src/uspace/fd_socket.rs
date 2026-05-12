@@ -233,6 +233,34 @@ pub(super) fn is_local_socket_fd(process: &UserProcess, fd: usize) -> Result<boo
     Ok(matches!(table.entry(fd as i32)?, FdEntry::LocalSocket(_)))
 }
 
+pub(super) fn socket_addr_call<F>(
+    process: &UserProcess,
+    fd: usize,
+    addr: usize,
+    addrlen: usize,
+    call: F,
+) -> isize
+where
+    F: FnOnce(i32, *const posix_ctypes::sockaddr, posix_ctypes::socklen_t) -> i32,
+{
+    let socket = match socket_entry(process, fd) {
+        Ok(socket) => socket,
+        Err(err) => return neg_errno(err),
+    };
+    let addr_bytes = match read_socket_addr_from_user(process, addr, addrlen) {
+        Ok(bytes) => bytes,
+        Err(err) => return neg_errno(err),
+    };
+    match posix_ret_i32(call(
+        socket.posix_fd,
+        addr_bytes.as_ptr() as *const posix_ctypes::sockaddr,
+        addrlen as posix_ctypes::socklen_t,
+    )) {
+        Ok(_) => 0,
+        Err(err) => neg_errno(err),
+    }
+}
+
 pub(super) fn read_socket_data_from_user(
     process: &UserProcess,
     ptr: usize,

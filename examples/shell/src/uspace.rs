@@ -57,7 +57,7 @@ use fd_pipe::PipeEndpoint;
 use fd_socket::{
     insert_local_socket_entry, insert_socket_entry, is_local_socket_fd, read_socket_addr_from_user,
     read_socket_data_from_user, recv_socket_data_to_user, recv_socket_data_to_user_with_addr,
-    socket_entry, socket_option_supported, write_socket_addr_to_user,
+    socket_addr_call, socket_entry, socket_option_supported, write_socket_addr_to_user,
 };
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
 use linux_abi::*;
@@ -2502,31 +2502,6 @@ fn sys_socket_bridge(
     };
     let ret = insert_socket_entry(process, posix_fd, base_socktype, flags);
     ret
-}
-
-fn socket_addr_call<F>(
-    process: &UserProcess,
-    fd: usize,
-    addr: usize,
-    addrlen: usize,
-    call: F,
-) -> isize
-where
-    F: FnOnce(i32, *const posix_ctypes::sockaddr, posix_ctypes::socklen_t) -> i32,
-{
-    let socket = socket_entry_or_return!(process, fd);
-    let addr_bytes = match read_socket_addr_from_user(process, addr, addrlen) {
-        Ok(bytes) => bytes,
-        Err(err) => return neg_errno(err),
-    };
-    match posix_ret_i32(call(
-        socket.posix_fd,
-        addr_bytes.as_ptr() as *const posix_ctypes::sockaddr,
-        addrlen as posix_ctypes::socklen_t,
-    )) {
-        Ok(_) => 0,
-        Err(err) => neg_errno(err),
-    }
 }
 
 fn sys_bind_bridge(process: &UserProcess, fd: usize, addr: usize, addrlen: usize) -> isize {
