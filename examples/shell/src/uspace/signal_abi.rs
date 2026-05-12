@@ -4,8 +4,17 @@ use core::mem::{offset_of, size_of};
 #[cfg(target_arch = "riscv64")]
 use axhal::context::TrapFrame;
 
+use axerrno::LinuxError;
+
 #[cfg(target_arch = "riscv64")]
 use super::linux_abi::{RISCV_SIGNAL_FPSTATE_BYTES, RISCV_SIGNAL_SIGSET_RESERVED_BYTES};
+
+pub(super) fn validate_signal_target(sig: i32) -> Result<(), LinuxError> {
+    if sig < 0 || sig > 64 {
+        return Err(LinuxError::EINVAL);
+    }
+    Ok(())
+}
 
 #[cfg(target_arch = "riscv64")]
 #[repr(C)]

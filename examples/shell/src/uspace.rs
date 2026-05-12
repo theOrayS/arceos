@@ -79,6 +79,7 @@ use runtime_paths::{
     resolve_host_path, runtime_absolute_path_candidates, runtime_library_name_candidates,
 };
 use select_fdset::{SelectMode, poll_fd_set, read_fd_set, read_pselect_deadline, write_fd_set};
+use signal_abi::validate_signal_target;
 #[cfg(target_arch = "riscv64")]
 use signal_abi::{
     RiscvSignalFrame, apply_riscv_sigcontext, make_riscv_signal_frame, riscv_signal_frame_offsets,
@@ -3817,13 +3818,6 @@ fn sys_rt_sigtimedwait(
         }
     }
     SIGCHLD_NUM
-}
-
-fn validate_signal_target(sig: i32) -> Result<(), LinuxError> {
-    if sig < 0 || sig > 64 {
-        return Err(LinuxError::EINVAL);
-    }
-    Ok(())
 }
 
 fn sys_kill(process: &UserProcess, pid: i32, sig: i32) -> isize {
