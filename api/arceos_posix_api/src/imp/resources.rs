@@ -2,6 +2,25 @@ use crate::ctypes;
 use axerrno::LinuxError;
 use core::ffi::c_int;
 
+fn current_rlimit(resource: u32) -> Option<ctypes::rlimit> {
+    match resource {
+        ctypes::RLIMIT_STACK => Some(ctypes::rlimit {
+            rlim_cur: axconfig::TASK_STACK_SIZE as _,
+            rlim_max: axconfig::TASK_STACK_SIZE as _,
+        }),
+        #[cfg(feature = "fd")]
+        ctypes::RLIMIT_NOFILE => Some(ctypes::rlimit {
+            rlim_cur: super::fd_ops::AX_FILE_LIMIT as _,
+            rlim_max: super::fd_ops::AX_FILE_LIMIT as _,
+        }),
+        _ => None,
+    }
+}
+
+unsafe fn write_rlimit_output(rlimits: *mut ctypes::rlimit, value: ctypes::rlimit) {
+    unsafe { core::ptr::write_unaligned(rlimits, value) }
+}
+
 /// Get resource limitations
 ///
 /// TODO: support more resource types
@@ -21,17 +40,8 @@ pub unsafe fn sys_getrlimit(resource: c_int, rlimits: *mut ctypes::rlimit) -> c_
         if rlimits.is_null() {
             return Ok(0);
         }
-        match resource as u32 {
-            ctypes::RLIMIT_STACK => unsafe {
-                (*rlimits).rlim_cur = axconfig::TASK_STACK_SIZE as _;
-                (*rlimits).rlim_max = axconfig::TASK_STACK_SIZE as _;
-            },
-            #[cfg(feature = "fd")]
-            ctypes::RLIMIT_NOFILE => unsafe {
-                (*rlimits).rlim_cur = super::fd_ops::AX_FILE_LIMIT as _;
-                (*rlimits).rlim_max = super::fd_ops::AX_FILE_LIMIT as _;
-            },
-            _ => {}
+        if let Some(limit) = current_rlimit(resource as u32) {
+            unsafe { write_rlimit_output(rlimits, limit) };
         }
         Ok(0)
     })
