@@ -3,6 +3,7 @@ use linux_raw_sys::general;
 use super::linux_abi::{
     DEFAULT_NOFILE_LIMIT, RLIMIT_NOFILE_RESOURCE, RLIMIT_STACK_RESOURCE, USER_STACK_SIZE,
 };
+use super::{UserProcess, task_context::current_tid};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -53,4 +54,8 @@ pub(super) fn sched_param_accepts_policy(policy: i32, param: UserSchedParam) -> 
         general::SCHED_BATCH | general::SCHED_IDLE if param.sched_priority == 0 => true,
         _ => false,
     }
+}
+
+pub(super) fn is_same_sched_target(process: &UserProcess, pid: i32) -> bool {
+    pid == 0 || pid == current_tid() || pid == process.pid()
 }

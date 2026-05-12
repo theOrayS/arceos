@@ -70,8 +70,8 @@ use metadata::{
 };
 use program_loader::load_program_image;
 use resource_sched::{
-    UserRlimit, UserSchedParam, default_rlimit, default_sched_param, rlimit_is_valid,
-    sched_param_accepts_policy, sched_param_accepts_setparam,
+    UserRlimit, UserSchedParam, default_rlimit, default_sched_param, is_same_sched_target,
+    rlimit_is_valid, sched_param_accepts_policy, sched_param_accepts_setparam,
 };
 use runtime_paths::{
     busybox_applet_target_path, current_cwd, normalize_path, push_runtime_candidate,
@@ -3171,10 +3171,6 @@ fn sys_times(process: &UserProcess, buf: usize) -> isize {
     let tms = default_tms();
     return_on_user_write_error!(process, buf, &tms);
     axhal::time::monotonic_time().as_millis() as isize
-}
-
-fn is_same_sched_target(process: &UserProcess, pid: i32) -> bool {
-    pid == 0 || pid == current_tid() || pid == process.pid()
 }
 
 fn sys_sched_setparam(process: &UserProcess, pid: i32, param: usize) -> isize {
