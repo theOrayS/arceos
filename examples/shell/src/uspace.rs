@@ -51,7 +51,10 @@ use credentials::{
     set_res_ids, set_single_id, write_group_list, write_id_triplet,
 };
 use fd_pipe::PipeEndpoint;
-use fd_socket::{LocalSocketEntry, SocketEntry};
+use fd_socket::{
+    LocalSocketEntry, SocketEntry, read_socket_addr_from_user, read_socket_data_from_user,
+    recv_socket_data_to_user, recv_socket_data_to_user_with_addr, write_socket_addr_to_user,
+};
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
 use linux_abi::*;
 use metadata::{
@@ -4370,139 +4373,6 @@ fn sys_exit_group(process: &UserProcess, _tf: &TrapFrame, code: i32) -> ! {
     );
     process.request_exit_group(code);
     terminate_current_thread(process, code)
-}
-
-fn read_socket_data_from_user(
-    process: &UserProcess,
-    ptr: usize,
-    len: usize,
-) -> Result<Vec<u8>, LinuxError> {
-    if ptr == 0 {
-        return Err(LinuxError::EFAULT);
-    }
-    read_user_bytes(process, ptr, len)
-}
-
-fn read_socket_addr_from_user(
-    process: &UserProcess,
-    ptr: usize,
-    len: usize,
-) -> Result<Vec<u8>, LinuxError> {
-    validate_user_read(process, ptr, len)?;
-    if ptr == 0 {
-        return Err(LinuxError::EFAULT);
-    }
-    if len != size_of::<posix_ctypes::sockaddr>() {
-        return Err(LinuxError::EINVAL);
-    }
-    read_user_bytes(process, ptr, len)
-}
-
-fn sockaddr_bytes(addr: &posix_ctypes::sockaddr) -> [u8; size_of::<posix_ctypes::sockaddr>()] {
-    let mut bytes = [0u8; size_of::<posix_ctypes::sockaddr>()];
-    let family_len = size_of::<posix_ctypes::sa_family_t>();
-    bytes[..family_len].copy_from_slice(&addr.sa_family.to_ne_bytes());
-    for (dst, src) in bytes[family_len..]
-        .iter_mut()
-        .zip(addr.sa_data.iter().copied())
-    {
-        *dst = src as u8;
-    }
-    bytes
-}
-
-fn write_socket_addr_to_user(
-    process: &UserProcess,
-    addr: usize,
-    addrlen: usize,
-    user_len: usize,
-    local_addr: &posix_ctypes::sockaddr,
-    local_len: posix_ctypes::socklen_t,
-) -> isize {
-    let copy_len = core::cmp::min(user_len, size_of::<posix_ctypes::sockaddr>());
-    if copy_len > 0 {
-        let local_addr_bytes = sockaddr_bytes(local_addr);
-        if let Err(err) = write_user_bytes(process, addr, &local_addr_bytes[..copy_len]) {
-            return neg_errno(err);
-        }
-    }
-    write_user_value(process, addrlen, &local_len)
-}
-
-fn recv_socket_data_to_user(
-    process: &UserProcess,
-    posix_fd: i32,
-    buf: usize,
-    len: usize,
-    flags: i32,
-) -> isize {
-    recv_socket_data_to_user_inner(process, posix_fd, buf, len, |dst| unsafe {
-        arceos_posix_api::sys_recv(posix_fd, dst, len, flags)
-    })
-}
-
-fn recv_socket_data_to_user_with_addr(
-    process: &UserProcess,
-    posix_fd: i32,
-    buf: usize,
-    len: usize,
-    flags: i32,
-    addr: usize,
-    addrlen: usize,
-    user_addr_len: usize,
-) -> isize {
-    let mut local_addr: posix_ctypes::sockaddr = unsafe { core::mem::zeroed() };
-    let mut local_len = 0 as posix_ctypes::socklen_t;
-    let ret = recv_socket_data_to_user_inner(process, posix_fd, buf, len, |dst| unsafe {
-        arceos_posix_api::sys_recvfrom(posix_fd, dst, len, flags, &mut local_addr, &mut local_len)
-    });
-    if ret > 0 && local_len != 0 {
-        let addr_ret = write_socket_addr_to_user(
-            process,
-            addr,
-            addrlen,
-            user_addr_len,
-            &local_addr,
-            local_len,
-        );
-        if addr_ret < 0 {
-            return addr_ret;
-        }
-    }
-    ret
-}
-
-fn recv_socket_data_to_user_inner(
-    process: &UserProcess,
-    posix_fd: i32,
-    buf: usize,
-    len: usize,
-    mut recv_once: impl FnMut(*mut c_void) -> isize,
-) -> isize {
-    if buf == 0 {
-        return neg_errno(LinuxError::EFAULT);
-    }
-    if let Err(err) = validate_user_write(process, buf, len) {
-        return neg_errno(err);
-    }
-    let mut bytes = match user_io_buffer(len) {
-        Ok(bytes) => bytes,
-        Err(err) => return neg_errno(err),
-    };
-    let ret = recv_with_real_timer_interrupt(process, posix_fd, || {
-        recv_once(bytes.as_mut_ptr() as *mut c_void)
-    });
-    if ret <= 0 {
-        return ret;
-    }
-    let received = ret as usize;
-    if received > len {
-        return neg_errno(LinuxError::EINVAL);
-    }
-    match write_user_bytes(process, buf, &bytes[..received]) {
-        Ok(()) => ret,
-        Err(err) => neg_errno(err),
-    }
 }
 
 fn read_execve_argv(
