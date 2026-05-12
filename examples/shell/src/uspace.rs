@@ -20,7 +20,6 @@ use axmm::AddrSpace;
 use axns::AxNamespace;
 use axsync::Mutex;
 use axtask::{AxTaskRef, TaskInner, WaitQueue};
-use lazyinit::LazyInit;
 use linux_raw_sys::{general, ioctl, system};
 use memory_addr::{PAGE_SIZE_4K, PageIter4K, VirtAddr};
 use std::collections::BTreeMap;
@@ -42,6 +41,7 @@ mod runtime_paths;
 mod signal_abi;
 mod synthetic_fs;
 mod sysv_shm;
+mod task_registry;
 mod user_memory;
 
 use fd_pipe::PipeEndpoint;
@@ -65,6 +65,10 @@ use synthetic_fs::{
     dev_shm_host_path, ensure_dev_shm_dir, is_proc_self_maps_path, proc_self_maps_fd_entry,
     proc_self_maps_is_writable_open, proc_self_maps_path_entry, synthetic_file_is_writable_open,
     synthetic_userdb_content, synthetic_userdb_fd_entry, synthetic_userdb_path_entry,
+};
+use task_registry::{
+    UserThreadEntry, register_user_task, unregister_user_task, user_thread_entry_by_process_pid,
+    user_thread_entry_by_tid, user_thread_entry_for_process,
 };
 use user_memory::{
     clear_user_bytes, read_cstr, read_user_bytes, read_user_value, validate_user_read,
@@ -203,12 +207,6 @@ struct BrkState {
 
 struct ChildTask {
     pid: i32,
-    task: AxTaskRef,
-    process: Arc<UserProcess>,
-}
-
-#[derive(Clone)]
-struct UserThreadEntry {
     task: AxTaskRef,
     process: Arc<UserProcess>,
 }
@@ -919,53 +917,6 @@ fn task_ext(task: &AxTaskRef) -> Option<&UserTaskExt> {
         return None;
     }
     Some(unsafe { &*(ptr as *const UserTaskExt) })
-}
-
-fn user_thread_table() -> &'static Mutex<BTreeMap<i32, UserThreadEntry>> {
-    static USER_THREADS: LazyInit<Mutex<BTreeMap<i32, UserThreadEntry>>> = LazyInit::new();
-    if !USER_THREADS.is_inited() {
-        USER_THREADS.init_once(Mutex::new(BTreeMap::new()));
-    }
-    &USER_THREADS
-}
-
-fn register_user_task(task: AxTaskRef, process: Arc<UserProcess>) {
-    let tid = task.id().as_u64() as i32;
-    user_thread_table()
-        .lock()
-        .insert(tid, UserThreadEntry { task, process });
-}
-
-fn unregister_user_task(tid: i32) {
-    user_thread_table().lock().remove(&tid);
-}
-
-fn user_thread_entry_by_tid(tid: i32) -> Option<UserThreadEntry> {
-    user_thread_table().lock().get(&tid).cloned()
-}
-
-fn user_thread_entry_by_process_pid(pid: i32) -> Option<UserThreadEntry> {
-    let table = user_thread_table().lock();
-    table.get(&pid).cloned().or_else(|| {
-        table
-            .values()
-            .find(|entry| {
-                entry.process.pid() == pid
-                    && entry.process.live_threads.load(Ordering::Acquire) != 0
-            })
-            .cloned()
-    })
-}
-
-fn user_thread_entry_for_process(process: &UserProcess) -> Option<UserThreadEntry> {
-    let pid = process.pid();
-    let table = user_thread_table().lock();
-    table.get(&pid).cloned().or_else(|| {
-        table
-            .values()
-            .find(|entry| entry.process.pid() == pid)
-            .cloned()
-    })
 }
 
 fn deliver_user_signal(entry: &UserThreadEntry, sig: i32) -> Result<(), LinuxError> {
