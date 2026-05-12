@@ -89,7 +89,10 @@ use synthetic_fs::{
     synthetic_file_is_writable_open, synthetic_userdb_content, synthetic_userdb_fd_entry,
     synthetic_userdb_path_entry,
 };
-use system_info::{SyslogAction, default_rusage, default_utsname, default_winsize, syslog_action};
+use system_info::{
+    SyslogAction, default_rusage, default_utsname, default_winsize, rusage_target_valid,
+    syslog_action,
+};
 use task_context::{UserTaskExt, current_process, current_task_ext, current_tid, task_ext};
 use task_registry::{
     UserThreadEntry, register_user_task, unregister_user_task, user_thread_entry_by_process_pid,
@@ -3248,11 +3251,8 @@ fn sys_syslog(process: &UserProcess, log_type: i32, buf: usize, len: usize) -> i
 }
 
 fn sys_getrusage(process: &UserProcess, who: i32, usage: usize) -> isize {
-    match who {
-        x if x == general::RUSAGE_SELF as i32
-            || x == general::RUSAGE_THREAD as i32
-            || x == general::RUSAGE_CHILDREN => {}
-        _ => return neg_errno(LinuxError::EINVAL),
+    if !rusage_target_valid(who) {
+        return neg_errno(LinuxError::EINVAL);
     }
     let value = default_rusage();
     write_user_value(process, usage, &value)

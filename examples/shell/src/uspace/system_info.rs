@@ -25,6 +25,12 @@ pub(super) fn default_rusage() -> general::rusage {
     unsafe { core::mem::zeroed() }
 }
 
+pub(super) fn rusage_target_valid(who: i32) -> bool {
+    who == general::RUSAGE_SELF as i32
+        || who == general::RUSAGE_THREAD as i32
+        || who == general::RUSAGE_CHILDREN
+}
+
 pub(super) fn default_winsize() -> general::winsize {
     general::winsize {
         ws_row: 0,
