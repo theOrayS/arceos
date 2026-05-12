@@ -34,6 +34,7 @@ use riscv::register::sstatus::{FS, Sstatus};
 mod fd_pipe;
 mod fd_socket;
 mod fd_table;
+mod futex;
 mod linux_abi;
 mod metadata;
 mod program_loader;
@@ -215,11 +216,6 @@ struct UserThreadEntry {
 struct LoadedProgram {
     process: Arc<UserProcess>,
     context: UspaceContext,
-}
-
-struct FutexState {
-    seq: AtomicU32,
-    queue: WaitQueue,
 }
 
 #[repr(C)]
@@ -925,14 +921,6 @@ fn task_ext(task: &AxTaskRef) -> Option<&UserTaskExt> {
     Some(unsafe { &*(ptr as *const UserTaskExt) })
 }
 
-fn futex_table() -> &'static Mutex<BTreeMap<usize, Arc<FutexState>>> {
-    static FUTEXES: LazyInit<Mutex<BTreeMap<usize, Arc<FutexState>>>> = LazyInit::new();
-    if !FUTEXES.is_inited() {
-        FUTEXES.init_once(Mutex::new(BTreeMap::new()));
-    }
-    &FUTEXES
-}
-
 fn user_thread_table() -> &'static Mutex<BTreeMap<i32, UserThreadEntry>> {
     static USER_THREADS: LazyInit<Mutex<BTreeMap<i32, UserThreadEntry>>> = LazyInit::new();
     if !USER_THREADS.is_inited() {
@@ -1000,10 +988,7 @@ fn deliver_user_signal(entry: &UserThreadEntry, sig: i32) -> Result<(), LinuxErr
     if sig == SIGCANCEL_NUM && !signal_is_blocked(ext, sig) {
         let futex_wait = ext.futex_wait.load(Ordering::Acquire);
         if futex_wait != 0 {
-            if let Some(state) = futex_table().lock().get(&futex_wait).cloned() {
-                state.seq.fetch_add(1, Ordering::Release);
-                let _ = state.queue.notify_task(true, &entry.task);
-            }
+            futex::wake_task(futex_wait, &entry.task);
         }
     }
     Ok(())
@@ -1014,34 +999,6 @@ fn deliver_user_signal_result(entry: &UserThreadEntry, sig: i32) -> isize {
         Ok(()) => 0,
         Err(err) => neg_errno(err),
     }
-}
-
-fn futex_state(uaddr: usize) -> Arc<FutexState> {
-    let mut table = futex_table().lock();
-    table
-        .entry(uaddr)
-        .or_insert_with(|| {
-            Arc::new(FutexState {
-                seq: AtomicU32::new(0),
-                queue: WaitQueue::new(),
-            })
-        })
-        .clone()
-}
-
-fn futex_wake_addr(uaddr: usize, count: usize) -> usize {
-    let Some(state) = futex_table().lock().get(&uaddr).cloned() else {
-        return 0;
-    };
-    state.seq.fetch_add(1, Ordering::Release);
-    let mut woken = 0usize;
-    for _ in 0..count {
-        if !state.queue.notify_one(true) {
-            break;
-        }
-        woken += 1;
-    }
-    woken
 }
 
 fn clear_current_tid_and_wake() {
@@ -1058,7 +1015,7 @@ fn clear_current_tid_and_wake() {
     );
     let zero: i32 = 0;
     let _ = write_user_value(ext.process.as_ref(), clear_tid, &zero);
-    let _ = futex_wake_addr(clear_tid, 1);
+    let _ = futex::wake_addr(clear_tid, 1);
 }
 
 fn perform_deferred_self_unmap() {
@@ -4601,7 +4558,7 @@ fn sys_futex(
             if current != val as u32 {
                 return neg_errno(LinuxError::EAGAIN);
             }
-            let state = futex_state(uaddr);
+            let state = futex::state(uaddr);
             let seq = state.seq.load(Ordering::Acquire);
             if let Some(ext) = current_task_ext() {
                 ext.futex_wait.store(uaddr, Ordering::Release);
@@ -4644,7 +4601,7 @@ fn sys_futex(
             }
             0
         }
-        general::FUTEX_WAKE => futex_wake_addr(uaddr, val) as isize,
+        general::FUTEX_WAKE => futex::wake_addr(uaddr, val) as isize,
         _ => neg_errno(LinuxError::ENOSYS),
     }
 }
