@@ -179,6 +179,10 @@ pub(super) fn monotonic_time_micros() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+pub(super) fn times_ticks() -> isize {
+    axhal::time::monotonic_time().as_millis() as isize
+}
+
 pub(super) fn timespec_to_duration(
     ts: general::timespec,
 ) -> Result<core::time::Duration, LinuxError> {

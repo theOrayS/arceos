@@ -110,8 +110,8 @@ use time_abi::{
     clock_gettime_timespec, clock_now_duration, current_timeval, default_timex, default_tms,
     itimerval_to_micros_pair, micros_to_duration, micros_to_timeval, monotonic_time_micros,
     read_timespec_duration, rtc_time_from_wall_time, set_realtime_offset_from_timespec,
-    sleep_duration, socket_duration_to_timeval, socket_timeval_to_duration, zero_timespec,
-    zero_timezone,
+    sleep_duration, socket_duration_to_timeval, socket_timeval_to_duration, times_ticks,
+    zero_timespec, zero_timezone,
 };
 use user_memory::{
     clear_user_bytes, read_cstr, read_execve_argv, read_iovec_entries, read_user_bytes,
@@ -3154,7 +3154,7 @@ fn sys_setitimer(
 fn sys_times(process: &UserProcess, buf: usize) -> isize {
     let tms = default_tms();
     return_on_user_write_error!(process, buf, &tms);
-    axhal::time::monotonic_time().as_millis() as isize
+    times_ticks()
 }
 
 fn sys_sched_setparam(process: &UserProcess, pid: i32, param: usize) -> isize {
