@@ -594,6 +594,10 @@ pub fn sys_shutdown(socket_fd: c_int, flag: c_int) -> c_int {
 /// Results' ai_flags and ai_canonname are 0 or NULL.
 ///
 /// Return address number if success.
+///
+/// # Safety
+///
+/// `res` must be writable for one `addrinfo` pointer when non-null.
 pub unsafe fn sys_getaddrinfo(
     nodename: *const c_char,
     servname: *const c_char,
@@ -660,10 +664,37 @@ pub unsafe fn sys_getaddrinfo(
         }
 
         out[0].ref_ = len as i16;
-        unsafe { *res = core::ptr::addr_of_mut!(out[0].ai) };
+        unsafe { write_addrinfo_result(res, core::ptr::addr_of_mut!(out[0].ai)) };
         core::mem::forget(out); // drop in `sys_freeaddrinfo`
         Ok(len)
     })
+}
+
+/// Write the allocated addrinfo result head back to the caller.
+///
+/// # Safety
+///
+/// `res` must be writable for one `addrinfo` pointer.
+unsafe fn write_addrinfo_result(res: *mut *mut ctypes::addrinfo, value: *mut ctypes::addrinfo) {
+    unsafe { core::ptr::write_unaligned(res, value) };
+}
+
+/// Rebuild the leaked `aibuf` vector returned by `sys_getaddrinfo`.
+///
+/// # Safety
+///
+/// `res` must be either null or a pointer previously returned by
+/// `sys_getaddrinfo` and not already freed.
+unsafe fn reclaim_addrinfo_buffer(res: *mut ctypes::addrinfo) -> Option<Vec<ctypes::aibuf>> {
+    if res.is_null() {
+        return None;
+    }
+
+    let aibuf_ptr = res as *mut ctypes::aibuf;
+    let len = unsafe { (*aibuf_ptr).ref_ as usize };
+    assert!(unsafe { (*aibuf_ptr).slot == 0 });
+    assert!(len > 0);
+    Some(unsafe { Vec::from_raw_parts(aibuf_ptr, len, len) }) // TODO: lock
 }
 
 /// Free queried `addrinfo` struct
@@ -673,15 +704,7 @@ pub unsafe fn sys_getaddrinfo(
 /// `res` must be either null or a pointer previously returned by
 /// `sys_getaddrinfo` and not already freed.
 pub unsafe fn sys_freeaddrinfo(res: *mut ctypes::addrinfo) {
-    if res.is_null() {
-        return;
-    }
-    let aibuf_ptr = res as *mut ctypes::aibuf;
-    let len = unsafe { *aibuf_ptr }.ref_ as usize;
-    assert!(unsafe { *aibuf_ptr }.slot == 0);
-    assert!(len > 0);
-    let vec = unsafe { Vec::from_raw_parts(aibuf_ptr, len, len) }; // TODO: lock
-    drop(vec);
+    drop(unsafe { reclaim_addrinfo_buffer(res) });
 }
 
 /// Get current address to which the socket sockfd is bound.
