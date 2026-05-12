@@ -95,7 +95,7 @@ use synthetic_fs::{
 };
 use system_info::{
     SyslogAction, default_rusage, default_utsname, default_winsize, rusage_target_valid,
-    syslog_action,
+    syslog_action, syslog_empty_read_bytes,
 };
 use task_context::{
     UserTaskExt, current_process, current_task_ext, current_tid, robust_list_for_task,
@@ -3221,11 +3221,11 @@ fn sys_sched_getaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mas
 fn sys_syslog(process: &UserProcess, log_type: i32, buf: usize, len: usize) -> isize {
     match syslog_action(log_type) {
         SyslogAction::EmptyRead => {
-            if len > 0 && buf != 0 {
+            if let Some(bytes) = syslog_empty_read_bytes(buf, len) {
                 if let Err(err) = validate_user_write(process, buf, len) {
                     return neg_errno(err);
                 }
-                if let Err(err) = write_user_bytes(process, buf, &[0]) {
+                if let Err(err) = write_user_bytes(process, buf, bytes) {
                     return neg_errno(err);
                 }
             }

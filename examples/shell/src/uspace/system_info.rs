@@ -21,6 +21,14 @@ pub(super) fn syslog_action(log_type: i32) -> SyslogAction {
     }
 }
 
+pub(super) fn syslog_empty_read_bytes(buf: usize, len: usize) -> Option<&'static [u8]> {
+    if len > 0 && buf != 0 {
+        Some(&[0])
+    } else {
+        None
+    }
+}
+
 pub(super) fn default_rusage() -> general::rusage {
     unsafe { core::mem::zeroed() }
 }
