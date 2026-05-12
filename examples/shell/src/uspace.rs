@@ -1916,12 +1916,13 @@ fn sys_writev(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> is
         if len == 0 {
             continue;
         }
-        let Some(src) = user_bytes(process, entry.iov_base as usize, len, false) else {
-            return neg_errno(LinuxError::EFAULT);
+        let src = match read_user_bytes(process, entry.iov_base as usize, len) {
+            Ok(bytes) => bytes,
+            Err(err) => return if written > 0 { written } else { neg_errno(err) },
         };
-        let n = match process.fds.lock().write(fd as i32, src) {
+        let n = match process.fds.lock().write(fd as i32, &src) {
             Ok(v) => v,
-            Err(err) => return neg_errno(err),
+            Err(err) => return if written > 0 { written } else { neg_errno(err) },
         };
         written += n as isize;
         if n < len {
@@ -1943,13 +1944,28 @@ fn sys_readv(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isi
         if len == 0 {
             continue;
         }
-        let Some(dst) = user_bytes_mut(process, entry.iov_base as usize, len, true) else {
-            return neg_errno(LinuxError::EFAULT);
+        let base = entry.iov_base as usize;
+        if let Err(err) = validate_user_write(process, base, len) {
+            return if total > 0 { total } else { neg_errno(err) };
+        }
+        let mut bytes = match user_io_buffer(len) {
+            Ok(bytes) => bytes,
+            Err(err) => return if total > 0 { total } else { neg_errno(err) },
         };
-        let n = match process.fds.lock().read(fd as i32, dst) {
+        let n = match process.fds.lock().read(fd as i32, &mut bytes) {
             Ok(v) => v,
-            Err(err) => return neg_errno(err),
+            Err(err) => return if total > 0 { total } else { neg_errno(err) },
         };
+        if n > len {
+            return if total > 0 {
+                total
+            } else {
+                neg_errno(LinuxError::EINVAL)
+            };
+        }
+        if let Err(err) = write_user_bytes(process, base, &bytes[..n]) {
+            return if total > 0 { total } else { neg_errno(err) };
+        }
         total += n as isize;
         if n < len {
             break;
