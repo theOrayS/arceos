@@ -2,7 +2,108 @@ use std::string::{String, ToString};
 use std::vec::Vec;
 
 use super::linux_abi::TESTSUITE_STAGE_ROOT;
-use super::normalize_path;
+
+pub(super) fn current_cwd() -> String {
+    std::env::current_dir().unwrap_or_else(|_| "/".into())
+}
+
+pub(super) fn resolve_host_path(cwd: String, path: &str) -> Result<String, String> {
+    normalize_path(cwd.as_str(), path).ok_or_else(|| format!("invalid path: {path}"))
+}
+
+pub(super) fn busybox_applet_target_path(path: &str) -> Option<String> {
+    let (root, applet) = path
+        .strip_prefix("/musl/")
+        .map(|applet| ("/musl", applet))
+        .or_else(|| {
+            path.strip_prefix("/glibc/")
+                .map(|applet| ("/glibc", applet))
+        })?;
+    if applet.is_empty()
+        || applet.contains('/')
+        || applet == "busybox"
+        || !is_busybox_applet_name(applet)
+    {
+        return None;
+    }
+    Some(format!("{root}/busybox"))
+}
+
+pub(super) fn normalize_path(base: &str, path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    let input = if path.starts_with('/') {
+        path.to_string()
+    } else if base == "/" {
+        format!("/{path}")
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), path)
+    };
+    for part in input.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let mut normalized = String::from("/");
+    normalized.push_str(&parts.join("/"));
+    Some(normalized)
+}
+
+fn is_busybox_applet_name(name: &str) -> bool {
+    matches!(
+        name,
+        "[" | "ash"
+            | "basename"
+            | "cal"
+            | "cat"
+            | "clear"
+            | "cp"
+            | "cut"
+            | "date"
+            | "df"
+            | "dirname"
+            | "dmesg"
+            | "du"
+            | "echo"
+            | "expr"
+            | "false"
+            | "find"
+            | "free"
+            | "grep"
+            | "head"
+            | "hexdump"
+            | "hwclock"
+            | "kill"
+            | "ls"
+            | "md5sum"
+            | "mkdir"
+            | "more"
+            | "mv"
+            | "od"
+            | "printf"
+            | "ps"
+            | "pwd"
+            | "rm"
+            | "rmdir"
+            | "sh"
+            | "sleep"
+            | "sort"
+            | "stat"
+            | "strings"
+            | "tail"
+            | "test"
+            | "touch"
+            | "true"
+            | "uname"
+            | "uniq"
+            | "uptime"
+            | "wc"
+            | "which"
+    )
+}
 
 pub(super) fn derive_exec_root_from_path(path: &str) -> String {
     if path == "/musl" || path.starts_with("/musl/") {

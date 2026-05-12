@@ -10,7 +10,8 @@ use super::linux_abi::{
     DEFAULT_GROUP_CONTENT, DEFAULT_PASSWD_CONTENT, ETC_GROUP_PATH, ETC_PASSWD_PATH,
     PROC_SELF_MAPS_PATH, USER_ASPACE_BASE, USER_STACK_SIZE, USER_STACK_TOP,
 };
-use super::{UserProcess, align_down, align_up, normalize_path};
+use super::runtime_paths::normalize_path;
+use super::{UserProcess, align_down, align_up};
 
 fn proc_self_maps_content(process: &UserProcess) -> Vec<u8> {
     let exec_path = process.exec_path();

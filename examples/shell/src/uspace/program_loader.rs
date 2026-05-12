@@ -15,8 +15,10 @@ use super::linux_abi::{
     AUX_CLOCK_TICKS, AUX_PLATFORM, MAX_SCRIPT_INTERPRETER_DEPTH, USER_BRK_GROW_SIZE,
     USER_MMAP_BASE, USER_PIE_LOAD_BASE, USER_STACK_SIZE, USER_STACK_TOP,
 };
-use super::runtime_paths::{derive_exec_root_from_path, resolve_runtime_support_file};
-use super::{BrkState, align_down, align_up, resolve_host_path, str_err, user_mapping_flags};
+use super::runtime_paths::{
+    derive_exec_root_from_path, resolve_host_path, resolve_runtime_support_file,
+};
+use super::{BrkState, align_down, align_up, str_err, user_mapping_flags};
 
 pub(super) struct LoadedImage {
     pub(super) entry: usize,
