@@ -51,21 +51,15 @@ impl SocketEntry {
     }
 
     pub(super) fn read(&self, dst: &mut [u8]) -> Result<usize, LinuxError> {
-        posix_ret_usize(arceos_posix_api::sys_recv(
-            self.posix_fd,
-            dst.as_mut_ptr() as *mut c_void,
-            dst.len(),
-            0,
-        ))
+        posix_ret_usize(unsafe {
+            arceos_posix_api::sys_recv(self.posix_fd, dst.as_mut_ptr() as *mut c_void, dst.len(), 0)
+        })
     }
 
     pub(super) fn write(&self, src: &[u8]) -> Result<usize, LinuxError> {
-        posix_ret_usize(arceos_posix_api::sys_send(
-            self.posix_fd,
-            src.as_ptr() as *const c_void,
-            src.len(),
-            0,
-        ))
+        posix_ret_usize(unsafe {
+            arceos_posix_api::sys_send(self.posix_fd, src.as_ptr() as *const c_void, src.len(), 0)
+        })
     }
 
     pub(super) fn close(&self) -> Result<(), LinuxError> {

@@ -359,7 +359,12 @@ pub fn sys_connect(
 /// Send a message on a socket to the address specified.
 ///
 /// Return the number of bytes sent if success.
-pub fn sys_sendto(
+///
+/// # Safety
+///
+/// `buf_ptr` must point to a readable buffer of `len` bytes. If `socket_addr`
+/// is non-null, it must point to a valid socket address of `addrlen` bytes.
+pub unsafe fn sys_sendto(
     socket_fd: c_int,
     buf_ptr: *const c_void,
     len: ctypes::size_t,
@@ -384,7 +389,11 @@ pub fn sys_sendto(
 /// Send a message on a socket to the address connected.
 ///
 /// Return the number of bytes sent if success.
-pub fn sys_send(
+///
+/// # Safety
+///
+/// `buf_ptr` must point to a readable buffer of `len` bytes.
+pub unsafe fn sys_send(
     socket_fd: c_int,
     buf_ptr: *const c_void,
     len: ctypes::size_t,
@@ -406,6 +415,11 @@ pub fn sys_send(
 /// Receive a message on a socket and get its source address.
 ///
 /// Return the number of bytes received if success.
+///
+/// # Safety
+///
+/// `buf_ptr` must point to a writable buffer of `len` bytes. `socket_addr` and
+/// `addrlen` must point to writable storage for the returned peer address.
 pub unsafe fn sys_recvfrom(
     socket_fd: c_int,
     buf_ptr: *mut c_void,
@@ -438,7 +452,11 @@ pub unsafe fn sys_recvfrom(
 /// Receive a message on a socket.
 ///
 /// Return the number of bytes received if success.
-pub fn sys_recv(
+///
+/// # Safety
+///
+/// `buf_ptr` must point to a writable buffer of `len` bytes.
+pub unsafe fn sys_recv(
     socket_fd: c_int,
     buf_ptr: *mut c_void,
     len: ctypes::size_t,

@@ -52,9 +52,9 @@ pub unsafe extern "C" fn sendto(
     addrlen: ctypes::socklen_t,
 ) -> ctypes::ssize_t {
     if socket_addr.is_null() && addrlen == 0 {
-        return e(sys_send(socket_fd, buf_ptr, len, flag) as _) as _;
+        return e(unsafe { sys_send(socket_fd, buf_ptr, len, flag) } as _) as _;
     }
-    e(sys_sendto(socket_fd, buf_ptr, len, flag, socket_addr, addrlen) as _) as _
+    e(unsafe { sys_sendto(socket_fd, buf_ptr, len, flag, socket_addr, addrlen) } as _) as _
 }
 
 /// Send a message on a socket to the address connected.
@@ -67,7 +67,7 @@ pub unsafe extern "C" fn send(
     len: ctypes::size_t,
     flag: c_int, // currently not used
 ) -> ctypes::ssize_t {
-    e(sys_send(socket_fd, buf_ptr, len, flag) as _) as _
+    e(unsafe { sys_send(socket_fd, buf_ptr, len, flag) } as _) as _
 }
 
 /// Receive a message on a socket and get its source address.
@@ -83,9 +83,9 @@ pub unsafe extern "C" fn recvfrom(
     addrlen: *mut ctypes::socklen_t,
 ) -> ctypes::ssize_t {
     if socket_addr.is_null() {
-        return e(sys_recv(socket_fd, buf_ptr, len, flag) as _) as _;
+        return e(unsafe { sys_recv(socket_fd, buf_ptr, len, flag) } as _) as _;
     }
-    e(sys_recvfrom(socket_fd, buf_ptr, len, flag, socket_addr, addrlen) as _) as _
+    e(unsafe { sys_recvfrom(socket_fd, buf_ptr, len, flag, socket_addr, addrlen) } as _) as _
 }
 
 /// Receive a message on a socket.
@@ -98,7 +98,7 @@ pub unsafe extern "C" fn recv(
     len: ctypes::size_t,
     flag: c_int, // currently not used
 ) -> ctypes::ssize_t {
-    e(sys_recv(socket_fd, buf_ptr, len, flag) as _) as _
+    e(unsafe { sys_recv(socket_fd, buf_ptr, len, flag) } as _) as _
 }
 
 /// Listen for connections on a socket

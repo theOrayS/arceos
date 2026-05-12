@@ -66,8 +66,8 @@ use synthetic_fs::{
     synthetic_userdb_content, synthetic_userdb_fd_entry, synthetic_userdb_path_entry,
 };
 use user_memory::{
-    clear_user_bytes, read_cstr, read_user_bytes, read_user_value, user_bytes, user_bytes_mut,
-    validate_user_read, validate_user_write, write_user_bytes, write_user_value,
+    clear_user_bytes, read_cstr, read_user_bytes, read_user_value, validate_user_read,
+    validate_user_write, write_user_bytes, write_user_value,
 };
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -3150,20 +3150,22 @@ fn sys_sendto_bridge(
     };
     let data_ptr = bytes.as_ptr() as *const c_void;
     let ret = if addr == 0 {
-        arceos_posix_api::sys_send(socket.posix_fd, data_ptr, len, flags as i32)
+        unsafe { arceos_posix_api::sys_send(socket.posix_fd, data_ptr, len, flags as i32) }
     } else {
         let addr_bytes = match read_socket_addr_from_user(process, addr, addrlen) {
             Ok(bytes) => bytes,
             Err(err) => return neg_errno(err),
         };
-        arceos_posix_api::sys_sendto(
-            socket.posix_fd,
-            data_ptr,
-            len,
-            flags as i32,
-            addr_bytes.as_ptr() as *const posix_ctypes::sockaddr,
-            addrlen as posix_ctypes::socklen_t,
-        )
+        unsafe {
+            arceos_posix_api::sys_sendto(
+                socket.posix_fd,
+                data_ptr,
+                len,
+                flags as i32,
+                addr_bytes.as_ptr() as *const posix_ctypes::sockaddr,
+                addrlen as posix_ctypes::socklen_t,
+            )
+        }
     };
     let ret = match posix_ret_usize(ret) {
         Ok(n) => n as isize,
@@ -5000,7 +5002,7 @@ fn recv_socket_data_to_user(
     len: usize,
     flags: i32,
 ) -> isize {
-    recv_socket_data_to_user_inner(process, posix_fd, buf, len, |dst| {
+    recv_socket_data_to_user_inner(process, posix_fd, buf, len, |dst| unsafe {
         arceos_posix_api::sys_recv(posix_fd, dst, len, flags)
     })
 }

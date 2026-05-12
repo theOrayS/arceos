@@ -3,7 +3,7 @@ use core::mem::{MaybeUninit, size_of};
 use axerrno::LinuxError;
 use axhal::paging::MappingFlags;
 use memory_addr::VirtAddr;
-use std::string::{String, ToString};
+use std::string::String;
 use std::vec::Vec;
 
 use super::{UserProcess, neg_errno};
