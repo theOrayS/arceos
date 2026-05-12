@@ -56,7 +56,8 @@ use credentials::{
 use fd_pipe::PipeEndpoint;
 use fd_socket::{
     LocalSocketEntry, SocketEntry, read_socket_addr_from_user, read_socket_data_from_user,
-    recv_socket_data_to_user, recv_socket_data_to_user_with_addr, write_socket_addr_to_user,
+    recv_socket_data_to_user, recv_socket_data_to_user_with_addr, socket_option_supported,
+    write_socket_addr_to_user,
 };
 use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
 use linux_abi::*;
@@ -2793,34 +2794,6 @@ fn socket_name_bridge(
     match posix_ret_i32(unsafe { op(socket.posix_fd, &mut local_addr, &mut local_len) }) {
         Ok(_) => write_socket_addr_to_user(process, addr, addrlen, len, &local_addr, local_len),
         Err(err) => neg_errno(err),
-    }
-}
-
-fn socket_option_supported(level: i32, optname: i32) -> bool {
-    if level == SOL_SOCKET_LEVEL {
-        matches!(
-            optname,
-            SO_REUSEADDR_OPT
-                | SO_REUSEPORT_OPT
-                | SO_DONTROUTE_OPT
-                | SO_BROADCAST_OPT
-                | SO_KEEPALIVE_OPT
-                | SO_SNDBUF_OPT
-                | SO_RCVBUF_OPT
-                | SO_RCVTIMEO_OPT
-                | SO_SNDTIMEO_OPT
-                | SO_ERROR_OPT
-                | SO_TYPE_OPT
-        )
-    } else if level == IPPROTO_IP_LEVEL {
-        matches!(
-            optname,
-            IP_RECVERR_OPT | MCAST_JOIN_GROUP_OPT | MCAST_LEAVE_GROUP_OPT
-        )
-    } else if level == posix_ctypes::IPPROTO_TCP as i32 {
-        matches!(optname, TCP_NODELAY_OPT | TCP_MAXSEG_OPT)
-    } else {
-        false
     }
 }
 

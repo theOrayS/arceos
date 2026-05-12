@@ -9,7 +9,13 @@ use linux_raw_sys::general;
 use std::sync::Arc;
 use std::vec::Vec;
 
-use super::linux_abi::{LOCAL_SOCKET_INO_BASE, ST_MODE_SOCKET};
+use super::linux_abi::{
+    IP_RECVERR_OPT, IPPROTO_IP_LEVEL, LOCAL_SOCKET_INO_BASE, MCAST_JOIN_GROUP_OPT,
+    MCAST_LEAVE_GROUP_OPT, SO_BROADCAST_OPT, SO_DONTROUTE_OPT, SO_ERROR_OPT, SO_KEEPALIVE_OPT,
+    SO_RCVBUF_OPT, SO_RCVTIMEO_OPT, SO_REUSEADDR_OPT, SO_REUSEPORT_OPT, SO_SNDBUF_OPT,
+    SO_SNDTIMEO_OPT, SO_TYPE_OPT, SOL_SOCKET_LEVEL, ST_MODE_SOCKET, TCP_MAXSEG_OPT,
+    TCP_NODELAY_OPT,
+};
 use super::user_memory::{
     read_user_bytes, user_io_buffer, validate_user_read, validate_user_write, write_user_bytes,
     write_user_value,
@@ -142,6 +148,34 @@ impl LocalSocketEntry {
         st.st_nlink = 1;
         st.st_blksize = 512;
         st
+    }
+}
+
+pub(super) fn socket_option_supported(level: i32, optname: i32) -> bool {
+    if level == SOL_SOCKET_LEVEL {
+        matches!(
+            optname,
+            SO_REUSEADDR_OPT
+                | SO_REUSEPORT_OPT
+                | SO_DONTROUTE_OPT
+                | SO_BROADCAST_OPT
+                | SO_KEEPALIVE_OPT
+                | SO_SNDBUF_OPT
+                | SO_RCVBUF_OPT
+                | SO_RCVTIMEO_OPT
+                | SO_SNDTIMEO_OPT
+                | SO_ERROR_OPT
+                | SO_TYPE_OPT
+        )
+    } else if level == IPPROTO_IP_LEVEL {
+        matches!(
+            optname,
+            IP_RECVERR_OPT | MCAST_JOIN_GROUP_OPT | MCAST_LEAVE_GROUP_OPT
+        )
+    } else if level == posix_ctypes::IPPROTO_TCP as i32 {
+        matches!(optname, TCP_NODELAY_OPT | TCP_MAXSEG_OPT)
+    } else {
+        false
     }
 }
 
