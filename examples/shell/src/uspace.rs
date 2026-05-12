@@ -8,7 +8,7 @@ use core::sync::atomic::{
 
 use arceos_posix_api::ctypes as posix_ctypes;
 use axerrno::LinuxError;
-use axfs::fops::{self, Directory, File, FileAttr, FileType, OpenOptions};
+use axfs::fops::{self, Directory, File, FileType, OpenOptions};
 use axhal::context::{TrapFrame, UspaceContext};
 use axhal::mem::virt_to_phys;
 use axhal::paging::MappingFlags;
@@ -46,11 +46,11 @@ mod user_memory;
 
 use fd_pipe::PipeEndpoint;
 use fd_socket::{LocalSocketEntry, SocketEntry};
-use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, MemoryFileEntry, PathEntry};
+use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
 use linux_abi::*;
 use metadata::{
     apply_recorded_path_metadata, canonical_permission_path, fd_entry_path, fd_entry_statfs_path,
-    file_attr_to_stat, file_type_mode, generic_statfs, normalize_file_mode, path_inode,
+    file_attr_to_stat, generic_statfs, normalize_file_mode,
 };
 use program_loader::load_program_image;
 use runtime_paths::{
@@ -5258,94 +5258,6 @@ fn fd_cloexec_flag(enabled: bool) -> u32 {
 
 fn str_err(err: &'static str) -> String {
     err.into()
-}
-
-impl PathEntry {
-    fn from_attr(path: &str, attr: &FileAttr) -> Self {
-        Self {
-            path: path.into(),
-            mode: file_type_mode(attr.file_type()) | attr.perm().bits() as u32,
-            size: attr.size(),
-            blocks: attr.blocks(),
-        }
-    }
-
-    fn synthetic_file(path: &str, size: usize) -> Self {
-        Self {
-            path: path.into(),
-            mode: ST_MODE_FILE | 0o444,
-            size: size as u64,
-            blocks: (size as u64).div_ceil(512),
-        }
-    }
-
-    fn synthetic_char(path: &str) -> Self {
-        Self {
-            path: path.into(),
-            mode: ST_MODE_CHR | 0o440,
-            size: 0,
-            blocks: 0,
-        }
-    }
-
-    fn stat(&self) -> general::stat {
-        let mut st: general::stat = unsafe { core::mem::zeroed() };
-        st.st_dev = 1;
-        st.st_ino = path_inode(Some(self.path.as_str()));
-        st.st_mode = self.mode;
-        st.st_nlink = 1;
-        st.st_size = self.size as _;
-        st.st_blksize = 512;
-        st.st_blocks = self.blocks as _;
-        st
-    }
-}
-
-impl MemoryFileEntry {
-    fn read(&mut self, dst: &mut [u8]) -> usize {
-        let start = self.offset.min(self.data.len());
-        let end = cmp::min(start + dst.len(), self.data.len());
-        let len = end.saturating_sub(start);
-        dst[..len].copy_from_slice(&self.data[start..end]);
-        self.offset = end;
-        len
-    }
-
-    fn stat(&self) -> general::stat {
-        PathEntry::synthetic_file(self.path.as_str(), self.data.len()).stat()
-    }
-
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64, LinuxError> {
-        let next = match pos {
-            SeekFrom::Start(offset) => offset as i64,
-            SeekFrom::Current(offset) => self.offset as i64 + offset,
-            SeekFrom::End(offset) => self.data.len() as i64 + offset,
-        };
-        if next < 0 {
-            return Err(LinuxError::EINVAL);
-        }
-        self.offset = next as usize;
-        Ok(self.offset as u64)
-    }
-}
-
-impl FdEntry {
-    fn duplicate_for_fork(&self) -> Result<Self, LinuxError> {
-        match self {
-            Self::Stdin => Ok(Self::Stdin),
-            Self::Stdout => Ok(Self::Stdout),
-            Self::Stderr => Ok(Self::Stderr),
-            Self::DevNull => Ok(Self::DevNull),
-            Self::Rtc => Ok(Self::Rtc),
-            Self::File(file) => Ok(Self::File(file.clone())),
-            Self::Directory(dir) => Ok(Self::Directory(dir.clone())),
-            Self::Path(path) => Ok(Self::Path(path.clone())),
-            Self::MemoryFile(file) => Ok(Self::MemoryFile(file.clone())),
-            Self::Pipe(pipe) => Ok(Self::Pipe(pipe.clone())),
-            Self::Socket(socket) => socket.duplicate().map(Self::Socket),
-            Self::LocalSocket(socket) => Ok(Self::LocalSocket(socket.duplicate())),
-        }
-    }
 }
 
 impl FdTable {
