@@ -91,6 +91,46 @@ pub(super) fn user_bytes_mut<'a>(
     Some(unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) })
 }
 
+pub(super) fn read_user_bytes(
+    process: &UserProcess,
+    ptr: usize,
+    len: usize,
+) -> Result<Vec<u8>, LinuxError> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr == 0 || !user_range_accessible(process, ptr, len, false) {
+        return Err(LinuxError::EFAULT);
+    }
+
+    let mut bytes = vec![0; len];
+    process
+        .aspace
+        .lock()
+        .read(VirtAddr::from(ptr), &mut bytes)
+        .map_err(|_| LinuxError::EFAULT)?;
+    Ok(bytes)
+}
+
+pub(super) fn write_user_bytes(
+    process: &UserProcess,
+    ptr: usize,
+    bytes: &[u8],
+) -> Result<(), LinuxError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if ptr == 0 || !user_range_accessible(process, ptr, bytes.len(), true) {
+        return Err(LinuxError::EFAULT);
+    }
+
+    process
+        .aspace
+        .lock()
+        .write(VirtAddr::from(ptr), bytes)
+        .map_err(|_| LinuxError::EFAULT)
+}
+
 pub(super) fn write_user_value<T: Copy>(process: &UserProcess, ptr: usize, value: &T) -> isize {
     if ptr == 0 || !user_range_accessible(process, ptr, size_of::<T>(), true) {
         return neg_errno(LinuxError::EFAULT);

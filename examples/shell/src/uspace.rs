@@ -66,8 +66,8 @@ use synthetic_fs::{
     synthetic_userdb_content, synthetic_userdb_fd_entry, synthetic_userdb_path_entry,
 };
 use user_memory::{
-    read_cstr, read_user_value, user_bytes, user_bytes_mut, validate_user_read,
-    validate_user_write, write_user_value,
+    read_cstr, read_user_bytes, read_user_value, user_bytes, user_bytes_mut, validate_user_read,
+    validate_user_write, write_user_bytes, write_user_value,
 };
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -1961,15 +1961,15 @@ fn sys_readv(process: &UserProcess, fd: usize, iov: usize, iovcnt: usize) -> isi
     total
 }
 
-fn read_iovec_array<'a>(
+fn read_iovec_array(
     process: &UserProcess,
     iov: usize,
     iovcnt: usize,
-) -> Result<&'a [u8], LinuxError> {
+) -> Result<Vec<u8>, LinuxError> {
     if iovcnt > IOV_MAX {
         return Err(LinuxError::EINVAL);
     }
-    user_bytes(process, iov, iovcnt * size_of::<general::iovec>(), false).ok_or(LinuxError::EFAULT)
+    read_user_bytes(process, iov, iovcnt * size_of::<general::iovec>())
 }
 
 fn sys_getcwd(process: &UserProcess, buf: usize, size: usize) -> isize {
@@ -1979,11 +1979,8 @@ fn sys_getcwd(process: &UserProcess, buf: usize, size: usize) -> isize {
     if bytes.len() > size {
         return neg_errno(LinuxError::ERANGE);
     }
-    let Some(dst) = user_bytes_mut(process, buf, bytes.len(), true) else {
-        return neg_errno(LinuxError::EFAULT);
-    };
-    dst.copy_from_slice(&bytes);
-    bytes.len() as isize
+    write_user_bytes(process, buf, &bytes)
+        .map_or_else(|err| neg_errno(err), |_| bytes.len() as isize)
 }
 
 fn sys_chdir(process: &UserProcess, pathname: usize) -> isize {
@@ -3653,11 +3650,8 @@ fn sys_readlinkat(
     if let Some(target) = proc_exe_link_target(process, resolved_path.as_str()) {
         let bytes = target.as_bytes();
         let copy_len = cmp::min(bytes.len(), bufsiz);
-        let Some(dst) = user_bytes_mut(process, buf, copy_len, true) else {
-            return neg_errno(LinuxError::EFAULT);
-        };
-        dst.copy_from_slice(&bytes[..copy_len]);
-        return copy_len as isize;
+        return write_user_bytes(process, buf, &bytes[..copy_len])
+            .map_or_else(|err| neg_errno(err), |_| copy_len as isize);
     }
     match axfs::api::metadata(resolved_path.as_str()) {
         Ok(_) => neg_errno(LinuxError::EINVAL),
