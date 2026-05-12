@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsiz
 
 use arceos_posix_api::ctypes as posix_ctypes;
 use axerrno::LinuxError;
-use axfs::fops::{self, Directory, File, FileType, OpenOptions};
+use axfs::fops::{self, Directory, File, OpenOptions};
 use axhal::context::{TrapFrame, UspaceContext};
 use axhal::mem::virt_to_phys;
 use axhal::trap::{
@@ -63,8 +63,8 @@ use linux_abi::*;
 use memory_map::{align_down, align_up, mmap_prot_to_flags, user_mapping_flags};
 use memory_policy::{validate_mempolicy_nodemask, write_default_mempolicy};
 use metadata::{
-    apply_recorded_path_metadata, canonical_permission_path, fd_entry_path, fd_entry_statfs_path,
-    file_attr_to_stat, generic_statfs, normalize_file_mode,
+    apply_recorded_path_metadata, canonical_permission_path, dirent_type, fd_entry_path,
+    fd_entry_statfs_path, file_attr_to_stat, generic_statfs, normalize_file_mode, stdio_stat,
 };
 use program_loader::load_program_image;
 use resource_sched::{
@@ -5126,26 +5126,4 @@ fn resolve_dirfd_path(
         return Err(LinuxError::ENOTDIR);
     };
     normalize_path(dir.path.as_str(), path).ok_or(LinuxError::EINVAL)
-}
-
-fn dirent_type(ty: FileType) -> u32 {
-    match ty {
-        FileType::Dir => general::DT_DIR,
-        FileType::CharDevice => general::DT_CHR,
-        FileType::BlockDevice => general::DT_BLK,
-        FileType::Fifo => general::DT_FIFO,
-        FileType::Socket => general::DT_SOCK,
-        FileType::SymLink => general::DT_LNK,
-        _ => general::DT_REG,
-    }
-}
-
-fn stdio_stat(readable: bool) -> general::stat {
-    let perm = if readable { 0o440 } else { 0o220 };
-    let mut st: general::stat = unsafe { core::mem::zeroed() };
-    st.st_ino = 1;
-    st.st_mode = ST_MODE_CHR | perm;
-    st.st_nlink = 1;
-    st.st_blksize = 512;
-    st
 }

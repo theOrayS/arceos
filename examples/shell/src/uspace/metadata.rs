@@ -100,6 +100,28 @@ pub(super) fn generic_statfs(path: Option<&str>) -> general::statfs {
     }
 }
 
+pub(super) fn dirent_type(ty: FileType) -> u32 {
+    match ty {
+        FileType::Dir => general::DT_DIR,
+        FileType::CharDevice => general::DT_CHR,
+        FileType::BlockDevice => general::DT_BLK,
+        FileType::Fifo => general::DT_FIFO,
+        FileType::Socket => general::DT_SOCK,
+        FileType::SymLink => general::DT_LNK,
+        _ => general::DT_REG,
+    }
+}
+
+pub(super) fn stdio_stat(readable: bool) -> general::stat {
+    let perm = if readable { 0o440 } else { 0o220 };
+    let mut st: general::stat = unsafe { core::mem::zeroed() };
+    st.st_ino = 1;
+    st.st_mode = ST_MODE_CHR | perm;
+    st.st_nlink = 1;
+    st.st_blksize = 512;
+    st
+}
+
 pub(super) fn path_inode(path: Option<&str>) -> u64 {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
