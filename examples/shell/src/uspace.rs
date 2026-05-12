@@ -36,6 +36,7 @@ mod linux_abi;
 mod metadata;
 mod program_loader;
 mod runtime_paths;
+mod select_fdset;
 mod signal_abi;
 mod synthetic_fs;
 mod sysv_shm;
@@ -56,6 +57,7 @@ use program_loader::load_program_image;
 use runtime_paths::{
     push_runtime_candidate, runtime_absolute_path_candidates, runtime_library_name_candidates,
 };
+use select_fdset::{SelectMode, poll_fd_set, read_fd_set, read_pselect_deadline, write_fd_set};
 #[cfg(target_arch = "riscv64")]
 use signal_abi::{
     RiscvKernelSigset, RiscvSignalFpState, RiscvSignalFrame, RiscvSignalInfo,
@@ -192,12 +194,6 @@ struct LoadedProgram {
 struct UserRlimit {
     rlim_cur: u64,
     rlim_max: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UserFdSet {
-    fds_bits: [usize; FD_SET_WORDS],
 }
 
 #[repr(C)]
@@ -3861,70 +3857,6 @@ fn read_timespec_duration(
 ) -> Result<core::time::Duration, LinuxError> {
     let ts = read_user_value::<general::timespec>(process, ptr)?;
     timespec_to_duration(ts)
-}
-
-#[derive(Clone, Copy)]
-enum SelectMode {
-    Read,
-    Write,
-    Except,
-}
-
-fn read_pselect_deadline(
-    process: &UserProcess,
-    timeout: usize,
-) -> Result<Option<core::time::Duration>, LinuxError> {
-    if timeout == 0 {
-        return Ok(None);
-    }
-    let ts = read_user_value::<general::timespec>(process, timeout)?;
-    if ts.tv_sec < 0 || !(0..1_000_000_000).contains(&ts.tv_nsec) {
-        return Err(LinuxError::EINVAL);
-    }
-    Ok(Some(
-        axhal::time::wall_time() + core::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32),
-    ))
-}
-
-fn read_fd_set(process: &UserProcess, ptr: usize) -> Result<[usize; FD_SET_WORDS], LinuxError> {
-    if ptr == 0 {
-        return Ok([0; FD_SET_WORDS]);
-    }
-    Ok(read_user_value::<UserFdSet>(process, ptr)?.fds_bits)
-}
-
-fn write_fd_set(process: &UserProcess, ptr: usize, bits: &[usize; FD_SET_WORDS]) -> isize {
-    if ptr == 0 {
-        return 0;
-    }
-    write_user_value(process, ptr, &UserFdSet { fds_bits: *bits })
-}
-
-fn poll_fd_set(
-    table: &FdTable,
-    nfds: usize,
-    requested: &[usize; FD_SET_WORDS],
-    ready: &mut [usize; FD_SET_WORDS],
-    mode: SelectMode,
-) -> usize {
-    let mut count = 0usize;
-    let words = nfds.div_ceil(BITS_PER_USIZE);
-    for word_idx in 0..words {
-        let mut bits = requested[word_idx];
-        while bits != 0 {
-            let bit_idx = bits.trailing_zeros() as usize;
-            let fd = word_idx * BITS_PER_USIZE + bit_idx;
-            if fd >= nfds {
-                break;
-            }
-            if table.poll(fd as i32, mode) {
-                ready[word_idx] |= 1usize << bit_idx;
-                count += 1;
-            }
-            bits &= bits - 1;
-        }
-    }
-    count
 }
 
 fn sys_brk(process: &UserProcess, addr: usize) -> isize {
