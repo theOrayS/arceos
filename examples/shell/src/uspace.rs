@@ -36,6 +36,7 @@ mod futex;
 mod linux_abi;
 mod metadata;
 mod program_loader;
+mod resource_sched;
 mod runtime_paths;
 mod select_fdset;
 mod signal_abi;
@@ -62,6 +63,10 @@ use metadata::{
     file_attr_to_stat, generic_statfs, normalize_file_mode,
 };
 use program_loader::load_program_image;
+use resource_sched::{
+    UserRlimit, UserSchedParam, default_rlimit, default_sched_param, rlimit_is_valid,
+    sched_param_accepts_policy, sched_param_accepts_setparam,
+};
 use runtime_paths::{
     busybox_applet_target_path, current_cwd, normalize_path, push_runtime_candidate,
     resolve_host_path, runtime_absolute_path_candidates, runtime_library_name_candidates,
@@ -196,19 +201,6 @@ struct ChildTask {
 struct LoadedProgram {
     process: Arc<UserProcess>,
     context: UspaceContext,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UserRlimit {
-    rlim_cur: u64,
-    rlim_max: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct UserSchedParam {
-    sched_priority: i32,
 }
 
 const NO_EXIT_GROUP_CODE: i32 = i32::MIN;
@@ -3546,7 +3538,7 @@ fn sys_sched_setparam(process: &UserProcess, pid: i32, param: usize) -> isize {
     return_errno_if!(!is_same_sched_target(process, pid), LinuxError::ESRCH);
     return_errno_if!(param == 0, LinuxError::EINVAL);
     match read_user_value::<UserSchedParam>(process, param) {
-        Ok(value) if value.sched_priority == 0 => 0,
+        Ok(value) if sched_param_accepts_setparam(value) => 0,
         Ok(_) => neg_errno(LinuxError::EINVAL),
         Err(err) => neg_errno(err),
     }
@@ -3555,7 +3547,7 @@ fn sys_sched_setparam(process: &UserProcess, pid: i32, param: usize) -> isize {
 fn sys_sched_getparam(process: &UserProcess, pid: i32, param: usize) -> isize {
     return_errno_if!(!is_same_sched_target(process, pid), LinuxError::ESRCH);
     return_errno_if!(param == 0, LinuxError::EINVAL);
-    let value = UserSchedParam { sched_priority: 0 };
+    let value = default_sched_param();
     write_user_value(process, param, &value)
 }
 
@@ -3566,11 +3558,10 @@ fn sys_sched_setscheduler(process: &UserProcess, pid: i32, policy: i32, param: u
         Ok(param) => param,
         Err(err) => return neg_errno(err),
     };
-    match policy as u32 {
-        0 if param.sched_priority == 0 => 0,
-        general::SCHED_FIFO | general::SCHED_RR if (1..=99).contains(&param.sched_priority) => 0,
-        general::SCHED_BATCH | general::SCHED_IDLE if param.sched_priority == 0 => 0,
-        _ => neg_errno(LinuxError::EINVAL),
+    if sched_param_accepts_policy(policy, param) {
+        0
+    } else {
+        neg_errno(LinuxError::EINVAL)
     }
 }
 
@@ -4341,7 +4332,7 @@ fn sys_prlimit64(
             Ok(limit) => limit,
             Err(err) => return neg_errno(err),
         };
-        if limit.rlim_cur > limit.rlim_max {
+        if !rlimit_is_valid(limit) {
             return neg_errno(LinuxError::EINVAL);
         }
         process.set_rlimit(resource, limit);
@@ -4463,23 +4454,6 @@ fn align_up(value: usize, align: usize) -> usize {
         0
     } else {
         align_down(value + align - 1, align)
-    }
-}
-
-fn default_rlimit(resource: u32) -> UserRlimit {
-    match resource {
-        RLIMIT_STACK_RESOURCE => UserRlimit {
-            rlim_cur: USER_STACK_SIZE as u64,
-            rlim_max: USER_STACK_SIZE as u64,
-        },
-        RLIMIT_NOFILE_RESOURCE => UserRlimit {
-            rlim_cur: DEFAULT_NOFILE_LIMIT,
-            rlim_max: DEFAULT_NOFILE_LIMIT,
-        },
-        _ => UserRlimit {
-            rlim_cur: u64::MAX,
-            rlim_max: u64::MAX,
-        },
     }
 }
 
