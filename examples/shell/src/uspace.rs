@@ -1696,13 +1696,13 @@ fn sys_read(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize
         });
         return ret;
     }
-    with_writable_slice(process, buf, count, |dst| {
+    with_writable_user_buffer(process, buf, count, |dst| {
         process.fds.lock().read(fd as i32, dst)
     })
 }
 
 fn sys_pread64(process: &UserProcess, fd: usize, buf: usize, count: usize, offset: usize) -> isize {
-    with_writable_slice(process, buf, count, |dst| {
+    with_writable_user_buffer(process, buf, count, |dst| {
         let mut table = process.fds.lock();
         let FdEntry::File(file) = table.entry_mut(fd as i32)? else {
             return Err(LinuxError::EBADF);
@@ -1726,7 +1726,7 @@ fn read_file_at_into(file: &File, offset: u64, dst: &mut [u8]) -> Result<usize, 
 }
 
 fn sys_write(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize {
-    with_readable_slice(process, buf, count, |src| {
+    with_readable_user_buffer(process, buf, count, |src| {
         process.fds.lock().write(fd as i32, src)
     })
 }
@@ -1738,7 +1738,7 @@ fn sys_pwrite64(
     count: usize,
     offset: usize,
 ) -> isize {
-    with_readable_slice(process, buf, count, |src| {
+    with_readable_user_buffer(process, buf, count, |src| {
         process
             .fds
             .lock()
@@ -4934,32 +4934,54 @@ fn sys_exit_group(process: &UserProcess, _tf: &TrapFrame, code: i32) -> ! {
     terminate_current_thread(process, code)
 }
 
-fn with_readable_slice(
+fn user_io_buffer(len: usize) -> Result<Vec<u8>, LinuxError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| LinuxError::ENOMEM)?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+fn with_readable_user_buffer(
     process: &UserProcess,
     ptr: usize,
     len: usize,
     f: impl FnOnce(&[u8]) -> Result<usize, LinuxError>,
 ) -> isize {
-    let Some(slice) = user_bytes(process, ptr, len, false) else {
-        return neg_errno(LinuxError::EFAULT);
+    let bytes = match read_user_bytes(process, ptr, len) {
+        Ok(bytes) => bytes,
+        Err(err) => return neg_errno(err),
     };
-    match f(slice) {
+    match f(&bytes) {
         Ok(v) => v as isize,
         Err(err) => neg_errno(err),
     }
 }
 
-fn with_writable_slice(
+fn with_writable_user_buffer(
     process: &UserProcess,
     ptr: usize,
     len: usize,
     f: impl FnOnce(&mut [u8]) -> Result<usize, LinuxError>,
 ) -> isize {
-    let Some(slice) = user_bytes_mut(process, ptr, len, true) else {
-        return neg_errno(LinuxError::EFAULT);
+    if let Err(err) = validate_user_write(process, ptr, len) {
+        return neg_errno(err);
+    }
+    let mut bytes = match user_io_buffer(len) {
+        Ok(bytes) => bytes,
+        Err(err) => return neg_errno(err),
     };
-    match f(slice) {
-        Ok(v) => v as isize,
+    match f(&mut bytes) {
+        Ok(v) => {
+            if v > len {
+                return neg_errno(LinuxError::EINVAL);
+            }
+            match write_user_bytes(process, ptr, &bytes[..v]) {
+                Ok(()) => v as isize,
+                Err(err) => neg_errno(err),
+            }
+        }
         Err(err) => neg_errno(err),
     }
 }
