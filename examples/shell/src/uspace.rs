@@ -61,7 +61,7 @@ use fd_socket::{
     socket_addr_call, socket_entry, socket_name_bridge, socket_option_supported,
     write_socket_addr_to_user,
 };
-use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry};
+use fd_table::{DirectoryEntry, FdEntry, FdTable, FileEntry, PathEntry, read_file_at_into};
 use linux_abi::*;
 use memory_map::{align_down, align_up, mmap_prot_to_flags, user_mapping_flags};
 use memory_policy::{validate_mempolicy_request, write_default_mempolicy};
@@ -1429,20 +1429,6 @@ fn sys_pread64(process: &UserProcess, fd: usize, buf: usize, count: usize, offse
         };
         read_file_at_into(&file.file, offset as u64, dst)
     })
-}
-
-fn read_file_at_into(file: &File, offset: u64, dst: &mut [u8]) -> Result<usize, LinuxError> {
-    let mut filled = 0usize;
-    while filled < dst.len() {
-        let read = file
-            .read_at(offset + filled as u64, &mut dst[filled..])
-            .map_err(LinuxError::from)?;
-        if read == 0 {
-            break;
-        }
-        filled += read;
-    }
-    Ok(filled)
 }
 
 fn sys_write(process: &UserProcess, fd: usize, buf: usize, count: usize) -> isize {

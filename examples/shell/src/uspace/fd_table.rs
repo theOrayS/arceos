@@ -61,6 +61,24 @@ pub(super) struct MemoryFileEntry {
     pub(super) offset: usize,
 }
 
+pub(super) fn read_file_at_into(
+    file: &File,
+    offset: u64,
+    dst: &mut [u8],
+) -> Result<usize, LinuxError> {
+    let mut filled = 0usize;
+    while filled < dst.len() {
+        let read = file
+            .read_at(offset + filled as u64, &mut dst[filled..])
+            .map_err(LinuxError::from)?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
+}
+
 impl PathEntry {
     pub(super) fn from_attr(path: &str, attr: &FileAttr) -> Self {
         Self {
