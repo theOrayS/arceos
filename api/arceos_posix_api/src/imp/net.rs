@@ -330,6 +330,22 @@ fn into_sockaddr(addr: SocketAddr) -> (ctypes::sockaddr, ctypes::socklen_t) {
     }
 }
 
+unsafe fn read_socklen(addrlen: *const ctypes::socklen_t) -> ctypes::socklen_t {
+    unsafe { core::ptr::read_unaligned(addrlen) }
+}
+
+unsafe fn write_sockaddr_output(
+    addr: *mut ctypes::sockaddr,
+    addrlen: *mut ctypes::socklen_t,
+    value: SocketAddr,
+) {
+    let (sockaddr, len) = into_sockaddr(value);
+    unsafe {
+        core::ptr::write_unaligned(addr, sockaddr);
+        core::ptr::write_unaligned(addrlen, len);
+    }
+}
+
 fn from_sockaddr(
     addr: *const ctypes::sockaddr,
     addrlen: ctypes::socklen_t,
@@ -492,9 +508,7 @@ pub unsafe fn sys_recvfrom(
 
         let res = socket.recvfrom(buf)?;
         if let Some(addr) = res.1 {
-            unsafe {
-                (*socket_addr, *addrlen) = into_sockaddr(addr);
-            }
+            unsafe { write_sockaddr_output(socket_addr, addrlen, addr) };
         }
         Ok(res.0)
     })
@@ -558,9 +572,7 @@ pub unsafe fn sys_accept(
         let new_socket = socket.accept()?;
         let addr = new_socket.peer_addr()?;
         let new_fd = Socket::add_to_fd_table(Socket::Tcp(Mutex::new(new_socket)))?;
-        unsafe {
-            (*socket_addr, *socket_len) = into_sockaddr(addr);
-        }
+        unsafe { write_sockaddr_output(socket_addr, socket_len, addr) };
         Ok(new_fd)
     })
 }
@@ -686,12 +698,11 @@ pub unsafe fn sys_getsockname(
         if addr.is_null() || addrlen.is_null() {
             return Err(LinuxError::EFAULT);
         }
-        if unsafe { *addrlen } < size_of::<ctypes::sockaddr>() as u32 {
+        if unsafe { read_socklen(addrlen) } < size_of::<ctypes::sockaddr>() as u32 {
             return Err(LinuxError::EINVAL);
         }
-        unsafe {
-            (*addr, *addrlen) = into_sockaddr(Socket::from_fd(sock_fd)?.local_addr()?);
-        }
+        let sockaddr = Socket::from_fd(sock_fd)?.local_addr()?;
+        unsafe { write_sockaddr_output(addr, addrlen, sockaddr) };
         Ok(0)
     })
 }
@@ -710,12 +721,11 @@ pub unsafe fn sys_getpeername(
         if addr.is_null() || addrlen.is_null() {
             return Err(LinuxError::EFAULT);
         }
-        if unsafe { *addrlen } < size_of::<ctypes::sockaddr>() as u32 {
+        if unsafe { read_socklen(addrlen) } < size_of::<ctypes::sockaddr>() as u32 {
             return Err(LinuxError::EINVAL);
         }
-        unsafe {
-            (*addr, *addrlen) = into_sockaddr(Socket::from_fd(sock_fd)?.peer_addr()?);
-        }
+        let sockaddr = Socket::from_fd(sock_fd)?.peer_addr()?;
+        unsafe { write_sockaddr_output(addr, addrlen, sockaddr) };
         Ok(0)
     })
 }
