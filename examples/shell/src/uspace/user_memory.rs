@@ -131,6 +131,31 @@ pub(super) fn write_user_bytes(
         .map_err(|_| LinuxError::EFAULT)
 }
 
+pub(super) fn clear_user_bytes(
+    process: &UserProcess,
+    ptr: usize,
+    len: usize,
+) -> Result<(), LinuxError> {
+    const ZERO_CHUNK: [u8; 64] = [0; 64];
+
+    if len == 0 {
+        return Ok(());
+    }
+    validate_user_write(process, ptr, len)?;
+
+    let aspace = process.aspace.lock();
+    let mut offset = 0;
+    while offset < len {
+        let chunk_len = core::cmp::min(len - offset, ZERO_CHUNK.len());
+        let dst = ptr.checked_add(offset).ok_or(LinuxError::EFAULT)?;
+        aspace
+            .write(VirtAddr::from(dst), &ZERO_CHUNK[..chunk_len])
+            .map_err(|_| LinuxError::EFAULT)?;
+        offset += chunk_len;
+    }
+    Ok(())
+}
+
 pub(super) fn write_user_value<T: Copy>(process: &UserProcess, ptr: usize, value: &T) -> isize {
     if ptr == 0 || !user_range_accessible(process, ptr, size_of::<T>(), true) {
         return neg_errno(LinuxError::EFAULT);

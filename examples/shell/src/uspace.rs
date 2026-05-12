@@ -66,8 +66,8 @@ use synthetic_fs::{
     synthetic_userdb_content, synthetic_userdb_fd_entry, synthetic_userdb_path_entry,
 };
 use user_memory::{
-    read_cstr, read_user_bytes, read_user_value, user_bytes, user_bytes_mut, validate_user_read,
-    validate_user_write, write_user_bytes, write_user_value,
+    clear_user_bytes, read_cstr, read_user_bytes, read_user_value, user_bytes, user_bytes_mut,
+    validate_user_read, validate_user_write, write_user_bytes, write_user_value,
 };
 
 static USER_RETURN_HOOK_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -1769,8 +1769,10 @@ fn sys_mbind(
 ) -> isize {
     let _ = (start, len, mode);
     let mask_len = nodemask_len(maxnode);
-    if nodemask != 0 && mask_len != 0 && user_bytes(process, nodemask, mask_len, false).is_none() {
-        return neg_errno(LinuxError::EFAULT);
+    if nodemask != 0 && mask_len != 0 {
+        if let Err(err) = validate_user_read(process, nodemask, mask_len) {
+            return neg_errno(err);
+        }
     }
     0
 }
@@ -1789,10 +1791,9 @@ fn sys_get_mempolicy(
     }
     let mask_len = nodemask_len(maxnode);
     if nodemask != 0 && mask_len != 0 {
-        let Some(mask) = user_bytes_mut(process, nodemask, mask_len, true) else {
-            return neg_errno(LinuxError::EFAULT);
-        };
-        mask.fill(0);
+        if let Err(err) = clear_user_bytes(process, nodemask, mask_len) {
+            return neg_errno(err);
+        }
     }
     0
 }
@@ -1800,8 +1801,10 @@ fn sys_get_mempolicy(
 fn sys_set_mempolicy(process: &UserProcess, mode: usize, nodemask: usize, maxnode: usize) -> isize {
     let _ = mode;
     let mask_len = nodemask_len(maxnode);
-    if nodemask != 0 && mask_len != 0 && user_bytes(process, nodemask, mask_len, false).is_none() {
-        return neg_errno(LinuxError::EFAULT);
+    if nodemask != 0 && mask_len != 0 {
+        if let Err(err) = validate_user_read(process, nodemask, mask_len) {
+            return neg_errno(err);
+        }
     }
     0
 }
@@ -3098,15 +3101,14 @@ fn sys_accept_bridge(
         }
         let copy_len = core::cmp::min(len, size_of::<posix_ctypes::sockaddr>());
         if copy_len > 0 {
-            let Some(dst) = user_bytes_mut(process, addr, copy_len, true) else {
-                return cleanup(LinuxError::EFAULT);
-            };
-            unsafe {
-                ptr::copy_nonoverlapping(
+            let local_addr_bytes = unsafe {
+                core::slice::from_raw_parts(
                     &local_addr as *const _ as *const u8,
-                    dst.as_mut_ptr(),
-                    copy_len,
-                );
+                    size_of::<posix_ctypes::sockaddr>(),
+                )
+            };
+            if let Err(err) = write_user_bytes(process, addr, &local_addr_bytes[..copy_len]) {
+                return cleanup(err);
             }
         }
         let ret = write_user_value(process, addrlen, &local_len);
@@ -3545,10 +3547,9 @@ fn sys_getsockopt_bridge(
             return neg_errno(LinuxError::EINVAL);
         }
         let out_len = len.min(TCP_INFO_COMPAT_SIZE);
-        let Some(dst) = user_bytes_mut(process, optval, out_len, true) else {
-            return neg_errno(LinuxError::EFAULT);
-        };
-        dst.fill(0);
+        if let Err(err) = clear_user_bytes(process, optval, out_len) {
+            return neg_errno(err);
+        }
         let out_len = out_len as posix_ctypes::socklen_t;
         return write_user_value(process, optlen, &out_len);
     }
@@ -3959,22 +3960,26 @@ fn sys_sched_getscheduler(process: &UserProcess, pid: i32) -> isize {
 fn sys_sched_setaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mask: usize) -> isize {
     return_errno_if!(!is_same_sched_target(process, pid), LinuxError::ESRCH);
     return_errno_if!(cpusetsize == 0 || mask == 0, LinuxError::EINVAL);
-    with_readable_slice(process, mask, cpusetsize, |src| {
-        if src[0] & 1 == 0 {
-            return Err(LinuxError::EINVAL);
-        }
-        Ok(0)
-    })
+    if let Err(err) = validate_user_read(process, mask, cpusetsize) {
+        return neg_errno(err);
+    }
+    match read_user_value::<u8>(process, mask) {
+        Ok(first) if first & 1 != 0 => 0,
+        Ok(_) => neg_errno(LinuxError::EINVAL),
+        Err(err) => neg_errno(err),
+    }
 }
 
 fn sys_sched_getaffinity(process: &UserProcess, pid: i32, cpusetsize: usize, mask: usize) -> isize {
     return_errno_if!(!is_same_sched_target(process, pid), LinuxError::ESRCH);
     return_errno_if!(cpusetsize == 0 || mask == 0, LinuxError::EINVAL);
-    with_writable_slice(process, mask, cpusetsize, |dst| {
-        dst.fill(0);
-        dst[0] = 1;
-        Ok(cmp::min(cpusetsize, size_of::<usize>()))
-    })
+    if let Err(err) = clear_user_bytes(process, mask, cpusetsize) {
+        return neg_errno(err);
+    }
+    if let Err(err) = write_user_bytes(process, mask, &[1]) {
+        return neg_errno(err);
+    }
+    cmp::min(cpusetsize, size_of::<usize>()) as isize
 }
 
 fn sys_syslog(process: &UserProcess, log_type: i32, buf: usize, len: usize) -> isize {
@@ -3982,12 +3987,11 @@ fn sys_syslog(process: &UserProcess, log_type: i32, buf: usize, len: usize) -> i
         // SYSLOG_ACTION_READ_ALL and READ_CLEAR. Expose an empty kernel log.
         3 | 4 => {
             if len > 0 && buf != 0 {
-                let ret = with_writable_slice(process, buf, len, |dst| {
-                    dst[0] = 0;
-                    Ok(0)
-                });
-                if ret != 0 {
-                    return ret;
+                if let Err(err) = validate_user_write(process, buf, len) {
+                    return neg_errno(err);
+                }
+                if let Err(err) = write_user_bytes(process, buf, &[0]) {
+                    return neg_errno(err);
                 }
             }
             0
@@ -4089,10 +4093,7 @@ fn read_timespec_duration(
     process: &UserProcess,
     ptr: usize,
 ) -> Result<core::time::Duration, LinuxError> {
-    let Some(bytes) = user_bytes(process, ptr, size_of::<general::timespec>(), false) else {
-        return Err(LinuxError::EFAULT);
-    };
-    let ts = unsafe { ptr::read_unaligned(bytes.as_ptr() as *const general::timespec) };
+    let ts = read_user_value::<general::timespec>(process, ptr)?;
     if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
         return Err(LinuxError::EINVAL);
     }
@@ -4336,10 +4337,9 @@ fn sys_shmctl(process: &UserProcess, shmid: usize, cmd: usize, buf: usize) -> is
         }
         SYSV_IPC_STAT => {
             if buf != 0 {
-                let Some(dst) = user_bytes_mut(process, buf, size_of::<usize>() * 16, true) else {
-                    return neg_errno(LinuxError::EFAULT);
-                };
-                dst.fill(0);
+                if let Err(err) = clear_user_bytes(process, buf, size_of::<usize>() * 16) {
+                    return neg_errno(err);
+                }
             }
             0
         }
@@ -4729,20 +4729,22 @@ fn sys_rt_sigprocmask(
     }
     let current_mask = ext.signal_mask.load(Ordering::Acquire);
     if oldset != 0 {
-        let Some(dst) = user_bytes_mut(process, oldset, sigsetsize, true) else {
-            return neg_errno(LinuxError::EFAULT);
-        };
-        dst.fill(0);
+        if let Err(err) = clear_user_bytes(process, oldset, sigsetsize) {
+            return neg_errno(err);
+        }
         if sigsetsize >= KERNEL_SIGSET_BYTES {
-            dst[..KERNEL_SIGSET_BYTES].copy_from_slice(&current_mask.to_ne_bytes());
+            if let Err(err) = write_user_bytes(process, oldset, &current_mask.to_ne_bytes()) {
+                return neg_errno(err);
+            }
         }
     }
     if set != 0 {
-        let Some(src) = user_bytes(process, set, KERNEL_SIGSET_BYTES, false) else {
-            return neg_errno(LinuxError::EFAULT);
+        let src = match read_user_bytes(process, set, KERNEL_SIGSET_BYTES) {
+            Ok(src) => src,
+            Err(err) => return neg_errno(err),
         };
         let mut set_bytes = [0u8; KERNEL_SIGSET_BYTES];
-        set_bytes.copy_from_slice(src);
+        set_bytes.copy_from_slice(&src);
         let set_mask = u64::from_ne_bytes(set_bytes);
         let next_mask = match how {
             SIG_BLOCK_HOW => current_mask | set_mask,
@@ -4775,10 +4777,9 @@ fn sys_rt_sigtimedwait(
         }
     }
     if info != 0 {
-        let Some(dst) = user_bytes_mut(process, info, 128, true) else {
-            return neg_errno(LinuxError::EFAULT);
-        };
-        dst.fill(0);
+        if let Err(err) = clear_user_bytes(process, info, 128) {
+            return neg_errno(err);
+        }
     }
     SIGCHLD_NUM
 }
