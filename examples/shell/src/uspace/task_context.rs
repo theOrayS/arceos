@@ -1,5 +1,6 @@
-use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
+use axerrno::LinuxError;
 use axhal::context::TrapFrame;
 use axsync::Mutex;
 use axtask::AxTaskRef;
@@ -62,6 +63,23 @@ pub(super) fn task_ext(task: &AxTaskRef) -> Option<&UserTaskExt> {
         return None;
     }
     Some(unsafe { &*(ptr as *const UserTaskExt) })
+}
+
+pub(super) fn set_current_robust_list(head: usize, len: usize) -> Result<(), LinuxError> {
+    let Some(ext) = current_task_ext() else {
+        return Err(LinuxError::EINVAL);
+    };
+    ext.robust_list_head.store(head, Ordering::Release);
+    ext.robust_list_len.store(len, Ordering::Release);
+    Ok(())
+}
+
+pub(super) fn robust_list_for_task(task: &AxTaskRef) -> Option<(usize, usize)> {
+    let ext = task_ext(task)?;
+    Some((
+        ext.robust_list_head.load(Ordering::Acquire),
+        ext.robust_list_len.load(Ordering::Acquire),
+    ))
 }
 
 pub(super) fn current_tid() -> i32 {

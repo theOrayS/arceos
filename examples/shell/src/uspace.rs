@@ -94,7 +94,10 @@ use system_info::{
     SyslogAction, default_rusage, default_utsname, default_winsize, rusage_target_valid,
     syslog_action,
 };
-use task_context::{UserTaskExt, current_process, current_task_ext, current_tid, task_ext};
+use task_context::{
+    UserTaskExt, current_process, current_task_ext, current_tid, robust_list_for_task,
+    set_current_robust_list, task_ext,
+};
 use task_registry::{
     UserThreadEntry, register_user_task, unregister_user_task, user_thread_entry_by_process_pid,
     user_thread_entry_by_tid, user_thread_entry_for_process,
@@ -3558,12 +3561,7 @@ fn sys_personality(process: &UserProcess, persona: usize) -> isize {
 }
 
 fn sys_set_robust_list(head: usize, len: usize) -> isize {
-    let Some(ext) = current_task_ext() else {
-        return neg_errno(LinuxError::EINVAL);
-    };
-    ext.robust_list_head.store(head, Ordering::Release);
-    ext.robust_list_len.store(len, Ordering::Release);
-    0
+    set_current_robust_list(head, len).map_or_else(neg_errno, |_| 0)
 }
 
 fn sys_get_robust_list(process: &UserProcess, pid: i32, head_ptr: usize, len_ptr: usize) -> isize {
@@ -3574,11 +3572,9 @@ fn sys_get_robust_list(process: &UserProcess, pid: i32, head_ptr: usize, len_ptr
     if entry.process.pid() != process.pid() {
         return neg_errno(LinuxError::EPERM);
     }
-    let Some(ext) = task_ext(&entry.task) else {
+    let Some((head, len)) = robust_list_for_task(&entry.task) else {
         return neg_errno(LinuxError::ESRCH);
     };
-    let head = ext.robust_list_head.load(Ordering::Acquire);
-    let len = ext.robust_list_len.load(Ordering::Acquire);
     return_on_user_write_error!(process, head_ptr, &head);
     write_user_value(process, len_ptr, &len)
 }
