@@ -13,7 +13,7 @@ incrementally and avoid broad cleanups unless they are the task.
 
 | Directory | Purpose |
 |-----------|---------|
-| `modules/` | Core runtime and subsystems: scheduler, memory, drivers, FS, net, sync, IPC |
+| `kernel/` | Core runtime and subsystems grouped by domain: arch, runtime, memory, task, drivers, FS, net, sync, namespace, diagnostics |
 | `api/` | Public ArceOS APIs and POSIX-facing APIs; `arceos_posix_api` contains the user-space boundary |
 | `ulib/` | User-facing libraries such as `axstd` and `axlibc` |
 | `examples/` | Rust and C example applications used by local builds and CI |
@@ -73,7 +73,7 @@ make kernel-la
 ### General
 - Work from the arceos/ root, not the outer workspace, unless the task clearly
 spans sibling directories.
-- Prefer minimal, subsystem-local patches. Do not refactor across modules/,
+- Prefer minimal, subsystem-local patches. Do not refactor across kernel/,
 api/, ulib/, and examples/ unless the task requires it.
 - Assume the Git worktree is dirty. Never revert unrelated user changes.
 - Do not hand-edit generated outputs in build/, target/, or root-level kernel
@@ -111,7 +111,7 @@ user-visible return values, or other POSIX/Linux-observable semantics, the
 final summary must explicitly list the visible behavior changes. If there is no
 intended visible behavior change, say so clearly.
 ### Logging and Output
-- In modules/, api/, and ulib/, prefer existing logging facilities such as
+- In kernel/, api/, and ulib/, prefer existing logging facilities such as
 axlog macros over ad-hoc printing.
 - In examples/, stdout/stderr-oriented behavior is acceptable when it is part
 of the example's visible interface.
@@ -129,8 +129,8 @@ Pick the smallest check set that proves the change:
 Additional validation guidance:
 
 - For changes spanning tightly coupled boot, trap, scheduler, or user-task flow
-code — especially across modules/axruntime, modules/axhal,
-modules/axtask, and api/arceos_posix_api/src/uspace.rs — prefer staged
+code — especially across kernel/runtime/axruntime, kernel/arch/axhal,
+kernel/task/axtask, and api/arceos_posix_api/src/uspace.rs — prefer staged
 validation:
 1. first perform the smallest relevant build-only validation,
 2. then perform behavior or run-time validation after the build succeeds.
@@ -159,7 +159,7 @@ feature combinations, or CI entry points should be treated as a regression.
 - point for test and user-space flows in this tree.
 - api/arceos_posix_api is ABI-sensitive. Avoid casual renames, layout changes,
 or behavior changes that leak through libc/POSIX-facing APIs.
-- modules/axruntime, modules/axhal, modules/axtask, and
+- kernel/runtime/axruntime, kernel/arch/axhal, kernel/task/axtask, and
 api/arceos_posix_api/src/uspace.rs are tightly coupled in boot, trap, and
 user-task flows. Cross-cutting changes there need extra care. Prefer build
 validation before behavior validation when touching this chain.

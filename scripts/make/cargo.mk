@@ -38,7 +38,7 @@ define cargo_clippy
 endef
 
 all_packages := \
-  $(shell ls $(CURDIR)/modules) \
+  $(notdir $(wildcard $(CURDIR)/kernel/*/*)) \
   axfeat arceos_api axstd axlibc
 
 define cargo_doc

@@ -19,6 +19,9 @@ pub trait FileLike: Send + Sync {
     fn stat(&self) -> LinuxResult<ctypes::stat>;
     fn into_any(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync>;
     fn poll(&self) -> LinuxResult<PollState>;
+    fn status_flags(&self) -> LinuxResult<c_int> {
+        Ok(0)
+    }
     fn set_nonblocking(&self, nonblocking: bool) -> LinuxResult;
 }
 
@@ -32,6 +35,10 @@ pub fn get_file_like(fd: c_int) -> LinuxResult<Arc<dyn FileLike>> {
         .get(fd as usize)
         .cloned()
         .ok_or(LinuxError::EBADF)
+}
+
+pub fn poll_file_like(fd: c_int) -> LinuxResult<PollState> {
+    get_file_like(fd)?.poll()
 }
 
 pub fn add_file_like(f: Arc<dyn FileLike>) -> LinuxResult<c_int> {
@@ -107,6 +114,12 @@ pub fn sys_fcntl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
             ctypes::F_DUPFD_CLOEXEC => {
                 // TODO: Change fd flags
                 dup_fd(fd)
+            }
+            ctypes::F_GETFL => {
+                if fd == 0 || fd == 1 || fd == 2 {
+                    return Ok(0);
+                }
+                get_file_like(fd)?.status_flags()
             }
             ctypes::F_SETFL => {
                 if fd == 0 || fd == 1 || fd == 2 {

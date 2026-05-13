@@ -151,6 +151,7 @@ name = "arceos-shell"
 version = "0.1.0"
 dependencies = [
  "arceos_posix_api",
+ "axalloc",
  "axerrno 0.1.2",
  "axfs",
  "axfs_ramfs",
@@ -505,6 +506,7 @@ dependencies = [
 name = "axfs"
 version = "0.2.0"
 dependencies = [
+ "axalloc",
  "axdriver",
  "axdriver_block",
  "axerrno 0.1.2",
@@ -538,8 +540,6 @@ dependencies = [
 [[package]]
 name = "axfs_ramfs"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f50c26614485d837a3fc09a92f24a226caddc25a30df7e6aaf4bd19b304c399"
 dependencies = [
  "axfs_vfs",
  "log",

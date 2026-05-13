@@ -9,7 +9,7 @@ use crate::{ctypes, utils::e};
 /// Return the read size if success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> ctypes::ssize_t {
-    e(sys_read(fd, buf, count) as _) as _
+    e(unsafe { sys_read(fd, buf, count) } as _) as _
 }
 
 /// Write data to the file indicated by `fd`.
@@ -18,7 +18,7 @@ pub unsafe extern "C" fn read(fd: c_int, buf: *mut c_void, count: usize) -> ctyp
 #[unsafe(no_mangle)]
 #[cfg(not(test))]
 pub unsafe extern "C" fn write(fd: c_int, buf: *const c_void, count: usize) -> ctypes::ssize_t {
-    e(sys_write(fd, buf, count) as _) as _
+    e(unsafe { sys_write(fd, buf, count) } as _) as _
 }
 
 /// Write a vector.
@@ -28,5 +28,5 @@ pub unsafe extern "C" fn writev(
     iov: *const ctypes::iovec,
     iocnt: c_int,
 ) -> ctypes::ssize_t {
-    e(sys_writev(fd, iov, iocnt) as _) as _
+    e(unsafe { sys_writev(fd, iov, iocnt) } as _) as _
 }

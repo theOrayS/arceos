@@ -20,7 +20,14 @@ const SCRIPT_SUFFIX: &str = "_testcode.sh";
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
 const TESTSUITE_STAGE_ROOT: &str = "/tmp/testsuite";
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
-const SCRIPT_BUSYBOX_APPLETS: &[&str] = &["kill", "sleep"];
+const SCRIPT_BUSYBOX_APPLETS: &[&str] = &["basename", "dirname", "kill", "sleep"];
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+const PATH_BUSYBOX_APPLETS: &[&str] = &[
+    "awk", "basename", "cat", "chmod", "cp", "cut", "date", "dirname", "echo", "expr", "find",
+    "grep", "head", "kill", "ln", "ls", "mkdir", "mktemp", "mv", "printf", "ps", "pwd", "readlink",
+    "rm", "rmdir", "sed", "seq", "sh", "sleep", "sort", "tail", "tee", "test", "touch", "tr",
+    "true", "uname", "wc", "xargs",
+];
 
 macro_rules! print_err {
     ($cmd: literal, $msg: expr) => {
@@ -451,6 +458,7 @@ fn copy_script_file(
     dst: &str,
     busybox_path: &str,
     rewrite_busybox_path: bool,
+    wrap_ltp_cases: bool,
 ) -> io::Result<()> {
     if let Some(parent) = parent_dir(dst) {
         ensure_dir_all(parent)?;
@@ -458,7 +466,14 @@ fn copy_script_file(
     let raw_script = fs::read_to_string(src)?;
     let mut script = raw_script
         .lines()
-        .map(|line| rewrite_script_line(line, busybox_path, rewrite_busybox_path))
+        .map(|line| {
+            let line = rewrite_script_line(line, busybox_path, rewrite_busybox_path);
+            if wrap_ltp_cases {
+                rewrite_ltp_case_line(&line, busybox_path)
+            } else {
+                line
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if raw_script.ends_with('\n') {
@@ -469,12 +484,115 @@ fn copy_script_file(
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn rewrite_ltp_case_line(line: &str, busybox_path: &str) -> String {
+    let trimmed = line.trim_start();
+    if trimmed == "\"$file\"" {
+        let indent = &line[..line.len() - trimmed.len()];
+        // Keep unsupported LTP prerequisites from blocking the whole eval run.
+        return format!(
+            "{indent}(case \"${{file##*/}}\" in af_alg*) echo \"SKIP LTP CASE ${{file##*/}} : AF_ALG unsupported by kernel\"; exit 32;; cgroup*) echo \"SKIP LTP CASE ${{file##*/}} : cgroup unsupported by kernel\"; exit 32;; cpuhotplug*) echo \"SKIP LTP CASE ${{file##*/}} : CPU hotplug unsupported by kernel\"; exit 32;; *lib.sh|tst_*.sh) echo \"SKIP LTP CASE ${{file##*/}} : LTP shell helper library is not a standalone test\"; exit 32;; esac; {busybox_path} grep -q 'check_envval' \"$file\" 2>/dev/null && {{ echo \"SKIP LTP CASE ${{file##*/}} : requires LTP network environment\"; exit 32; }}; tools_dir=\"${{TESTSUITE_TOOLS_DIR:-${{0%/*}}}}\"; PATH=\"$tools_dir:${{file%/*}}:$PATH\" \"$file\")"
+        );
+    }
+    line.to_string()
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn is_shell_var_start(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphabetic()
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn is_shell_var_char(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn parse_basename_substitution_tail(input: &str) -> Option<(String, usize)> {
+    let bytes = input.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+
+    let quoted = matches!(bytes.get(idx), Some(b'"'));
+    if quoted {
+        idx += 1;
+    }
+
+    if !matches!(bytes.get(idx), Some(b'$')) {
+        return None;
+    }
+    idx += 1;
+
+    let start = idx;
+    if !matches!(bytes.get(idx), Some(byte) if is_shell_var_start(*byte)) {
+        return None;
+    }
+    idx += 1;
+    while matches!(bytes.get(idx), Some(byte) if is_shell_var_char(*byte)) {
+        idx += 1;
+    }
+    let var_name = input[start..idx].to_string();
+
+    if quoted {
+        if !matches!(bytes.get(idx), Some(b'"')) {
+            return None;
+        }
+        idx += 1;
+    }
+
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if !matches!(bytes.get(idx), Some(b')')) {
+        return None;
+    }
+
+    Some((var_name, idx + 1))
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn rewrite_basename_substitutions(line: &str) -> String {
+    const PATTERN: &str = "$(basename";
+    let mut rewritten = String::new();
+    let mut rest = line;
+
+    while let Some(pos) = rest.find(PATTERN) {
+        rewritten.push_str(&rest[..pos]);
+        let after_pattern = &rest[pos + PATTERN.len()..];
+        if let Some((var_name, consumed)) = parse_basename_substitution_tail(after_pattern) {
+            rewritten.push_str("${");
+            rewritten.push_str(&var_name);
+            rewritten.push_str("##*/}");
+            rest = &after_pattern[consumed..];
+        } else {
+            rewritten.push_str(PATTERN);
+            rest = after_pattern;
+        }
+    }
+
+    rewritten.push_str(rest);
+    rewritten
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
 fn rewrite_script_line(line: &str, busybox_path: &str, rewrite_busybox_path: bool) -> String {
-    let line = if rewrite_busybox_path {
+    let mut line = if rewrite_busybox_path {
         line.replace("./busybox", busybox_path)
     } else {
         line.to_string()
     };
+    line = rewrite_basename_substitutions(&line);
+    for applet in SCRIPT_BUSYBOX_APPLETS {
+        line = line.replace(
+            &format!("$({applet}"),
+            &format!("$({busybox_path} {applet}"),
+        );
+        line = line.replace(
+            &format!("`{aplet}", aplet = applet),
+            &format!("`{busybox_path} {aplet}", aplet = applet),
+        );
+    }
     for applet in SCRIPT_BUSYBOX_APPLETS {
         if let Some(rewritten) = prefix_busybox_applet(&line, applet, busybox_path) {
             return rewritten;
@@ -496,6 +614,38 @@ fn prefix_busybox_applet(line: &str, applet: &str, busybox_path: &str) -> Option
     let indent_len = line.len() - trimmed.len();
     let indent = &line[..indent_len];
     Some(format!("{indent}{busybox_path} {trimmed}"))
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn create_busybox_applet_wrapper(dir: &str, busybox_path: &str, applet: &str) -> io::Result<()> {
+    let wrapper_path = join_path(dir, applet);
+    if fs::metadata(&wrapper_path).is_ok() {
+        return Ok(());
+    }
+
+    let mut wrapper = File::create(&wrapper_path)?;
+    writeln!(wrapper, "#!{busybox_path} sh")?;
+    writeln!(wrapper, "exec {busybox_path} {applet} \"$@\"")
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn ensure_busybox_path_wrappers(dir: &str, busybox_path: &str) -> io::Result<()> {
+    if !matches!(fs::metadata(busybox_path), Ok(meta) if meta.is_file()) {
+        return Ok(());
+    }
+    for applet in PATH_BUSYBOX_APPLETS {
+        create_busybox_applet_wrapper(dir, busybox_path, applet)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn busybox_path_wrapper_chmod_args(dir: &str) -> String {
+    PATH_BUSYBOX_APPLETS
+        .iter()
+        .map(|applet| join_path(dir, applet))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
@@ -522,7 +672,7 @@ fn copy_stage_entry(
             copy_stage_entry(src_root, dst_root, &child_rel, busybox_path)?;
         }
     } else if rel.ends_with(".sh") {
-        copy_script_file(&src, &dst, busybox_path, !rel.contains('/'))?;
+        copy_script_file(&src, &dst, busybox_path, !rel.contains('/'), false)?;
     } else {
         copy_file(&src, &dst)?;
     }
@@ -585,6 +735,31 @@ fn prepare_suite_stage_dir(suite_dir: &str, script_name: &str) -> io::Result<Opt
     }
 
     Ok(Some(stage_root))
+}
+
+#[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
+fn prepare_unstaged_script_dir(
+    suite_dir: &str,
+    group: &str,
+    script_name: &str,
+    busybox_path: &str,
+) -> io::Result<String> {
+    let stage_root = join_path(
+        TESTSUITE_STAGE_ROOT,
+        &format!("{}-{}-script", suite_dir.trim_start_matches('/'), group),
+    );
+    if matches!(fs::metadata(&stage_root), Ok(meta) if meta.is_dir()) {
+        remove_dir_all(&stage_root)?;
+    }
+    ensure_dir_all(&stage_root)?;
+    copy_script_file(
+        &join_path(suite_dir, script_name),
+        &join_path(&stage_root, script_name),
+        busybox_path,
+        true,
+        group == "ltp",
+    )?;
+    Ok(stage_root)
 }
 
 #[cfg(all(feature = "auto-run-tests", feature = "uspace"))]
@@ -700,14 +875,6 @@ pub fn maybe_run_official_tests() {
             );
             continue;
         }
-        if group == "ltp" {
-            print_suite_skip(
-                &suite_dir,
-                "ltp",
-                "ltp full-suite execution is not wired yet",
-            );
-            continue;
-        }
         if group == "unixbench" {
             print_suite_skip(
                 &suite_dir,
@@ -725,10 +892,15 @@ pub fn maybe_run_official_tests() {
         };
         let use_staged_dir = staged_dir.is_some();
         let suite_busybox = join_path(&suite_dir, "busybox");
-        let (cwd, shell_path, script_path) = if let Some(dir) = staged_dir {
-            (dir, suite_busybox.as_str(), script)
+        let suite_shell = if matches!(fs::metadata(&suite_busybox), Ok(meta) if meta.is_file()) {
+            suite_busybox.as_str()
         } else {
-            (suite_dir.clone(), shell, script)
+            shell
+        };
+        let (cwd, shell_path) = if let Some(dir) = staged_dir {
+            (dir, suite_busybox)
+        } else {
+            (suite_dir.clone(), suite_shell.to_string())
         };
         if let Err(err) = std::env::set_current_dir(&cwd) {
             println!("autorun: cd {cwd} failed: {err}");
@@ -743,16 +915,38 @@ pub fn maybe_run_official_tests() {
             }
             continue;
         }
-        let command = if use_staged_dir {
-            format!("PATH=. {shell_path} sh ./{script_path}")
+        let unstaged_script_dir = if use_staged_dir {
+            None
         } else {
-            format!("./{script_path}")
+            match prepare_unstaged_script_dir(&suite_dir, group, script, &shell_path) {
+                Ok(dir) => Some(dir),
+                Err(err) => {
+                    println!("autorun: prepare {suite_dir}/{script} failed: {err}");
+                    continue;
+                }
+            }
         };
-        if let Err(err) = run_user_program_argv_in(&cwd, &[shell_path, "sh", "-c", &command]) {
-            println!("autorun: {cwd}/{script_path} failed: {err}");
+        let script_arg = if let Some(dir) = unstaged_script_dir.as_deref() {
+            join_path(dir, script)
+        } else {
+            format!("./{script}")
+        };
+        let path_dir = unstaged_script_dir.as_deref().unwrap_or(&cwd);
+        if let Err(err) = ensure_busybox_path_wrappers(path_dir, &shell_path) {
+            println!("autorun: prepare busybox path wrappers failed: {err}");
+        }
+        let chmod_args = busybox_path_wrapper_chmod_args(path_dir);
+        let command = format!(
+            "{shell_path} chmod +x {chmod_args}; TESTSUITE_TOOLS_DIR={path_dir} PATH={path_dir}:. {shell_path} sh {script_arg}"
+        );
+        if let Err(err) = run_user_program_argv_in(&cwd, &[&shell_path, "sh", "-c", &command]) {
+            println!("autorun: {cwd}/{script} failed: {err}");
         }
         if use_staged_dir {
             let _ = remove_dir_all(&cwd);
+        }
+        if let Some(dir) = unstaged_script_dir {
+            let _ = remove_dir_all(&dir);
         }
     }
 
@@ -760,7 +954,7 @@ pub fn maybe_run_official_tests() {
     std::process::exit(0);
 }
 
-#[cfg(not(all(feature = "auto-run-tests", feature = "uspace")))]
+#[cfg(all(feature = "auto-run-tests", not(feature = "uspace")))]
 pub fn maybe_run_official_tests() {}
 
 pub fn run_cmd(line: &[u8]) {

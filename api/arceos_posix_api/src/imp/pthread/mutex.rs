@@ -12,23 +12,34 @@ static_assertions::const_assert_eq!(
 );
 
 #[repr(C)]
-pub struct PthreadMutex(AtomicU64);
+pub struct PthreadMutex {
+    owner: AtomicU64,
+    _reserved: [u64; 4],
+}
 
 impl PthreadMutex {
     const fn new() -> Self {
-        Self(AtomicU64::new(0))
+        Self {
+            owner: AtomicU64::new(0),
+            _reserved: [0; 4],
+        }
     }
 
     fn lock(&self) -> LinuxResult {
         let current_id = axtask::current().id().as_u64();
         loop {
-            match self
-                .0
-                .compare_exchange_weak(0, current_id, Ordering::Acquire, Ordering::Relaxed)
-            {
+            match self.owner.compare_exchange_weak(
+                0,
+                current_id,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => return Ok(()),
                 Err(owner_id) => {
-                    assert_ne!(owner_id, current_id, "pthread mutex already owned by current task");
+                    assert_ne!(
+                        owner_id, current_id,
+                        "pthread mutex already owned by current task"
+                    );
                     axtask::yield_now();
                 }
             }
@@ -37,7 +48,7 @@ impl PthreadMutex {
 
     fn unlock(&self) -> LinuxResult {
         let current_id = axtask::current().id().as_u64();
-        let owner_id = self.0.swap(0, Ordering::Release);
+        let owner_id = self.owner.swap(0, Ordering::Release);
         assert_eq!(
             owner_id, current_id,
             "pthread mutex released by non-owner task"
@@ -47,7 +58,11 @@ impl PthreadMutex {
 }
 
 /// Initialize a mutex.
-pub fn sys_pthread_mutex_init(
+///
+/// # Safety
+///
+/// `mutex` must point to writable storage for a `pthread_mutex_t`.
+pub unsafe fn sys_pthread_mutex_init(
     mutex: *mut ctypes::pthread_mutex_t,
     _attr: *const ctypes::pthread_mutexattr_t,
 ) -> c_int {
@@ -62,7 +77,11 @@ pub fn sys_pthread_mutex_init(
 }
 
 /// Lock the given mutex.
-pub fn sys_pthread_mutex_lock(mutex: *mut ctypes::pthread_mutex_t) -> c_int {
+///
+/// # Safety
+///
+/// `mutex` must point to a valid initialized `pthread_mutex_t`.
+pub unsafe fn sys_pthread_mutex_lock(mutex: *mut ctypes::pthread_mutex_t) -> c_int {
     debug!("sys_pthread_mutex_lock <= {:#x}", mutex as usize);
     syscall_body!(sys_pthread_mutex_lock, {
         check_null_mut_ptr(mutex)?;
@@ -74,7 +93,11 @@ pub fn sys_pthread_mutex_lock(mutex: *mut ctypes::pthread_mutex_t) -> c_int {
 }
 
 /// Unlock the given mutex.
-pub fn sys_pthread_mutex_unlock(mutex: *mut ctypes::pthread_mutex_t) -> c_int {
+///
+/// # Safety
+///
+/// `mutex` must point to a valid initialized `pthread_mutex_t` owned by the current task.
+pub unsafe fn sys_pthread_mutex_unlock(mutex: *mut ctypes::pthread_mutex_t) -> c_int {
     debug!("sys_pthread_mutex_unlock <= {:#x}", mutex as usize);
     syscall_body!(sys_pthread_mutex_unlock, {
         check_null_mut_ptr(mutex)?;

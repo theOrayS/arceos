@@ -5,6 +5,7 @@
 use alloc::collections::BTreeMap;
 use alloc::collections::btree_map::Entry;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::{ffi::c_int, time::Duration};
 
 use axerrno::{LinuxError, LinuxResult};
@@ -36,7 +37,12 @@ impl EpollInstance {
             .map_err(|_| LinuxError::EINVAL)
     }
 
-    fn control(&self, op: usize, fd: usize, event: &ctypes::epoll_event) -> LinuxResult<usize> {
+    fn control(
+        &self,
+        op: usize,
+        fd: usize,
+        event: Option<&ctypes::epoll_event>,
+    ) -> LinuxResult<usize> {
         match get_file_like(fd as c_int) {
             Ok(_) => {}
             Err(e) => return Err(e),
@@ -44,6 +50,7 @@ impl EpollInstance {
 
         match op as u32 {
             ctypes::EPOLL_CTL_ADD => {
+                let event = event.ok_or(LinuxError::EFAULT)?;
                 if let Entry::Vacant(e) = self.events.lock().entry(fd) {
                     e.insert(*event);
                 } else {
@@ -51,6 +58,7 @@ impl EpollInstance {
                 }
             }
             ctypes::EPOLL_CTL_MOD => {
+                let event = event.ok_or(LinuxError::EFAULT)?;
                 let mut events = self.events.lock();
                 if let Entry::Occupied(mut ocp) = events.entry(fd) {
                     ocp.insert(*event);
@@ -81,22 +89,22 @@ impl EpollInstance {
             match get_file_like(*infd as c_int)?.poll() {
                 Err(_) => {
                     if (ev.events & ctypes::EPOLLERR) != 0 {
-                        events[events_num].events = ctypes::EPOLLERR;
-                        events[events_num].data = ev.data;
-                        events_num += 1;
+                        if !push_ready_event(events, &mut events_num, ctypes::EPOLLERR, ev.data) {
+                            return Ok(events_num);
+                        }
                     }
                 }
                 Ok(state) => {
                     if state.readable && (ev.events & ctypes::EPOLLIN != 0) {
-                        events[events_num].events = ctypes::EPOLLIN;
-                        events[events_num].data = ev.data;
-                        events_num += 1;
+                        if !push_ready_event(events, &mut events_num, ctypes::EPOLLIN, ev.data) {
+                            return Ok(events_num);
+                        }
                     }
 
                     if state.writable && (ev.events & ctypes::EPOLLOUT != 0) {
-                        events[events_num].events = ctypes::EPOLLOUT;
-                        events[events_num].data = ev.data;
-                        events_num += 1;
+                        if !push_ready_event(events, &mut events_num, ctypes::EPOLLOUT, ev.data) {
+                            return Ok(events_num);
+                        }
                     }
                 }
             }
@@ -137,6 +145,21 @@ impl FileLike for EpollInstance {
     }
 }
 
+fn push_ready_event(
+    events: &mut [ctypes::epoll_event],
+    events_num: &mut usize,
+    event_mask: u32,
+    data: ctypes::epoll_data_t,
+) -> bool {
+    if *events_num >= events.len() {
+        return false;
+    }
+    events[*events_num].events = event_mask;
+    events[*events_num].data = data;
+    *events_num += 1;
+    true
+}
+
 /// Creates a new epoll instance.
 ///
 /// It returns a file descriptor referring to the new epoll instance.
@@ -152,6 +175,11 @@ pub fn sys_epoll_create(size: c_int) -> c_int {
 }
 
 /// Control interface for an epoll file descriptor
+///
+/// # Safety
+///
+/// For `EPOLL_CTL_ADD` and `EPOLL_CTL_MOD`, `event` must be valid for reads of
+/// one `epoll_event`. `EPOLL_CTL_DEL` ignores `event` and may receive null.
 pub unsafe fn sys_epoll_ctl(
     epfd: c_int,
     op: c_int,
@@ -160,14 +188,25 @@ pub unsafe fn sys_epoll_ctl(
 ) -> c_int {
     debug!("sys_epoll_ctl <= epfd: {} op: {} fd: {}", epfd, op, fd);
     syscall_body!(sys_epoll_ctl, {
-        let ret = unsafe {
-            EpollInstance::from_fd(epfd)?.control(op as usize, fd as usize, &(*event))? as c_int
+        let event = match op as u32 {
+            ctypes::EPOLL_CTL_ADD | ctypes::EPOLL_CTL_MOD => {
+                if event.is_null() {
+                    return Err(LinuxError::EFAULT);
+                }
+                Some(unsafe { &*event })
+            }
+            _ => None,
         };
+        let ret = EpollInstance::from_fd(epfd)?.control(op as usize, fd as usize, event)? as c_int;
         Ok(ret)
     })
 }
 
 /// Waits for events on the epoll instance referred to by the file descriptor epfd.
+///
+/// # Safety
+///
+/// `events` must be valid for writes of `maxevents` `epoll_event` entries.
 pub unsafe fn sys_epoll_wait(
     epfd: c_int,
     events: *mut ctypes::epoll_event,
@@ -183,15 +222,26 @@ pub unsafe fn sys_epoll_wait(
         if maxevents <= 0 {
             return Err(LinuxError::EINVAL);
         }
-        let events = unsafe { core::slice::from_raw_parts_mut(events, maxevents as usize) };
+        if events.is_null() {
+            return Err(LinuxError::EFAULT);
+        }
+        let maxevents = maxevents as usize;
+        let mut ready_events = Vec::new();
+        ready_events
+            .try_reserve_exact(maxevents)
+            .map_err(|_| LinuxError::ENOMEM)?;
+        ready_events.resize(maxevents, ctypes::epoll_event::default());
         let deadline =
             (!timeout.is_negative()).then(|| wall_time() + Duration::from_millis(timeout as u64));
         let epoll_instance = EpollInstance::from_fd(epfd)?;
         loop {
             #[cfg(feature = "net")]
             axnet::poll_interfaces();
-            let events_num = epoll_instance.poll_all(events)?;
+            let events_num = epoll_instance.poll_all(&mut ready_events)?;
             if events_num > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(ready_events.as_ptr(), events, events_num);
+                }
                 return Ok(events_num as c_int);
             }
 

@@ -103,6 +103,10 @@ impl Pthread {
     }
 }
 
+unsafe fn write_pthread_output<T>(dst: *mut T, value: T) {
+    unsafe { core::ptr::write_unaligned(dst, value) };
+}
+
 /// Returns the `pthread` struct of current thread.
 pub fn sys_pthread_self() -> ctypes::pthread_t {
     Pthread::current().expect("fail to get current thread") as *const Pthread as _
@@ -112,6 +116,11 @@ pub fn sys_pthread_self() -> ctypes::pthread_t {
 ///
 /// If successful, it stores the pointer to the newly created `struct __pthread`
 /// in `res` and returns 0.
+///
+/// # Safety
+///
+/// `res` must point to writable storage for one `pthread_t`. `attr` must be
+/// either null or point to a valid `pthread_attr_t`.
 pub unsafe fn sys_pthread_create(
     res: *mut ctypes::pthread_t,
     attr: *const ctypes::pthread_attr_t,
@@ -123,8 +132,11 @@ pub unsafe fn sys_pthread_create(
         start_routine as usize, arg as usize
     );
     syscall_body!(sys_pthread_create, {
+        if res.is_null() {
+            return Err(LinuxError::EFAULT);
+        }
         let ptr = Pthread::create(attr, start_routine, arg)?;
-        unsafe { core::ptr::write(res, ptr) };
+        unsafe { write_pthread_output(res, ptr) };
         Ok(0)
     })
 }
@@ -136,12 +148,17 @@ pub fn sys_pthread_exit(retval: *mut c_void) -> ! {
 }
 
 /// Waits for the given thread to exit, and stores the return value in `retval`.
+///
+/// # Safety
+///
+/// If `retval` is non-null, it must point to writable storage for one thread
+/// return pointer.
 pub unsafe fn sys_pthread_join(thread: ctypes::pthread_t, retval: *mut *mut c_void) -> c_int {
     debug!("sys_pthread_join <= {:#x}", retval as usize);
     syscall_body!(sys_pthread_join, {
         let ret = Pthread::join(thread)?;
         if !retval.is_null() {
-            unsafe { core::ptr::write(retval, ret) };
+            unsafe { write_pthread_output(retval, ret) };
         }
         Ok(0)
     })

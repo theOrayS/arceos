@@ -75,6 +75,10 @@ impl FileLike for File {
     }
 }
 
+unsafe fn write_stat_output(buf: *mut ctypes::stat, value: ctypes::stat) {
+    unsafe { core::ptr::write_unaligned(buf, value) };
+}
+
 /// Convert open flags to [`OpenOptions`].
 fn flags_to_options(flags: c_int, _mode: ctypes::mode_t) -> OpenOptions {
     let flags = flags as u32;
@@ -106,7 +110,11 @@ fn flags_to_options(flags: c_int, _mode: ctypes::mode_t) -> OpenOptions {
 ///
 /// Return its index in the file table (`fd`). Return `EMFILE` if it already
 /// has the maximum number of files open.
-pub fn sys_open(filename: *const c_char, flags: c_int, mode: ctypes::mode_t) -> c_int {
+///
+/// # Safety
+///
+/// `filename` must be a valid, NUL-terminated C string.
+pub unsafe fn sys_open(filename: *const c_char, flags: c_int, mode: ctypes::mode_t) -> c_int {
     let filename = char_ptr_to_str(filename);
     debug!("sys_open <= {:?} {:#o} {:#o}", filename, flags, mode);
     syscall_body!(sys_open, {
@@ -136,6 +144,11 @@ pub fn sys_lseek(fd: c_int, offset: ctypes::off_t, whence: c_int) -> ctypes::off
 /// Get the file metadata by `path` and write into `buf`.
 ///
 /// Return 0 if success.
+///
+/// # Safety
+///
+/// `path` must be a valid, NUL-terminated C string. `buf` must be writable for
+/// one `stat` value when non-null.
 pub unsafe fn sys_stat(path: *const c_char, buf: *mut ctypes::stat) -> c_int {
     let path = char_ptr_to_str(path);
     debug!("sys_stat <= {:?} {:#x}", path, buf as usize);
@@ -147,7 +160,7 @@ pub unsafe fn sys_stat(path: *const c_char, buf: *mut ctypes::stat) -> c_int {
         options.read(true);
         let file = axfs::fops::File::open(path?, &options)?;
         let st = File::new(file).stat()?;
-        unsafe { *buf = st };
+        unsafe { write_stat_output(buf, st) };
         Ok(0)
     })
 }
@@ -155,6 +168,10 @@ pub unsafe fn sys_stat(path: *const c_char, buf: *mut ctypes::stat) -> c_int {
 /// Get file metadata by `fd` and write into `buf`.
 ///
 /// Return 0 if success.
+///
+/// # Safety
+///
+/// `buf` must be writable for one `stat` value when non-null.
 pub unsafe fn sys_fstat(fd: c_int, buf: *mut ctypes::stat) -> c_int {
     debug!("sys_fstat <= {} {:#x}", fd, buf as usize);
     syscall_body!(sys_fstat, {
@@ -162,7 +179,8 @@ pub unsafe fn sys_fstat(fd: c_int, buf: *mut ctypes::stat) -> c_int {
             return Err(LinuxError::EFAULT);
         }
 
-        unsafe { *buf = get_file_like(fd)?.stat()? };
+        let st = get_file_like(fd)?.stat()?;
+        unsafe { write_stat_output(buf, st) };
         Ok(0)
     })
 }
@@ -170,6 +188,11 @@ pub unsafe fn sys_fstat(fd: c_int, buf: *mut ctypes::stat) -> c_int {
 /// Get the metadata of the symbolic link and write into `buf`.
 ///
 /// Return 0 if success.
+///
+/// # Safety
+///
+/// `path` must be a valid, NUL-terminated C string. `buf` must be writable for
+/// one `stat` value when non-null.
 pub unsafe fn sys_lstat(path: *const c_char, buf: *mut ctypes::stat) -> ctypes::ssize_t {
     let path = char_ptr_to_str(path);
     debug!("sys_lstat <= {:?} {:#x}", path, buf as usize);
@@ -177,25 +200,31 @@ pub unsafe fn sys_lstat(path: *const c_char, buf: *mut ctypes::stat) -> ctypes::
         if buf.is_null() {
             return Err(LinuxError::EFAULT);
         }
-        unsafe { *buf = Default::default() }; // TODO
+        let st = ctypes::stat::default(); // TODO
+        unsafe { write_stat_output(buf, st) };
         Ok(0)
     })
 }
 
 /// Get the path of the current directory.
+///
+/// # Safety
+///
+/// `buf` must be writable for `size` bytes when non-null.
 #[allow(clippy::unnecessary_cast)] // `c_char` is either `i8` or `u8`
-pub fn sys_getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
+pub unsafe fn sys_getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
     debug!("sys_getcwd <= {:#x} {}", buf as usize, size);
     syscall_body!(sys_getcwd, {
         if buf.is_null() {
             return Ok(core::ptr::null::<c_char>() as _);
         }
-        let dst = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, size as _) };
         let cwd = axfs::api::current_dir()?;
         let cwd = cwd.as_bytes();
         if cwd.len() < size {
-            dst[..cwd.len()].copy_from_slice(cwd);
-            dst[cwd.len()] = 0;
+            unsafe {
+                core::ptr::copy_nonoverlapping(cwd.as_ptr(), buf as *mut u8, cwd.len());
+                core::ptr::write((buf as *mut u8).add(cwd.len()), 0);
+            }
             Ok(buf)
         } else {
             Err(LinuxError::ERANGE)
@@ -207,7 +236,11 @@ pub fn sys_getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
 /// If new exists, it is first removed.
 ///
 /// Return 0 if the operation succeeds, otherwise return -1.
-pub fn sys_rename(old: *const c_char, new: *const c_char) -> c_int {
+///
+/// # Safety
+///
+/// `old` and `new` must be valid, NUL-terminated C strings.
+pub unsafe fn sys_rename(old: *const c_char, new: *const c_char) -> c_int {
     syscall_body!(sys_rename, {
         let old_path = char_ptr_to_str(old)?;
         let new_path = char_ptr_to_str(new)?;

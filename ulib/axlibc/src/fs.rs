@@ -16,7 +16,7 @@ pub unsafe extern "C" fn ax_open(
     flags: c_int,
     mode: ctypes::mode_t,
 ) -> c_int {
-    e(sys_open(filename, flags, mode))
+    e(unsafe { sys_open(filename, flags, mode) })
 }
 
 /// Set the position of the file indicated by `fd`.
@@ -32,7 +32,7 @@ pub unsafe extern "C" fn lseek(fd: c_int, offset: ctypes::off_t, whence: c_int) 
 /// Return 0 if success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut ctypes::stat) -> c_int {
-    e(sys_stat(path, buf))
+    e(unsafe { sys_stat(path, buf) })
 }
 
 /// Get file metadata by `fd` and write into `buf`.
@@ -40,7 +40,7 @@ pub unsafe extern "C" fn stat(path: *const c_char, buf: *mut ctypes::stat) -> c_
 /// Return 0 if success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut ctypes::stat) -> c_int {
-    e(sys_fstat(fd, buf))
+    e(unsafe { sys_fstat(fd, buf) })
 }
 
 /// Get the metadata of the symbolic link and write into `buf`.
@@ -48,13 +48,13 @@ pub unsafe extern "C" fn fstat(fd: c_int, buf: *mut ctypes::stat) -> c_int {
 /// Return 0 if success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lstat(path: *const c_char, buf: *mut ctypes::stat) -> c_int {
-    e(sys_lstat(path, buf) as _)
+    e(unsafe { sys_lstat(path, buf) } as _)
 }
 
 /// Get the path of the current directory.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
-    sys_getcwd(buf, size)
+    unsafe { sys_getcwd(buf, size) }
 }
 
 /// Rename `old` to `new`
@@ -63,5 +63,5 @@ pub unsafe extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
 /// Return 0 if the operation succeeds, otherwise return -1.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rename(old: *const c_char, new: *const c_char) -> c_int {
-    e(sys_rename(old, new))
+    e(unsafe { sys_rename(old, new) })
 }
